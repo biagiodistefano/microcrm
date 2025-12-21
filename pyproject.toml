@@ -1,0 +1,133 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = { find = { where = ["src"] } }
+
+[project]
+name = "crm"
+version = "1.0.0"
+description = "MicroCRM - Lead management for product promotion"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "celery>=5.6.0",
+    "django>=5.2.9",
+    "django-celery-beat>=2.8.1",
+    "django-celery-results>=2.6.0",
+    "django-google-sso>=9.0.2",
+    "django-ninja>=1.5.0",
+    "django-ninja-extra>=0.30.6",
+    "django-simple-history>=3.11.0",
+    "django-solo>=2.4.0",
+    "django-storages>=1.14.6",
+    "django-unfold>=0.74.1",
+    "faker>=38.2.0",
+    "google-genai>=1.56.0",
+    "gunicorn>=23.0.0",
+    "psycopg[binary]>=3.3.2",
+    "python-decouple>=3.8",
+    "redis>=7.1.0",
+    "requests>=2.32.0",
+    "rich>=13.9.0",
+    "typer>=0.15.0",
+    "whitenoise>=6.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "celery-types>=0.23.0",
+    "django-stubs[compatible-mypy]>=5.2.8",
+    "mypy>=1.19.1",
+    "pytest>=8.4.1",
+    "pytest-cov>=6.2.1",
+    "pytest-django>=4.11.1",
+    "rich>=14.2.0",
+    "ruff>=0.14.9",
+    "typer>=0.20.0",
+]
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pypackages__",
+    "dist",
+    "node_modules",
+    "venv",
+    "*/migrations/*",
+    "crm_client.py",
+    "trello_crm.py",
+]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "D", "T201", "C"]
+extend-select = ["I", "W", "E", "D"]
+ignore = ["D100", "D101", "D104", "D105", "D106"]
+fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/migrations/*.py" = ["D"]
+"**/tests/*.py" = ["D"]
+"**/admin.py" = ["D102"]
+"**/management/commands/*.py" = ["D", "T201"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+mypy_path = ["./src"]
+plugins = ["mypy_django_plugin.main"]
+exclude = ["(?x)(^.*/migrations/.*\\.py$|^crm_client\\.py$|^trello_crm\\.py$)"]
+
+[[tool.mypy.overrides]]
+module = "django_google_sso.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "simple_history.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "decouple.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "unfold.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "solo.*"
+ignore_missing_imports = true
+
+[tool.django-stubs]
+django_settings_module = "crm.settings"
+
+[tool.pytest.ini_options]
+pythonpath = "src"
+DJANGO_SETTINGS_MODULE = "crm.settings"
+testpaths = ["src"]
+
+[tool.coverage.run]
+omit = [
+    "src/manage.py",
+    "src/crm/asgi.py",
+    "src/crm/wsgi.py",
+    "src/crm/settings.py",
+    "src/*/migrations/*",
+    "src/*/management/*",
+]

@@ -1,0 +1,51 @@
+name: Test
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - .github/workflows/test.yaml
+      - src/**/*.py
+      - pyproject.toml
+      - uv.lock
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.18"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Check uv.lock
+        run: |
+          if ! git diff --exit-code uv.lock > /dev/null; then
+            echo "❌ uv.lock is out of sync with pyproject.toml"
+            exit 1
+          fi
+
+      - name: Recreate environment file
+        run: cp .env.example .env
+
+      - name: Run ruff formatting check
+        run: uv run ruff check . --select F
+
+      - name: Run ruff linting check
+        run: uv run ruff check .
+
+      - name: Run mypy
+        run: uv run mypy --strict --extra-checks --warn-unreachable --warn-unused-ignores --no-incremental src
+
+      - name: Check for missing migrations
+        working-directory: src
+        run: uv run python manage.py makemigrations --check --dry-run --no-input
+
+      - name: Run unit tests
+        run: uv run pytest --cov=src --cov-report=term --cov-branch -v src

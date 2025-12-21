@@ -1,0 +1,30 @@
+# Caddyfile for MicroCRM production deployment
+# Caddy automatically handles HTTPS via Let's Encrypt
+
+{$DOMAIN} {
+    # Reverse proxy to Django/Gunicorn
+    reverse_proxy web:8000
+
+    # Security headers
+    header {
+        # Prevent clickjacking
+        X-Frame-Options "SAMEORIGIN"
+        # Prevent MIME type sniffing
+        X-Content-Type-Options "nosniff"
+        # Enable XSS filter
+        X-XSS-Protection "1; mode=block"
+        # Referrer policy
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    # Logging
+    log {
+        output stdout
+        format console
+    }
+}
+
+# Redirect www to non-www (optional, remove if not needed)
+www.{$DOMAIN} {
+    redir https://{$DOMAIN}{uri} permanent
+}

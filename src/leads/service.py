@@ -1,0 +1,254 @@
+"""Business logic for leads."""
+
+import typing as t
+
+from django.utils import timezone
+from ninja.errors import HttpError
+
+from leads.models import Action, City, Lead, LeadType, ResearchJob, Tag
+from leads.schema import ActionIn, ActionPatch, CityIn, LeadIn, LeadPatch, ResearchJobIn
+
+
+def get_or_create_city(city_in: CityIn) -> City:
+    """Get or create a city."""
+    city, _ = City.objects.get_or_create(
+        name__iexact=city_in.name,
+        country__iexact=city_in.country,
+        defaults={"name": city_in.name, "country": city_in.country, "iso2": city_in.iso2.upper()},
+    )
+    return city
+
+
+def get_or_create_lead_type(name: str) -> LeadType:
+    """Get or create a lead type."""
+    lead_type, _ = LeadType.objects.get_or_create(name__iexact=name, defaults={"name": name})
+    return lead_type
+
+
+def get_or_create_tags(tag_names: list[str]) -> list[Tag]:
+    """Get or create tags (case insensitive)."""
+    tags = []
+    for name in tag_names:
+        tag, _ = Tag.objects.get_or_create(name__iexact=name, defaults={"name": name})
+        tags.append(tag)
+    return tags
+
+
+def apply_lead_data(lead: Lead, data: LeadIn | LeadPatch, is_patch: bool = False) -> Lead:
+    """Apply data to a lead, handling related objects."""
+    exclude = {"city", "lead_type", "tags"}
+    data_dict = data.model_dump(exclude=exclude, exclude_unset=is_patch)
+
+    for field, value in data_dict.items():
+        setattr(lead, field, value)
+
+    # Handle city
+    if data.city is not None:
+        lead.city = get_or_create_city(data.city)
+    elif not is_patch:
+        lead.city = None
+
+    # Handle lead_type
+    if data.lead_type is not None:
+        lead.lead_type = get_or_create_lead_type(data.lead_type)
+    elif not is_patch:
+        lead.lead_type = None
+
+    lead.save()
+
+    # Handle tags
+    if data.tags is not None:
+        tags = get_or_create_tags(data.tags)
+        lead.tags.set(tags)
+    elif not is_patch:
+        lead.tags.clear()
+
+    return lead
+
+
+def create_lead(data: LeadIn) -> Lead:
+    """Create a new lead."""
+    lead = Lead()
+    return apply_lead_data(lead, data)
+
+
+def update_lead(lead: Lead, data: LeadIn) -> Lead:
+    """Update a lead (full replacement)."""
+    return apply_lead_data(lead, data)
+
+
+def patch_lead(lead: Lead, data: LeadPatch) -> Lead:
+    """Partially update a lead."""
+    return apply_lead_data(lead, data, is_patch=True)
+
+
+# --- Action Functions ---
+
+
+def create_action(data: ActionIn) -> Action:
+    """Create a new action.
+
+    Actions always start with PENDING status.
+
+    Raises:
+        HttpError: 404 if the lead doesn't exist.
+    """
+    try:
+        lead = Lead.objects.get(id=data.lead_id)
+    except Lead.DoesNotExist:
+        raise HttpError(404, f"Lead with id {data.lead_id} not found")
+    return Action.objects.create(
+        lead=lead,
+        name=data.name,
+        notes=data.notes,
+        due_date=data.due_date,
+    )
+
+
+def update_action(action: Action, data: ActionIn) -> Action:
+    """Update an action (full replacement).
+
+    Note: status is not changed via PUT. Use PATCH to update status.
+
+    Raises:
+        HttpError: 404 if the lead doesn't exist.
+    """
+    # Validate lead exists
+    if not Lead.objects.filter(id=data.lead_id).exists():
+        raise HttpError(404, f"Lead with id {data.lead_id} not found")
+    action.lead_id = data.lead_id
+    action.name = data.name
+    action.notes = data.notes
+    action.due_date = data.due_date
+    action.save()
+    return action
+
+
+def patch_action(action: Action, data: ActionPatch) -> Action:
+    """Partially update an action."""
+    data_dict = data.model_dump(exclude_unset=True)
+    for field, value in data_dict.items():
+        setattr(action, field, value)
+    _handle_action_completion(action)
+    action.save()
+    return action
+
+
+def _handle_action_completion(action: Action) -> None:
+    """Set completed_at when status changes to COMPLETED."""
+    if action.status == Action.Status.COMPLETED and action.completed_at is None:
+        action.completed_at = timezone.now()
+    elif action.status != Action.Status.COMPLETED:
+        action.completed_at = None
+
+
+# --- City Functions ---
+
+
+def create_city(data: CityIn) -> City:
+    """Create a new city.
+
+    Raises:
+        HttpError: 400 if a city with the same name and country already exists.
+    """
+    if City.objects.filter(name__iexact=data.name, country__iexact=data.country).exists():
+        raise HttpError(400, f"City '{data.name}' in '{data.country}' already exists")
+    return City.objects.create(
+        name=data.name,
+        country=data.country,
+        iso2=data.iso2.upper() if data.iso2 else "",
+    )
+
+
+def start_city_research(city: City) -> dict[str, t.Any]:
+    """Start deep research for a city.
+
+    Creates a ResearchJob and queues it for processing via Celery.
+
+    Returns:
+        Dict with job_id and status.
+
+    Raises:
+        ValueError: If there's already an active research job for this city.
+    """
+    from leads.tasks import queue_research
+
+    return queue_research(city.id)
+
+
+# --- ResearchJob Functions ---
+
+
+def create_research_job(data: ResearchJobIn) -> ResearchJob:
+    """Create a new research job for a city.
+
+    The job is created with NOT_STARTED status. Use run_research_job() to start it.
+
+    Raises:
+        HttpError: 404 if the city doesn't exist.
+        HttpError: 400 if there's already an active research job for this city.
+    """
+    try:
+        city = City.objects.get(id=data.city_id)
+    except City.DoesNotExist:
+        raise HttpError(404, f"City with id {data.city_id} not found")
+
+    # Check for existing active jobs
+    active_statuses = [ResearchJob.Status.PENDING, ResearchJob.Status.RUNNING]
+    if ResearchJob.objects.filter(city=city, status__in=active_statuses).exists():
+        raise HttpError(400, f"Research already active for {city}")
+
+    return ResearchJob.objects.create(city=city, status=ResearchJob.Status.NOT_STARTED)
+
+
+def run_research_job(job: ResearchJob) -> dict[str, t.Any]:
+    """Queue a research job for processing.
+
+    Sets the job to PENDING and queues the start_research_job task.
+
+    Returns:
+        Dict with job_id, status, and message.
+
+    Raises:
+        HttpError: 400 if the job is not in a runnable state.
+    """
+    from leads.tasks import start_research_job
+
+    allowed_statuses = {ResearchJob.Status.NOT_STARTED, ResearchJob.Status.FAILED}
+    if job.status not in allowed_statuses:
+        raise HttpError(400, f"Job #{job.id} is {job.get_status_display()}, cannot run")
+
+    # Set to PENDING and clear interaction_id before queuing
+    job.status = ResearchJob.Status.PENDING
+    job.gemini_interaction_id = ""
+    job.error = ""
+    job.save()
+
+    start_research_job.delay(job.id)
+
+    return {"job_id": job.id, "status": "queued", "message": f"Job #{job.id} queued for processing"}
+
+
+def reprocess_research_job(job: ResearchJob) -> dict[str, t.Any]:
+    """Reprocess a research job that has raw_result.
+
+    This retries parsing/lead creation without re-running Gemini research.
+
+    Returns:
+        Dict with job_id, status, leads_created, and message.
+
+    Raises:
+        HttpError: 400 if the job has no raw_result to reprocess.
+    """
+    from leads.tasks import reprocess_job
+
+    if not job.raw_result:
+        raise HttpError(400, f"Job #{job.id} has no raw_result to reprocess")
+
+    result = reprocess_job(job.id)
+    return {
+        "job_id": job.id,
+        "status": "completed",
+        "leads_created": result["leads_created"],
+        "message": f"Reprocessed job #{job.id}, created {result['leads_created']} leads",
+    }

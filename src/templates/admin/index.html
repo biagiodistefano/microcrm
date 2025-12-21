@@ -1,0 +1,505 @@
+{% extends "admin/base_site.html" %}
+{% load static i18n unfold %}
+
+{% block title %}Dashboard | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div id="content-main">
+
+    {# Quick Access Buttons #}
+    <div class="flex flex-wrap gap-4 mb-6">
+        {% if dashboard.quick_actions %}
+            {% for action in dashboard.quick_actions %}
+                {% if action.external %}
+                    <a href="{{ action.url }}" target="_blank" rel="noopener noreferrer"
+                       class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-primary-500 dark:hover:bg-primary-600">
+                        <span class="mr-2">{{ action.icon }}</span>
+                        {{ action.title }}
+                    </a>
+                {% else %}
+                    <a href="{{ action.url }}"
+                       class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-primary-500 dark:hover:bg-primary-600">
+                        <span class="mr-2">{{ action.icon }}</span>
+                        {{ action.title }}
+                    </a>
+                {% endif %}
+            {% endfor %}
+        {% endif %}
+    </div>
+
+    <h1 class="text-2xl font-semibold text-gray-900 dark:text-gray-100 mb-6">MicroCRM Dashboard</h1>
+
+    {% if dashboard %}
+        {# Quick Stats Grid #}
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+            {# Total Leads #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow hover:shadow-lg hover:border-primary-300 dark:hover:border-primary-700 transition-all">
+                <a href="{{ dashboard.quick_stats.total_leads_url }}" class="block p-6">
+                    <h2 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Total Leads</h2>
+                    <div class="flex items-center justify-between mb-2">
+                        <p class="text-3xl font-bold text-primary-600 dark:text-primary-500">{{ dashboard.quick_stats.total_leads }}</p>
+                        <span class="text-4xl">👥</span>
+                    </div>
+                </a>
+                <div class="px-6 pb-6 pt-3 border-t border-base-200 dark:border-base-700 -mt-3">
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="text-gray-600 dark:text-gray-400 flex items-center gap-1">
+                            <span>📈</span>
+                            <span>Last 7 days</span>
+                        </span>
+                        <span class="font-semibold text-green-600 dark:text-green-500">+{{ dashboard.quick_stats.recent_leads }}</span>
+                    </div>
+                </div>
+            </div>
+
+            {# Hot Leads #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow hover:shadow-lg hover:border-red-300 dark:hover:border-red-700 transition-all">
+                <a href="{{ dashboard.quick_stats.hot_leads_url }}" class="block p-6 pb-3">
+                    <h2 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Hot Leads</h2>
+                    <div class="flex items-center justify-between">
+                        <p class="text-3xl font-bold text-red-600 dark:text-red-500">{{ dashboard.quick_stats.hot_leads }}</p>
+                        <span class="text-4xl">🔥</span>
+                    </div>
+                </a>
+                <div class="px-6 pb-6 pt-3 border-t border-base-200 dark:border-base-700">
+                    <a href="{{ dashboard.quick_stats.warm_leads_url }}" class="flex items-center justify-between text-sm hover:bg-gray-50 dark:hover:bg-base-800 -mx-2 px-2 py-1 rounded">
+                        <span class="text-gray-600 dark:text-gray-400 flex items-center gap-1">
+                            <span>🟡</span>
+                            <span>Warm</span>
+                        </span>
+                        <span class="font-semibold text-gray-900 dark:text-gray-100">{{ dashboard.quick_stats.warm_leads }}</span>
+                    </a>
+                </div>
+            </div>
+
+            {# Research Jobs #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow hover:shadow-lg hover:border-blue-300 dark:hover:border-blue-700 transition-all">
+                <a href="{{ dashboard.quick_stats.running_jobs_url }}" class="block p-6 pb-3">
+                    <h2 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Research Jobs</h2>
+                    <div class="flex items-center justify-between">
+                        <p class="text-3xl font-bold text-blue-600 dark:text-blue-500">{{ dashboard.quick_stats.running_jobs }}</p>
+                        <span class="text-4xl">🔬</span>
+                    </div>
+                </a>
+                <div class="px-6 pb-6 pt-3 border-t border-base-200 dark:border-base-700">
+                    <a href="{{ dashboard.quick_stats.completed_jobs_url }}" class="flex items-center justify-between text-sm hover:bg-gray-50 dark:hover:bg-base-800 -mx-2 px-2 py-1 rounded">
+                        <span class="text-gray-600 dark:text-gray-400 flex items-center gap-1">
+                            <span>✅</span>
+                            <span>Completed</span>
+                        </span>
+                        <span class="font-semibold text-gray-900 dark:text-gray-100">{{ dashboard.quick_stats.completed_jobs }}</span>
+                    </a>
+                </div>
+            </div>
+
+            {# Upcoming Actions #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow hover:shadow-lg hover:border-primary-300 dark:hover:border-primary-700 transition-all">
+                <a href="{{ dashboard.quick_stats.upcoming_actions_url }}" class="block p-6 pb-3">
+                    <h2 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Actions Due</h2>
+                    <div class="flex items-center justify-between">
+                        <p class="text-3xl font-bold {% if dashboard.quick_stats.overdue_actions > 0 %}text-red-600 dark:text-red-500{% else %}text-green-600 dark:text-green-500{% endif %}">{{ dashboard.quick_stats.upcoming_actions_count }}</p>
+                        <span class="text-4xl">📋</span>
+                    </div>
+                </a>
+                <div class="px-6 pb-6 pt-3 border-t border-base-200 dark:border-base-700">
+                    <a href="{{ dashboard.quick_stats.overdue_actions_url }}" class="flex items-center justify-between text-sm hover:bg-gray-50 dark:hover:bg-base-800 -mx-2 px-2 py-1 rounded">
+                        <span class="text-gray-600 dark:text-gray-400 flex items-center gap-1">
+                            <span>⚠️</span>
+                            <span>Overdue</span>
+                        </span>
+                        <span class="font-semibold {% if dashboard.quick_stats.overdue_actions > 0 %}text-red-600 dark:text-red-500{% else %}text-gray-900 dark:text-gray-100{% endif %}">{{ dashboard.quick_stats.overdue_actions }}</span>
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        {# Charts Row #}
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+            {# Leads by Status #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Leads by Status</h2>
+                <div class="h-64">
+                    <canvas id="statusChart"></canvas>
+                </div>
+            </div>
+
+            {# Leads by Temperature #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Leads by Temperature</h2>
+                <div class="h-64">
+                    <canvas id="temperatureChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        {# Lead Growth Chart #}
+        <div class="grid grid-cols-1 mb-8">
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Lead Growth (Last 30 Days)</h2>
+                <div class="h-64">
+                    <canvas id="leadGrowthChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        {# Analytics Row #}
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            {# Top Cities #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-4 text-gray-800 dark:text-gray-200">Top Cities</h2>
+                {% if dashboard.top_cities %}
+                    <div class="space-y-4">
+                        {% for city in dashboard.top_cities %}
+                            <a href="{{ city.url }}" class="block group">
+                                <div class="flex justify-between mb-1">
+                                    <span class="text-sm text-gray-600 dark:text-gray-400 group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors">{{ city.name }}</span>
+                                    <span class="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                                        {{ city.count }} ({{ city.percentage }}%)
+                                    </span>
+                                </div>
+                                <div class="w-full bg-gray-200 rounded-full h-2 dark:bg-gray-700">
+                                    <div class="bg-primary-600 group-hover:bg-primary-500 h-2 rounded-full transition-colors" style="width: {{ city.percentage }}%"></div>
+                                </div>
+                            </a>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <p class="text-gray-600 dark:text-gray-400">No leads yet</p>
+                {% endif %}
+            </div>
+
+            {# Top Lead Types #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-4 text-gray-800 dark:text-gray-200">Lead Types</h2>
+                {% if dashboard.top_lead_types %}
+                    <div class="space-y-4">
+                        {% for lead_type in dashboard.top_lead_types %}
+                            <a href="{{ lead_type.url }}" class="block group">
+                                <div class="flex justify-between mb-1">
+                                    <span class="text-sm text-gray-600 dark:text-gray-400 group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors">{{ lead_type.name }}</span>
+                                    <span class="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                                        {{ lead_type.count }} ({{ lead_type.percentage }}%)
+                                    </span>
+                                </div>
+                                <div class="w-full bg-gray-200 rounded-full h-2 dark:bg-gray-700">
+                                    <div class="bg-primary-500 group-hover:bg-primary-400 h-2 rounded-full transition-colors" style="width: {{ lead_type.percentage }}%"></div>
+                                </div>
+                            </a>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <p class="text-gray-600 dark:text-gray-400">No leads yet</p>
+                {% endif %}
+            </div>
+
+            {# Top Tags #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow p-6">
+                <h2 class="text-lg font-semibold mb-4 text-gray-800 dark:text-gray-200">Popular Tags</h2>
+                {% if dashboard.top_tags %}
+                    <div class="flex flex-wrap gap-2">
+                        {% for tag in dashboard.top_tags %}
+                            <a href="{{ tag.url }}" class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-primary-100 text-primary-800 dark:bg-primary-900 dark:text-primary-200 hover:bg-primary-200 dark:hover:bg-primary-800 transition-colors cursor-pointer">
+                                {{ tag.name }}
+                                <span class="ml-2 text-xs bg-primary-200 dark:bg-primary-800 rounded-full px-2 py-0.5">{{ tag.count }}</span>
+                            </a>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <p class="text-gray-600 dark:text-gray-400">No tags yet</p>
+                {% endif %}
+            </div>
+        </div>
+
+        {# System Health & Upcoming Actions #}
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+            {# System Health #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow overflow-hidden">
+                <div class="p-6">
+                    <h2 class="text-lg font-semibold mb-4 text-gray-800 dark:text-gray-200">
+                        System Health (Last {{ dashboard.system_health.days }} Days)
+                    </h2>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        {# Failed Tasks #}
+                        <div class="flex items-center gap-3">
+                            <span class="text-3xl">{% if dashboard.system_health.failed_tasks > 0 %}⚠️{% else %}✅{% endif %}</span>
+                            <div>
+                                <p class="text-2xl font-bold {% if dashboard.system_health.failed_tasks > 0 %}text-red-600 dark:text-red-500{% else %}text-green-600 dark:text-green-500{% endif %}">
+                                    {{ dashboard.system_health.failed_tasks }}
+                                </p>
+                                <p class="text-sm text-gray-600 dark:text-gray-400">Failed tasks</p>
+                            </div>
+                        </div>
+                        {# Running Jobs #}
+                        <div class="flex items-center gap-3">
+                            <span class="text-3xl">🔄</span>
+                            <div>
+                                <p class="text-2xl font-bold text-blue-600 dark:text-blue-500">
+                                    {{ dashboard.system_health.running_jobs }}
+                                </p>
+                                <p class="text-sm text-gray-600 dark:text-gray-400">Running jobs</p>
+                            </div>
+                        </div>
+                    </div>
+                    {# System Info #}
+                    <div class="mt-4 pt-4 border-t border-base-200 dark:border-base-700">
+                        <div class="grid grid-cols-2 gap-2 text-sm">
+                            <div class="flex justify-between">
+                                <span class="text-gray-600 dark:text-gray-400">Version</span>
+                                <span class="font-mono text-gray-900 dark:text-gray-100">{{ dashboard.system_info.version }}</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600 dark:text-gray-400">Debug</span>
+                                <span class="font-mono {% if dashboard.system_info.debug %}text-yellow-600{% else %}text-green-600{% endif %}">{{ dashboard.system_info.debug|yesno:"ON,OFF" }}</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600 dark:text-gray-400">Database</span>
+                                <span class="font-mono text-gray-900 dark:text-gray-100">{{ dashboard.system_info.database }}</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600 dark:text-gray-400">Celery</span>
+                                <span class="font-mono {% if dashboard.system_info.celery_eager %}text-yellow-600{% else %}text-green-600{% endif %}">{{ dashboard.system_info.celery_eager|yesno:"Eager,Async" }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% if dashboard.system_health.recent_failures %}
+                    <div class="border-t border-base-200 dark:border-base-700 p-4">
+                        <p class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Recent Task Failures:</p>
+                        <div class="space-y-2 max-h-40 overflow-y-auto">
+                            {% for failure in dashboard.system_health.recent_failures %}
+                                <div class="text-xs bg-gray-50 dark:bg-base-800 p-2 rounded">
+                                    <p class="font-medium text-gray-900 dark:text-gray-100">{{ failure.task_name }}</p>
+                                    <p class="text-gray-600 dark:text-gray-400">{{ failure.date_done|date:"Y-m-d H:i:s" }}</p>
+                                </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                {% endif %}
+            </div>
+
+            {# Upcoming Actions #}
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow overflow-hidden">
+                <div class="p-6">
+                    <h2 class="text-lg font-semibold mb-4 text-gray-800 dark:text-gray-200">
+                        Upcoming Actions (Next 7 Days)
+                    </h2>
+                    {% if dashboard.upcoming_actions %}
+                        <div class="space-y-3 max-h-80 overflow-y-auto">
+                            {% for lead in dashboard.upcoming_actions %}
+                                <a href="{% url 'admin:leads_lead_change' lead.id %}" class="block p-3 bg-gray-50 dark:bg-base-800 rounded-lg hover:bg-gray-100 dark:hover:bg-base-700 transition-colors">
+                                    <div class="flex justify-between items-start">
+                                        <div>
+                                            <p class="font-medium text-gray-900 dark:text-gray-100">{{ lead.name }}</p>
+                                            <p class="text-sm text-gray-600 dark:text-gray-400">{{ lead.next_action|default:"Follow up" }}</p>
+                                        </div>
+                                        <div class="text-right">
+                                            {% if lead.is_overdue %}
+                                                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">
+                                                    {{ lead.days_until }} days ago
+                                                </span>
+                                            {% elif lead.days_until == 0 %}
+                                                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                                                    Today
+                                                </span>
+                                            {% else %}
+                                                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200">
+                                                    In {{ lead.days_until }} days
+                                                </span>
+                                            {% endif %}
+                                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                                {% if lead.temperature == 'hot' %}🔴{% elif lead.temperature == 'warm' %}🟡{% else %}🔵{% endif %}
+                                                {{ lead.temperature|title }}
+                                            </p>
+                                        </div>
+                                    </div>
+                                </a>
+                            {% endfor %}
+                        </div>
+                    {% else %}
+                        <div class="text-center py-8">
+                            <span class="text-4xl">🎉</span>
+                            <p class="text-gray-600 dark:text-gray-400 mt-2">No upcoming actions scheduled</p>
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        {# Research Jobs Overview #}
+        {% if dashboard.recent_research_jobs %}
+        <div class="grid grid-cols-1 mb-8">
+            <div class="bg-white dark:bg-base-900 border border-base-200 dark:border-base-800 rounded-lg shadow overflow-hidden">
+                <div class="p-6">
+                    <h2 class="text-lg font-semibold mb-4 text-gray-800 dark:text-gray-200">Recent Research Jobs</h2>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                            <thead>
+                                <tr>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">City</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Leads Created</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Created</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Completed</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+                                {% for job in dashboard.recent_research_jobs %}
+                                    <tr class="hover:bg-gray-50 dark:hover:bg-base-800">
+                                        <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                                            <a href="{% url 'admin:leads_researchjob_change' job.id %}" class="hover:text-primary-600">
+                                                {{ job.city }}
+                                            </a>
+                                        </td>
+                                        <td class="px-4 py-3 whitespace-nowrap">
+                                            {% if job.status == 'completed' %}
+                                                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">✅ Completed</span>
+                                            {% elif job.status == 'running' %}
+                                                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200">🔄 Running</span>
+                                            {% elif job.status == 'pending' %}
+                                                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">⏳ Pending</span>
+                                            {% else %}
+                                                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">❌ Failed</span>
+                                            {% endif %}
+                                        </td>
+                                        <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                                            {{ job.leads_created }}
+                                        </td>
+                                        <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                            {{ job.created_at|date:"M d, H:i" }}
+                                        </td>
+                                        <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                            {% if job.completed_at %}
+                                                {{ job.completed_at|date:"M d, H:i" }}
+                                            {% else %}
+                                                -
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+    {% else %}
+        <p class="text-gray-600 dark:text-gray-400">Dashboard data could not be loaded.</p>
+    {% endif %}
+
+</div>
+
+{# JavaScript for Charts #}
+{% block extrahead %}
+    {{ block.super }}
+    {% if dashboard %}
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Status Chart (Doughnut)
+            const statusCtx = document.getElementById('statusChart');
+            if (statusCtx) {
+                new Chart(statusCtx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: {{ dashboard.charts.status_labels|safe }},
+                        datasets: [{
+                            data: {{ dashboard.charts.status_data|safe }},
+                            backgroundColor: [
+                                '#3b82f6',  // New - blue
+                                '#f59e0b',  // Contacted - amber
+                                '#10b981',  // Qualified - green
+                                '#059669',  // Converted - darker green
+                                '#ef4444',  // Lost - red
+                            ],
+                            borderWidth: 0
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                position: 'bottom',
+                                labels: {
+                                    padding: 20,
+                                    usePointStyle: true
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Temperature Chart (Doughnut)
+            const tempCtx = document.getElementById('temperatureChart');
+            if (tempCtx) {
+                new Chart(tempCtx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: {{ dashboard.charts.temp_labels|safe }},
+                        datasets: [{
+                            data: {{ dashboard.charts.temp_data|safe }},
+                            backgroundColor: [
+                                '#3b82f6',  // Cold - blue
+                                '#f59e0b',  // Warm - amber
+                                '#ef4444',  // Hot - red
+                            ],
+                            borderWidth: 0
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                position: 'bottom',
+                                labels: {
+                                    padding: 20,
+                                    usePointStyle: true
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Lead Growth Chart (Line)
+            const growthCtx = document.getElementById('leadGrowthChart');
+            if (growthCtx) {
+                new Chart(growthCtx, {
+                    type: 'line',
+                    data: {
+                        labels: {{ dashboard.charts.growth_labels|safe }},
+                        datasets: [{
+                            label: 'New Leads',
+                            data: {{ dashboard.charts.growth_data|safe }},
+                            borderColor: 'rgb(168, 85, 247)',
+                            backgroundColor: 'rgba(168, 85, 247, 0.1)',
+                            tension: 0.4,
+                            fill: true
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { display: false }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: { stepSize: 1 }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    </script>
+    {% endif %}
+{% endblock %}
+
+{% endblock %}

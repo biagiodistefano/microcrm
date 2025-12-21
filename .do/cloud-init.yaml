@@ -1,0 +1,125 @@
+#cloud-config
+# DigitalOcean Cloud-Init for MicroCRM
+#
+# Usage:
+#   1. Create a droplet with this user-data
+#   2. SSH into the droplet
+#   3. Run: cd /opt/microcrm && ./prod_wizard.sh
+#
+# Or use environment variables for non-interactive setup:
+#   Set these in DigitalOcean's droplet metadata or pass via user-data
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - git
+  - curl
+  - ca-certificates
+
+write_files:
+  - path: /opt/microcrm-setup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+
+      echo "=== MicroCRM DigitalOcean Setup ==="
+
+      # Install Docker
+      if ! command -v docker &> /dev/null; then
+          echo "Installing Docker..."
+          curl -fsSL https://get.docker.com | sh
+          systemctl enable docker
+          systemctl start docker
+      fi
+
+      # Clone repository
+      if [ ! -d /opt/microcrm ]; then
+          echo "Cloning MicroCRM..."
+          git clone https://github.com/biagiodistefano/microcrm.git /opt/microcrm
+      fi
+
+      cd /opt/microcrm
+
+      # Check for environment variables (non-interactive mode)
+      if [ -n "$MICROCRM_DOMAIN" ]; then
+          echo "Configuring from environment variables..."
+
+          # Generate passwords if not provided
+          DB_PASS=${MICROCRM_DB_PASSWORD:-$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)}
+          SECRET=${MICROCRM_SECRET_KEY:-$(openssl rand -base64 48 | tr -d '/+=')}
+          API_KEY=${MICROCRM_API_KEY:-$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)}
+
+          cat > .env.prod << EOF
+      # MicroCRM Production Configuration
+      # ALLOWED_HOSTS and CSRF_TRUSTED_ORIGINS are derived from DOMAIN in settings.py
+      DOMAIN=${MICROCRM_DOMAIN}
+
+      # Superuser
+      SUPERUSER_USERNAME=${MICROCRM_ADMIN_USER:-admin}
+      SUPERUSER_EMAIL=${MICROCRM_ADMIN_EMAIL:-admin@${MICROCRM_DOMAIN}}
+      SUPERUSER_PASSWORD=${MICROCRM_ADMIN_PASSWORD:-admin}
+
+      # Django
+      SECRET_KEY=${SECRET}
+      DEBUG=False
+      SITE_NAME=MicroCRM
+
+      # Database
+      DB_NAME=microcrm
+      DB_USER=microcrm
+      DB_PASSWORD=${DB_PASS}
+      DB_HOST=postgres
+      DB_PORT=5432
+
+      # Redis & Celery
+      REDIS_HOST=redis
+      REDIS_PORT=6379
+      CELERY_TASK_ALWAYS_EAGER=False
+
+      # API
+      API_KEY=${API_KEY}
+
+      # Gemini AI
+      GEMINI_API_KEY=${MICROCRM_GEMINI_KEY:-}
+
+      # Google SSO
+      GOOGLE_SSO_CLIENT_ID=${MICROCRM_GOOGLE_CLIENT_ID:-}
+      GOOGLE_SSO_CLIENT_SECRET=${MICROCRM_GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_SSO_PROJECT_ID=${MICROCRM_GOOGLE_PROJECT_ID:-}
+      GOOGLE_SSO_SUPERUSER_LIST=${MICROCRM_GOOGLE_SUPERUSERS:-}
+      EOF
+
+          echo "Starting MicroCRM..."
+          docker compose -f compose.prod.yaml up --build -d
+
+          echo ""
+          echo "=== MicroCRM Deployed! ==="
+          echo "URL: https://${MICROCRM_DOMAIN}"
+          echo "Admin: https://${MICROCRM_DOMAIN}/admin/"
+          echo ""
+      else
+          echo ""
+          echo "=== Setup Complete ==="
+          echo "Run the production wizard to configure and start MicroCRM:"
+          echo ""
+          echo "  cd /opt/microcrm"
+          echo "  ./prod_wizard.sh"
+          echo ""
+      fi
+
+runcmd:
+  - /opt/microcrm-setup.sh
+
+final_message: |
+  ===========================================
+  MicroCRM server is ready!
+
+  To complete setup, SSH into the server and run:
+    cd /opt/microcrm
+    ./prod_wizard.sh
+
+  Or if you provided MICROCRM_DOMAIN environment variable,
+  the application should already be running.
+  ===========================================
