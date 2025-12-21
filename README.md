@@ -4,7 +4,7 @@
 
 <!-- Status & Version -->
 [![Version](https://img.shields.io/github/v/release/biagiodistefano/microcrm?style=for-the-badge&label=version)](https://github.com/biagiodistefano/microcrm/releases)
-[![License](https://img.shields.io/github/license/biagiodistefano/microcrm?style=for-the-badge)](./LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](./LICENSE)
 
 <!-- CI/CD -->
 [![Tests](https://img.shields.io/github/actions/workflow/status/biagiodistefano/microcrm/test.yaml?branch=main&label=tests&style=for-the-badge)](https://github.com/biagiodistefano/microcrm/actions/workflows/test.yaml)
@@ -36,6 +36,24 @@ Traditional CRMs are either too complex (enterprise-focused with endless feature
 *   **Smart Deduplication:** Automatically merges research results with existing leads, filling in blanks without overwriting valuable data.
 *   **REST API First:** Fully documented API (Django Ninja) for easy integration with other tools.
 *   **Self-Hostable:** Run it on your own infrastructure, keep control of your data.
+
+---
+
+## Screenshots
+
+<div align="center">
+
+**Dashboard Overview**
+
+![Dashboard - KPIs and Charts](docs/screenshots/dashboard_0.png)
+
+![Dashboard - Trends and Analytics](docs/screenshots/dashboard_1.png)
+
+**AI Research Jobs**
+
+![Research Jobs List](docs/screenshots/research_jobs.png)
+
+</div>
 
 ---
 
