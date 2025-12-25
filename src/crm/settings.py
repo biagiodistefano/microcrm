@@ -164,6 +164,21 @@ GOOGLE_SSO_SUPERUSER_LIST = [
 GOOGLE_SSO_STAFF_LIST = GOOGLE_SSO_SUPERUSER_LIST
 SSO_SHOW_FORM_ON_ADMIN_PAGE = DEBUG
 
+# Email
+EMAIL_HOST = config("EMAIL_HOST", default="smtp.gmail.com")
+EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
+EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=True, cast=bool)
+EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
+DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="MicroCRM <noreply@example.com>")
+EMAIL_DRY_RUN = config("EMAIL_DRY_RUN", default=DEBUG, cast=bool)
+
+if EMAIL_DRY_RUN:
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+
 # Unfold
 UNFOLD = {
     "SITE_TITLE": "MicroCRM",
@@ -212,6 +227,23 @@ UNFOLD = {
                     },
                     {"title": "Tags", "icon": "label", "link": reverse_lazy("admin:leads_tag_changelist")},
                     {"title": "Cities", "icon": "location_city", "link": reverse_lazy("admin:leads_city_changelist")},
+                ],
+            },
+            {
+                "title": "Email",
+                "separator": True,
+                "collapsible": True,
+                "items": [
+                    {
+                        "title": "Templates",
+                        "icon": "draft",
+                        "link": reverse_lazy("admin:leads_emailtemplate_changelist"),
+                    },
+                    {
+                        "title": "Sent Emails",
+                        "icon": "outgoing_mail",
+                        "link": reverse_lazy("admin:leads_emailsent_changelist"),
+                    },
                 ],
             },
             {

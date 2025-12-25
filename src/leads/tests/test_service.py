@@ -1,8 +1,10 @@
 """Tests for leads service."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
-from leads.models import City, Lead, LeadType, Tag
+from leads.models import City, EmailSent, EmailTemplate, Lead, LeadType, Tag
 from leads.schema import CityIn, LeadIn, LeadPatch
 from leads.service import (
     create_lead,
@@ -10,7 +12,10 @@ from leads.service import (
     get_or_create_lead_type,
     get_or_create_tags,
     patch_lead,
+    render_email_template,
+    send_email_to_lead,
     update_lead,
+    validate_no_placeholders,
 )
 
 pytestmark = pytest.mark.django_db
@@ -152,3 +157,151 @@ class TestPatchLead:
         tag_names = list(patched.tags.values_list("name", flat=True))
         assert "PatchTag1" in tag_names
         assert "PatchTag2" in tag_names
+
+
+class TestRenderEmailTemplate:
+    """Tests for render_email_template function."""
+
+    def test_renders_all_placeholders(self, lead: Lead, email_template: EmailTemplate) -> None:
+        subject, body = render_email_template(email_template, lead)
+
+        assert subject == "Hello Test Lead!"
+        assert "Hi Test Lead," in body
+        assert "Berlin, Germany" in body
+
+    def test_handles_missing_lead_data(self, email_template: EmailTemplate) -> None:
+        lead = Lead.objects.create(name="Minimal Lead")
+        subject, body = render_email_template(email_template, lead)
+
+        assert subject == "Hello Minimal Lead!"
+        assert "Hi Minimal Lead," in body
+        # City placeholder replaced with empty string
+        assert "you're from ." in body
+
+    def test_preserves_template_without_placeholders(
+        self, lead: Lead, email_template_no_placeholders: EmailTemplate
+    ) -> None:
+        subject, body = render_email_template(email_template_no_placeholders, lead)
+
+        assert subject == "General Announcement"
+        assert body == "This is a general message with no personalization."
+
+
+class TestValidateNoPlaceholders:
+    """Tests for validate_no_placeholders function."""
+
+    def test_returns_empty_list_for_clean_text(self) -> None:
+        result = validate_no_placeholders("Hello World", "This is clean text")
+        assert result == []
+
+    def test_finds_placeholders_in_subject(self) -> None:
+        result = validate_no_placeholders("Hello {name}!", "Clean body")
+        assert "{name}" in result
+
+    def test_finds_placeholders_in_body(self) -> None:
+        result = validate_no_placeholders("Clean subject", "Hello {lead.name}, from {lead.city}")
+        assert "{lead.name}" in result
+        assert "{lead.city}" in result
+
+    def test_finds_placeholders_in_both(self) -> None:
+        result = validate_no_placeholders("Hi {name}", "You are from {city}")
+        assert len(result) == 2
+        assert "{name}" in result
+        assert "{city}" in result
+
+
+class TestSendEmailToLead:
+    """Tests for send_email_to_lead function."""
+
+    @patch("leads.service.EmailMessage")
+    def test_sends_email_and_creates_record(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        mock_email = mock_email_class.return_value
+
+        email_sent = send_email_to_lead(
+            lead=lead,
+            subject="Test Subject",
+            body="Test Body",
+            to=["recipient@example.com"],
+        )
+
+        assert email_sent.lead == lead
+        assert email_sent.subject == "Test Subject"
+        assert email_sent.body == "Test Body"
+        assert email_sent.to == ["recipient@example.com"]
+        assert email_sent.status == EmailSent.Status.SENT
+        assert email_sent.sent_at is not None
+        mock_email.send.assert_called_once_with(fail_silently=False)
+
+    @patch("leads.service.EmailMessage")
+    def test_updates_lead_last_contact(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        assert lead.last_contact is None
+
+        send_email_to_lead(
+            lead=lead,
+            subject="Test",
+            body="Test",
+            to=["test@example.com"],
+        )
+
+        lead.refresh_from_db()
+        assert lead.last_contact is not None
+
+    @patch("leads.service.EmailMessage")
+    def test_includes_bcc_recipients(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        send_email_to_lead(
+            lead=lead,
+            subject="Test",
+            body="Test",
+            to=["to@example.com"],
+            bcc=["bcc@example.com"],
+        )
+
+        mock_email_class.assert_called_once()
+        call_kwargs = mock_email_class.call_args.kwargs
+        assert call_kwargs["bcc"] == ["bcc@example.com"]
+
+    @patch("leads.service.EmailMessage")
+    def test_associates_template_with_record(
+        self, mock_email_class: MagicMock, lead: Lead, email_template: EmailTemplate
+    ) -> None:
+        email_sent = send_email_to_lead(
+            lead=lead,
+            subject="Test",
+            body="Test",
+            to=["test@example.com"],
+            template=email_template,
+        )
+
+        assert email_sent.template == email_template
+
+    def test_raises_error_for_unreplaced_placeholders(self, lead: Lead) -> None:
+        with pytest.raises(ValueError, match="Unreplaced placeholders"):
+            send_email_to_lead(
+                lead=lead,
+                subject="Hello {name}",
+                body="Test",
+                to=["test@example.com"],
+            )
+
+        # No EmailSent record should be created
+        assert EmailSent.objects.count() == 0
+
+    @patch("leads.service.EmailMessage")
+    def test_marks_failed_on_send_error(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        mock_email = mock_email_class.return_value
+        mock_email.send.side_effect = Exception("SMTP error")
+
+        with pytest.raises(Exception, match="SMTP error"):
+            send_email_to_lead(
+                lead=lead,
+                subject="Test",
+                body="Test",
+                to=["test@example.com"],
+            )
+
+        email_sent = EmailSent.objects.get(lead=lead)
+        assert email_sent.status == EmailSent.Status.FAILED
+        assert "SMTP error" in email_sent.error_message
+        # last_contact should NOT be updated on failure
+        lead.refresh_from_db()
+        assert lead.last_contact is None

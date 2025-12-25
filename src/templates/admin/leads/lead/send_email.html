@@ -1,0 +1,239 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block extrahead %}
+{{ block.super }}
+<style>
+    .send-email-form {
+        max-width: 800px;
+    }
+    .send-email-form .form-row {
+        margin-bottom: 1rem;
+    }
+    .send-email-form label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+    }
+    .send-email-form input[type="text"],
+    .send-email-form textarea,
+    .send-email-form select {
+        width: 100%;
+        padding: 0.5rem;
+        border: 1px solid var(--border-color, #ccc);
+        border-radius: 0.375rem;
+        font-family: inherit;
+        font-size: 0.875rem;
+    }
+    .send-email-form textarea {
+        min-height: 300px;
+        font-family: monospace;
+    }
+    .send-email-form .help {
+        font-size: 0.75rem;
+        color: var(--body-quiet-color, #666);
+        margin-top: 0.25rem;
+    }
+    .send-email-form .readonly-field {
+        padding: 0.5rem;
+        background: #e5e7eb;
+        border: 1px solid #d1d5db;
+        border-radius: 0.375rem;
+        color: #374151;
+    }
+    .send-email-form .errorlist {
+        color: var(--error-fg, #c00);
+        list-style: none;
+        padding: 0;
+        margin: 0.25rem 0;
+    }
+    .send-email-form .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .send-email-form .checkbox-row input[type="checkbox"] {
+        width: auto;
+    }
+    .lead-info {
+        background: #f3f4f6;
+        padding: 1rem;
+        border-radius: 0.375rem;
+        margin-bottom: 1.5rem;
+        border: 1px solid #e5e7eb;
+    }
+    .lead-info h3 {
+        margin: 0 0 0.5rem 0;
+        color: #111827;
+    }
+    .lead-info p {
+        margin: 0.25rem 0;
+        color: #4b5563;
+    }
+    .lead-info p strong {
+        color: #111827;
+    }
+    .template-warning {
+        background: #fef3c7;
+        border: 1px solid #f59e0b;
+        color: #92400e;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.375rem;
+        margin-top: 0.5rem;
+        font-size: 0.875rem;
+        display: none;
+    }
+    .template-warning.visible {
+        display: block;
+    }
+    .button-row {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 1.5rem;
+    }
+    .button-row button,
+    .button-row a {
+        padding: 0.5rem 1rem;
+        border-radius: 0.375rem;
+        text-decoration: none;
+        font-weight: 500;
+        cursor: pointer;
+    }
+    .button-row button[type="submit"] {
+        background: var(--primary, #417690);
+        color: white;
+        border: none;
+    }
+    .button-row button[type="submit"]:hover {
+        opacity: 0.9;
+    }
+    .button-row a.cancel {
+        background: var(--close-button-bg, #888);
+        color: white;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="send-email-form">
+    <div class="lead-info">
+        <h3>Sending email to: {{ lead.name }}</h3>
+        {% if lead.company %}<p><strong>Company:</strong> {{ lead.company }}</p>{% endif %}
+        {% if lead.city %}<p><strong>City:</strong> {{ lead.city }}</p>{% endif %}
+        {% if lead.lead_type %}<p><strong>Type:</strong> {{ lead.lead_type }}</p>{% endif %}
+    </div>
+
+    {% if form.non_field_errors %}
+    <div class="errornote">
+        {{ form.non_field_errors }}
+    </div>
+    {% endif %}
+
+    <form method="post" id="send-email-form">
+        {% csrf_token %}
+
+        <div class="form-row">
+            <label for="id_template">Template</label>
+            {{ form.template }}
+            {% if form.template.help_text %}<p class="help">{{ form.template.help_text }}</p>{% endif %}
+            {{ form.template.errors }}
+            <div id="template-warning" class="template-warning">
+                This template has already been used for this lead.
+            </div>
+        </div>
+
+        <div class="form-row">
+            <label>From</label>
+            <div class="readonly-field">{{ from_email }}</div>
+        </div>
+
+        <div class="form-row">
+            <label for="id_to">To</label>
+            {{ form.to }}
+            {% if form.to.help_text %}<p class="help">{{ form.to.help_text }}</p>{% endif %}
+            {{ form.to.errors }}
+        </div>
+
+        <div class="form-row">
+            <label for="id_bcc">BCC</label>
+            {{ form.bcc }}
+            {% if form.bcc.help_text %}<p class="help">{{ form.bcc.help_text }}</p>{% endif %}
+            {{ form.bcc.errors }}
+        </div>
+
+        <div class="form-row">
+            <label for="id_subject">Subject</label>
+            {{ form.subject }}
+            {{ form.subject.errors }}
+        </div>
+
+        <div class="form-row">
+            <label for="id_body">Body</label>
+            {{ form.body }}
+            {{ form.body.errors }}
+        </div>
+
+        <div class="form-row checkbox-row">
+            {{ form.send_in_background }}
+            <label for="id_send_in_background" style="display: inline; font-weight: normal;">
+                Send in background (via Celery)
+            </label>
+            {% if form.send_in_background.help_text %}<p class="help">{{ form.send_in_background.help_text }}</p>{% endif %}
+        </div>
+
+        <div class="button-row">
+            <button type="submit">Send Email</button>
+            <a href="{% url 'admin:leads_lead_change' lead.id %}" class="cancel">Cancel</a>
+        </div>
+    </form>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const templateSelect = document.getElementById('id_template');
+    const subjectInput = document.getElementById('id_subject');
+    const bodyInput = document.getElementById('id_body');
+    const templateWarning = document.getElementById('template-warning');
+    const leadId = {{ lead.id }};
+    // Build the base URL from current page URL (remove 'send-email/' from the end)
+    const baseUrl = window.location.pathname.replace(/send-email\/$/, '');
+    // Template IDs already used for this lead
+    const usedTemplateIds = {{ used_template_ids|safe }};
+
+    function checkTemplateWarning(templateId) {
+        if (templateId && usedTemplateIds.includes(parseInt(templateId))) {
+            templateWarning.classList.add('visible');
+        } else {
+            templateWarning.classList.remove('visible');
+        }
+    }
+
+    if (templateSelect) {
+        // Check on page load if a template is pre-selected
+        checkTemplateWarning(templateSelect.value);
+
+        templateSelect.addEventListener('change', function() {
+            const templateId = this.value;
+
+            // Check if template was already used
+            checkTemplateWarning(templateId);
+
+            if (!templateId) {
+                return;
+            }
+
+            // Fetch rendered template via AJAX
+            fetch(`${baseUrl}render-template/${templateId}/`)
+                .then(response => response.json())
+                .then(data => {
+                    if (subjectInput) subjectInput.value = data.subject;
+                    if (bodyInput) bodyInput.value = data.body;
+                })
+                .catch(error => {
+                    console.error('Error fetching template:', error);
+                });
+        });
+    }
+});
+</script>
+{% endblock %}

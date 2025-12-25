@@ -449,3 +449,53 @@ def _find_existing_lead(data: ResearchLead, city: City) -> Lead | None:
 
     # Name + city match as fallback
     return Lead.objects.filter(name__iexact=data.name, city=city).first()
+
+
+# --- Email Tasks ---
+
+
+@shared_task
+def send_email_task(
+    lead_id: int,
+    subject: str,
+    body: str,
+    to: list[str],
+    bcc: list[str] | None = None,
+    template_id: int | None = None,
+) -> dict[str, t.Any]:
+    """Send an email to a lead in the background.
+
+    Args:
+        lead_id: The ID of the Lead
+        subject: Rendered subject line
+        body: Rendered email body
+        to: List of recipient email addresses
+        bcc: Optional list of BCC email addresses
+        template_id: Optional EmailTemplate ID (for reference)
+
+    Returns:
+        Dict with email_sent_id and status
+    """
+    from leads.models import EmailTemplate
+    from leads.service import send_email_to_lead
+
+    lead = Lead.objects.get(id=lead_id)
+    template = EmailTemplate.objects.get(id=template_id) if template_id else None
+
+    try:
+        email_sent = send_email_to_lead(
+            lead=lead,
+            subject=subject,
+            body=body,
+            to=to,
+            bcc=bcc,
+            template=template,
+        )
+        return {"email_sent_id": email_sent.id, "status": "sent"}
+    except ValueError as e:
+        # Placeholder validation error
+        logger.error("Email validation error for lead %s: %s", lead_id, e)
+        return {"email_sent_id": None, "status": "failed", "error": str(e)}
+    except Exception as e:
+        logger.exception("Error sending email to lead %s", lead_id)
+        return {"email_sent_id": None, "status": "failed", "error": str(e)}

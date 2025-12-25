@@ -1,10 +1,13 @@
 import typing as t
 from datetime import date
 
+from django import forms
+from django.conf import settings
 from django.contrib import admin, messages
 from django.db.models import DateField, QuerySet
-from django.http import HttpRequest, HttpResponse
-from django.urls import reverse
+from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import path, reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from simple_history.admin import SimpleHistoryAdmin
@@ -15,6 +18,8 @@ from unfold.decorators import action
 from unfold.widgets import UnfoldAdminSingleDateWidget
 
 from . import models
+from . import service as lead_service
+from . import tasks as lead_tasks
 
 
 class HasContactFieldFilter(admin.SimpleListFilter):
@@ -183,6 +188,67 @@ class ActionInline(TabularInline):  # type: ignore[misc]
     }
 
 
+class SendEmailForm(forms.Form):
+    """Form for sending email to a lead."""
+
+    template = forms.ModelChoiceField(
+        queryset=models.EmailTemplate.objects.all(),
+        required=False,
+        empty_label="-- Select a template --",
+        help_text="Select a template to auto-populate subject and body",
+    )
+    to = forms.CharField(
+        widget=forms.TextInput(attrs={"class": "vTextField"}),
+        help_text="Comma-separated list of email addresses",
+    )
+    bcc = forms.CharField(
+        required=False,
+        widget=forms.TextInput(attrs={"class": "vTextField"}),
+        help_text="Comma-separated list of BCC email addresses (optional)",
+    )
+    subject = forms.CharField(
+        max_length=255,
+        widget=forms.TextInput(attrs={"class": "vTextField"}),
+    )
+    body = forms.CharField(
+        widget=forms.Textarea(attrs={"class": "vLargeTextField", "rows": 15}),
+    )
+    send_in_background = forms.BooleanField(
+        required=False,
+        initial=False,
+        help_text="Send email asynchronously via Celery",
+    )
+
+    def clean_to(self) -> list[str]:
+        """Parse comma-separated email addresses."""
+        value = self.cleaned_data["to"]
+        emails = [e.strip() for e in value.split(",") if e.strip()]
+        if not emails:
+            raise forms.ValidationError("At least one recipient is required")
+        return emails
+
+    def clean_bcc(self) -> list[str]:
+        """Parse comma-separated BCC email addresses."""
+        value = self.cleaned_data.get("bcc", "")
+        if not value:
+            return []
+        return [e.strip() for e in value.split(",") if e.strip()]
+
+    def clean(self) -> dict[str, t.Any]:
+        """Validate no placeholders remain in subject or body."""
+        cleaned_data = super().clean()
+        if cleaned_data is None:
+            return {}
+        subject = cleaned_data.get("subject", "")
+        body = cleaned_data.get("body", "")
+
+        unreplaced = lead_service.validate_no_placeholders(subject, body)
+        if unreplaced:
+            raise forms.ValidationError(f"Unreplaced placeholders found: {', '.join(unreplaced)}")
+
+        return cleaned_data
+
+
 @admin.register(models.Lead)
 class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin):  # type: ignore[misc]
     """Admin for Lead model."""
@@ -240,6 +306,106 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         ("Notes", {"fields": ("notes",)}),
         ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
     )
+
+    def get_urls(self) -> list[t.Any]:
+        """Add custom URLs for email functionality."""
+        urls: list[t.Any] = super().get_urls()
+        custom_urls = [
+            path(
+                "<int:lead_id>/send-email/",
+                self.admin_site.admin_view(self.send_email_view),
+                name="leads_lead_send_email",
+            ),
+            path(
+                "<int:lead_id>/render-template/<int:template_id>/",
+                self.admin_site.admin_view(self.render_template_view),
+                name="leads_lead_render_template",
+            ),
+        ]
+        return custom_urls + urls
+
+    def send_email_view(self, request: HttpRequest, lead_id: int) -> HttpResponse:
+        """Custom view for sending email to a lead."""
+        lead = get_object_or_404(models.Lead, id=lead_id)
+
+        if request.method == "POST":
+            form = SendEmailForm(request.POST)
+            if form.is_valid():
+                result = self._process_send_email(request, lead, form)
+                if result:
+                    return result
+        else:
+            initial = {"to": lead.email} if lead.email else {}
+            form = SendEmailForm(initial=initial)
+
+        return self._render_send_email_form(request, lead, form)
+
+    def _process_send_email(self, request: HttpRequest, lead: models.Lead, form: SendEmailForm) -> HttpResponse | None:
+        """Process the send email form submission.
+
+        Returns redirect on success, None on failure (to re-render form with errors).
+        """
+        data = form.cleaned_data
+        template = data.get("template")
+
+        try:
+            if data.get("send_in_background"):
+                lead_tasks.send_email_task.delay(
+                    lead_id=lead.id,
+                    subject=data["subject"],
+                    body=data["body"],
+                    to=data["to"],
+                    bcc=data["bcc"],
+                    template_id=template.id if template else None,
+                )
+                messages.success(request, f"Email to {lead.name} queued for background sending.")
+            else:
+                lead_service.send_email_to_lead(
+                    lead=lead,
+                    subject=data["subject"],
+                    body=data["body"],
+                    to=data["to"],
+                    bcc=data["bcc"],
+                    template=template,
+                )
+                messages.success(request, f"Email sent successfully to {lead.name}.")
+
+            return redirect(reverse("admin:leads_lead_change", args=[lead.id]))
+
+        except ValueError as e:
+            messages.error(request, str(e))
+        except Exception as e:
+            messages.error(request, f"Failed to send email: {e}")
+
+        return None
+
+    def _render_send_email_form(self, request: HttpRequest, lead: models.Lead, form: SendEmailForm) -> HttpResponse:
+        """Render the send email form."""
+        # Get template IDs already used for this lead
+        used_template_ids = list(
+            models.EmailSent.objects.filter(lead=lead, template__isnull=False)
+            .values_list("template_id", flat=True)
+            .distinct()
+        )
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Send Email to {lead.name}",
+            "lead": lead,
+            "form": form,
+            "from_email": settings.DEFAULT_FROM_EMAIL,
+            "used_template_ids": used_template_ids,
+            "opts": self.model._meta,
+            "has_view_permission": True,
+        }
+        return render(request, "admin/leads/lead/send_email.html", context)
+
+    def render_template_view(self, request: HttpRequest, lead_id: int, template_id: int) -> JsonResponse:
+        """AJAX endpoint to render a template for a lead."""
+        lead = get_object_or_404(models.Lead, id=lead_id)
+        template = get_object_or_404(models.EmailTemplate, id=template_id)
+
+        subject, body = lead_service.render_email_template(template, lead)
+        return JsonResponse({"subject": subject, "body": body})
 
     # Bulk actions for status
     @admin.action(description="→ Set status: Contacted")
@@ -358,10 +524,16 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
 
     @admin.display(description="Email")
     def display_email(self, obj: models.Lead) -> str:
-        """Display email as mailto link."""
+        """Display email with link to send email view."""
         if not obj.email:
             return "-"
-        return format_html('<a href="mailto:{}" onclick="event.stopPropagation()">{}</a>', obj.email, obj.email)
+        send_url = reverse("admin:leads_lead_send_email", args=[obj.id])
+        return format_html(
+            '<a href="{}" onclick="event.stopPropagation()" title="Send email to {}">{}</a>',
+            send_url,
+            obj.email,
+            obj.email,
+        )
 
     @admin.display(description="Links")
     def display_socials(self, obj: models.Lead) -> str:
@@ -626,6 +798,85 @@ class ActionAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
             instance.save(update_fields=["status", "completed_at"])
             self.message_user(request, f"Marked '{instance.name}' as completed", messages.SUCCESS)
         return HttpResponseRedirect(request.META.get("HTTP_REFERER", reverse("admin:leads_action_changelist")))
+
+
+@admin.register(models.EmailTemplate)
+class EmailTemplateAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
+    """Admin for EmailTemplate model."""
+
+    list_display = ["name", "subject", "updated_at"]
+    search_fields = ["name", "subject", "body"]
+    readonly_fields = ["created_at", "updated_at"]
+    ordering = ["name"]
+
+    fieldsets = (
+        (None, {"fields": ("name", "subject", "body")}),
+        ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
+    )
+
+
+@admin.register(models.EmailSent)
+class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
+    """Admin for EmailSent model."""
+
+    list_display = ["id", "lead_link", "subject", "display_status", "display_recipients", "sent_at", "created_at"]
+    list_filter = ["status", ("sent_at", RangeDateFilter), ("created_at", RangeDateFilter)]
+    search_fields = ["subject", "body", "lead__name", "to", "from_email"]
+    readonly_fields = [
+        "lead",
+        "template",
+        "from_email",
+        "to",
+        "bcc",
+        "subject",
+        "body",
+        "status",
+        "error_message",
+        "created_at",
+        "sent_at",
+    ]
+    ordering = ["-created_at"]
+    list_per_page = 25
+
+    fieldsets = (
+        (None, {"fields": ("lead", "template", "status")}),
+        ("Recipients", {"fields": ("from_email", "to", "bcc")}),
+        ("Content", {"fields": ("subject", "body")}),
+        ("Status", {"fields": ("error_message", "created_at", "sent_at")}),
+    )
+
+    def lead_link(self, obj: models.EmailSent) -> str:
+        """Return a link to the lead."""
+        url = reverse("admin:leads_lead_change", args=[obj.lead.id])
+        return format_html('<a href="{}">{}</a>', url, obj.lead.name)
+
+    lead_link.short_description = "Lead"  # type: ignore[attr-defined]
+
+    @admin.display(description="Status")
+    def display_status(self, obj: models.EmailSent) -> str:
+        """Display status with colored badge."""
+        colors: dict[str, str] = {
+            models.EmailSent.Status.PENDING: "#f59e0b",  # amber
+            models.EmailSent.Status.SENT: "#10b981",  # green
+            models.EmailSent.Status.FAILED: "#ef4444",  # red
+        }
+        color = colors.get(obj.status, "#666")
+        return format_html(
+            '<span style="background: {}; color: white; padding: 2px 8px; '
+            'border-radius: 4px; font-size: 0.8em;">{}</span>',
+            color,
+            obj.get_status_display(),
+        )
+
+    @admin.display(description="To")
+    def display_recipients(self, obj: models.EmailSent) -> str:
+        """Display recipient list."""
+        recipients: list[str] = obj.to if isinstance(obj.to, list) else []
+        if not recipients:
+            return "-"
+        if len(recipients) == 1:
+            return recipients[0]
+        return f"{recipients[0]} (+{len(recipients) - 1})"
 
 
 @admin.register(models.ResearchPromptConfig)
