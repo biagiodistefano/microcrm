@@ -249,8 +249,9 @@ class TestLeadAdminDisplayMethods:
 
     def test_display_email_with_email(self, lead_admin: LeadAdmin, lead: models.Lead) -> None:
         result = lead_admin.display_email(lead)
-        assert "mailto:" in result
+        assert f"/admin/leads/lead/{lead.id}/send-email/" in result
         assert lead.email in result
+        assert "Send email to" in result
 
     def test_display_email_without_email(self, lead_admin: LeadAdmin) -> None:
         lead = models.Lead(name="No email", email="")

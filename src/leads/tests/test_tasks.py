@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from ninja.errors import HttpError
 
-from leads.models import City, Lead, LeadType, ResearchJob, Tag
+from leads.models import City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 from leads.tasks import (
     ResearchLead,
     ResearchResult,
@@ -19,6 +19,7 @@ from leads.tasks import (
     poll_research_jobs,
     queue_research,
     reprocess_job,
+    send_email_task,
     start_research_job,
 )
 
@@ -544,3 +545,98 @@ class TestParseWithGeminiFallback:
 
         with pytest.raises(ValueError, match="empty response"):
             _parse_with_gemini_fallback("Some raw text")
+
+
+class TestSendEmailTask:
+    """Tests for send_email_task Celery task."""
+
+    @pytest.fixture
+    def lead(self, city: City) -> Lead:
+        """Create a lead for email tests."""
+        return Lead.objects.create(
+            name="Email Test Lead",
+            email="lead@example.com",
+            city=city,
+        )
+
+    @pytest.fixture
+    def email_template(self) -> EmailTemplate:
+        """Create an email template for tests."""
+        return EmailTemplate.objects.create(
+            name="Task Test Template",
+            subject="Hello from task",
+            body="This is a test email from the task.",
+        )
+
+    @patch("leads.service.EmailMessage")
+    def test_sends_email_successfully(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        result = send_email_task(
+            lead_id=lead.id,
+            subject="Test Subject",
+            body="Test Body",
+            to=["recipient@example.com"],
+        )
+
+        assert result["status"] == "sent"
+        assert result["email_sent_id"] is not None
+        email_sent = EmailSent.objects.get(id=result["email_sent_id"])
+        assert email_sent.lead == lead
+        assert email_sent.subject == "Test Subject"
+        mock_email_class.return_value.send.assert_called_once()
+
+    @patch("leads.service.EmailMessage")
+    def test_includes_template_when_provided(
+        self, mock_email_class: MagicMock, lead: Lead, email_template: EmailTemplate
+    ) -> None:
+        result = send_email_task(
+            lead_id=lead.id,
+            subject="Test",
+            body="Test",
+            to=["test@example.com"],
+            template_id=email_template.id,
+        )
+
+        assert result["status"] == "sent"
+        email_sent = EmailSent.objects.get(id=result["email_sent_id"])
+        assert email_sent.template == email_template
+
+    @patch("leads.service.EmailMessage")
+    def test_includes_bcc_when_provided(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        send_email_task(
+            lead_id=lead.id,
+            subject="Test",
+            body="Test",
+            to=["to@example.com"],
+            bcc=["bcc@example.com"],
+        )
+
+        mock_email_class.assert_called_once()
+        call_kwargs = mock_email_class.call_args.kwargs
+        assert call_kwargs["bcc"] == ["bcc@example.com"]
+
+    def test_returns_failed_on_validation_error(self, lead: Lead) -> None:
+        result = send_email_task(
+            lead_id=lead.id,
+            subject="Hello {foo}",
+            body="Test",
+            to=["test@example.com"],
+        )
+
+        assert result["status"] == "failed"
+        assert result["email_sent_id"] is None
+        assert "Unreplaced placeholders" in result["error"]
+
+    @patch("leads.service.EmailMessage")
+    def test_returns_failed_on_send_error(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        mock_email_class.return_value.send.side_effect = Exception("SMTP connection failed")
+
+        result = send_email_task(
+            lead_id=lead.id,
+            subject="Test",
+            body="Test",
+            to=["test@example.com"],
+        )
+
+        assert result["status"] == "failed"
+        assert result["email_sent_id"] is None
+        assert "SMTP connection failed" in result["error"]

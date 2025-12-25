@@ -1,11 +1,14 @@
 """Business logic for leads."""
 
+import re
 import typing as t
 
+from django.conf import settings
+from django.core.mail import EmailMessage
 from django.utils import timezone
 from ninja.errors import HttpError
 
-from leads.models import Action, City, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 from leads.schema import ActionIn, ActionPatch, CityIn, LeadIn, LeadPatch, ResearchJobIn
 
 
@@ -252,3 +255,129 @@ def reprocess_research_job(job: ResearchJob) -> dict[str, t.Any]:
         "leads_created": result["leads_created"],
         "message": f"Reprocessed job #{job.id}, created {result['leads_created']} leads",
     }
+
+
+# --- Email Functions ---
+
+# Regex to find unreplaced placeholders like {something}
+PLACEHOLDER_PATTERN = re.compile(r"\{[^}]+\}")
+
+
+def render_email_template(template: EmailTemplate, lead: Lead) -> tuple[str, str]:
+    """Render an email template with lead data.
+
+    Available placeholders:
+    - {lead.name}, {lead.email}, {lead.phone}, {lead.company}
+    - {lead.city}, {lead.lead_type}
+    - {lead.instagram}, {lead.telegram}, {lead.website}
+
+    Args:
+        template: The EmailTemplate to render
+        lead: The Lead to use for placeholder values
+
+    Returns:
+        Tuple of (rendered_subject, rendered_body)
+    """
+    context = {
+        "lead.name": lead.name or "",
+        "lead.email": lead.email or "",
+        "lead.phone": lead.phone or "",
+        "lead.company": lead.company or "",
+        "lead.city": str(lead.city) if lead.city else "",
+        "lead.lead_type": str(lead.lead_type) if lead.lead_type else "",
+        "lead.instagram": lead.instagram or "",
+        "lead.telegram": lead.telegram or "",
+        "lead.website": lead.website or "",
+    }
+
+    subject = template.subject
+    body = template.body
+
+    for placeholder, value in context.items():
+        subject = subject.replace("{" + placeholder + "}", value)
+        body = body.replace("{" + placeholder + "}", value)
+
+    return subject, body
+
+
+def validate_no_placeholders(subject: str, body: str) -> list[str]:
+    """Check if there are any unreplaced placeholders in subject or body.
+
+    Returns:
+        List of unreplaced placeholders found, empty if none.
+    """
+    placeholders = []
+    placeholders.extend(PLACEHOLDER_PATTERN.findall(subject))
+    placeholders.extend(PLACEHOLDER_PATTERN.findall(body))
+    return placeholders
+
+
+def send_email_to_lead(
+    lead: Lead,
+    subject: str,
+    body: str,
+    to: list[str],
+    bcc: list[str] | None = None,
+    template: EmailTemplate | None = None,
+) -> EmailSent:
+    """Send an email to a lead and log it.
+
+    Args:
+        lead: The Lead receiving the email
+        subject: Rendered subject line
+        body: Rendered email body
+        to: List of recipient email addresses
+        bcc: Optional list of BCC email addresses
+        template: Optional EmailTemplate used (for reference)
+
+    Returns:
+        EmailSent record
+
+    Raises:
+        ValueError: If there are unreplaced placeholders in subject or body
+    """
+    # Validate no placeholders remain
+    unreplaced = validate_no_placeholders(subject, body)
+    if unreplaced:
+        raise ValueError(f"Unreplaced placeholders found: {', '.join(unreplaced)}")
+
+    from_email = settings.DEFAULT_FROM_EMAIL
+    bcc = bcc or []
+
+    # Create the EmailSent record first with PENDING status
+    email_sent = EmailSent.objects.create(
+        lead=lead,
+        template=template,
+        from_email=from_email,
+        to=to,
+        bcc=bcc,
+        subject=subject,
+        body=body,
+        status=EmailSent.Status.PENDING,
+    )
+
+    try:
+        email = EmailMessage(
+            subject=subject,
+            body=body,
+            from_email=from_email,
+            to=to,
+            bcc=bcc if bcc else None,
+        )
+        email.send(fail_silently=False)
+
+        email_sent.status = EmailSent.Status.SENT
+        email_sent.sent_at = timezone.now()
+        email_sent.save()
+
+        # Update lead's last_contact
+        lead.last_contact = timezone.now().date()
+        lead.save(update_fields=["last_contact"])
+
+    except Exception as e:
+        email_sent.status = EmailSent.Status.FAILED
+        email_sent.error_message = str(e)
+        email_sent.save()
+        raise
+
+    return email_sent

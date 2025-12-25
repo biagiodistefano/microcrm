@@ -206,3 +206,59 @@ class ResearchJob(models.Model):
 
     def __str__(self) -> str:
         return f"Research: {self.city} ({self.status})"
+
+
+class EmailTemplate(models.Model):
+    """Reusable email template with placeholder support."""
+
+    name = models.CharField(max_length=255, unique=True, help_text="Template identifier (e.g., 'Initial Outreach')")
+    subject = models.CharField(max_length=255, help_text="Subject line. Use {lead.name}, {lead.city}, etc.")
+    body = models.TextField(help_text="Email body. Use {lead.name}, {lead.city}, etc.")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = HistoricalRecords()
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        return self.name
+
+
+class EmailSent(models.Model):
+    """Record of an email sent to a lead."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        SENT = "sent", "Sent"
+        FAILED = "failed", "Failed"
+
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="emails_sent")
+    template = models.ForeignKey(
+        EmailTemplate, on_delete=models.SET_NULL, null=True, blank=True, related_name="emails_sent"
+    )
+    from_email = models.EmailField(help_text="Sender email address")
+    to = models.JSONField(help_text="List of recipient email addresses")
+    bcc = models.JSONField(default=list, blank=True, help_text="List of BCC email addresses")
+    subject = models.CharField(max_length=255, help_text="Rendered subject at send time")
+    body = models.TextField(help_text="Rendered body at send time")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    error_message = models.TextField(blank=True, help_text="Error details if sending failed")
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Email Sent"
+        verbose_name_plural = "Emails Sent"
+        indexes = [
+            models.Index(fields=["status"], name="leads_emailsent_status"),
+            models.Index(fields=["sent_at"], name="leads_emailsent_sent_at"),
+            models.Index(fields=["created_at"], name="leads_emailsent_created_at"),
+        ]
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        return f"Email to {self.lead.name}: {self.subject[:50]}"
