@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.test import Client
 
-from leads.models import Action, City, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 
 pytestmark = pytest.mark.django_db
 
@@ -594,4 +594,297 @@ class TestResearchJobDeleteEndpoint:
 
     def test_delete_job_not_found(self, api_client: Client) -> None:
         response = api_client.delete("/api/research-jobs/99999")
+        assert response.status_code == 404
+
+
+# --- Email Template Endpoints ---
+
+
+class TestEmailTemplateListEndpoint:
+    def test_list_templates_empty(self, api_client: Client) -> None:
+        response = api_client.get("/api/email-templates/")
+        assert response.status_code == 200
+        data = response.json()
+        assert data == []
+
+    def test_list_templates_with_data(self, api_client: Client, email_template: EmailTemplate) -> None:
+        response = api_client.get("/api/email-templates/")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == email_template.name
+
+    def test_list_templates_search(self, api_client: Client, email_template: EmailTemplate) -> None:
+        response = api_client.get("/api/email-templates/?search=Test")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+
+        response = api_client.get("/api/email-templates/?search=nonexistent")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 0
+
+
+class TestEmailTemplateGetEndpoint:
+    def test_get_template(self, api_client: Client, email_template: EmailTemplate) -> None:
+        response = api_client.get(f"/api/email-templates/{email_template.id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == email_template.name
+        assert data["subject"] == email_template.subject
+        assert data["body"] == email_template.body
+
+    def test_get_template_not_found(self, api_client: Client) -> None:
+        response = api_client.get("/api/email-templates/99999")
+        assert response.status_code == 404
+
+
+class TestEmailTemplateCreateEndpoint:
+    def test_create_template(self, api_client: Client) -> None:
+        response = api_client.post(
+            "/api/email-templates/",
+            data={
+                "name": "New Template",
+                "subject": "Hello {lead.name}!",
+                "body": "Welcome to our service.",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["name"] == "New Template"
+        assert data["subject"] == "Hello {lead.name}!"
+        assert EmailTemplate.objects.count() == 1
+
+    def test_create_template_duplicate_name(self, api_client: Client, email_template: EmailTemplate) -> None:
+        response = api_client.post(
+            "/api/email-templates/",
+            data={
+                "name": email_template.name,
+                "subject": "Test",
+                "body": "Test",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 500  # IntegrityError
+
+
+class TestEmailTemplateUpdateEndpoint:
+    def test_update_template(self, api_client: Client, email_template: EmailTemplate) -> None:
+        response = api_client.put(
+            f"/api/email-templates/{email_template.id}",
+            data={
+                "name": "Updated Name",
+                "subject": "Updated Subject",
+                "body": "Updated Body",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "Updated Name"
+        assert data["subject"] == "Updated Subject"
+        assert data["body"] == "Updated Body"
+
+    def test_update_template_not_found(self, api_client: Client) -> None:
+        response = api_client.put(
+            "/api/email-templates/99999",
+            data={"name": "Test", "subject": "Test", "body": "Test"},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+
+class TestEmailTemplatePatchEndpoint:
+    def test_patch_template_name(self, api_client: Client, email_template: EmailTemplate) -> None:
+        original_subject = email_template.subject
+        response = api_client.patch(
+            f"/api/email-templates/{email_template.id}",
+            data={"name": "Patched Name"},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "Patched Name"
+        assert data["subject"] == original_subject  # Unchanged
+
+    def test_patch_template_not_found(self, api_client: Client) -> None:
+        response = api_client.patch(
+            "/api/email-templates/99999",
+            data={"name": "Test"},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+
+class TestEmailTemplateDeleteEndpoint:
+    def test_delete_template(self, api_client: Client, email_template: EmailTemplate) -> None:
+        template_id = email_template.id
+        response = api_client.delete(f"/api/email-templates/{template_id}")
+        assert response.status_code == 204
+        assert not EmailTemplate.objects.filter(id=template_id).exists()
+
+    def test_delete_template_not_found(self, api_client: Client) -> None:
+        response = api_client.delete("/api/email-templates/99999")
+        assert response.status_code == 404
+
+
+# --- Email Sent Endpoints ---
+
+
+class TestEmailSentListEndpoint:
+    def test_list_emails_empty(self, api_client: Client) -> None:
+        response = api_client.get("/api/emails-sent/")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+        assert data["results"] == []
+
+    def test_list_emails_with_data(self, api_client: Client, email_sent: EmailSent) -> None:
+        response = api_client.get("/api/emails-sent/")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["results"][0]["subject"] == email_sent.subject
+
+    def test_list_emails_filter_by_lead(self, api_client: Client, email_sent: EmailSent) -> None:
+        response = api_client.get(f"/api/emails-sent/?lead_id={email_sent.lead_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+
+        response = api_client.get("/api/emails-sent/?lead_id=99999")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+
+    def test_list_emails_filter_by_status(self, api_client: Client, email_sent: EmailSent) -> None:
+        response = api_client.get("/api/emails-sent/?status=sent")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+
+        response = api_client.get("/api/emails-sent/?status=failed")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+
+
+class TestEmailSentGetEndpoint:
+    def test_get_email(self, api_client: Client, email_sent: EmailSent) -> None:
+        response = api_client.get(f"/api/emails-sent/{email_sent.id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["subject"] == email_sent.subject
+        assert data["lead_id"] == email_sent.lead_id
+        assert data["status"] == EmailSent.Status.SENT
+
+    def test_get_email_not_found(self, api_client: Client) -> None:
+        response = api_client.get("/api/emails-sent/99999")
+        assert response.status_code == 404
+
+
+# --- Lead Email Endpoints ---
+
+
+class TestLeadSendEmailEndpoint:
+    @patch("leads.service.EmailMessage")
+    def test_send_email_with_template(
+        self, mock_email_class: MagicMock, api_client: Client, lead: Lead, email_template: EmailTemplate
+    ) -> None:
+        response = api_client.post(
+            f"/api/leads/{lead.id}/send-email",
+            data={"template_id": email_template.id},
+            content_type="application/json",
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == EmailSent.Status.SENT
+        assert data["email_id"] > 0
+        mock_email_class.return_value.send.assert_called_once()
+
+    @patch("leads.service.EmailMessage")
+    def test_send_email_with_custom_content(self, mock_email_class: MagicMock, api_client: Client, lead: Lead) -> None:
+        response = api_client.post(
+            f"/api/leads/{lead.id}/send-email",
+            data={
+                "subject": "Custom Subject",
+                "body": "Custom Body",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == EmailSent.Status.SENT
+
+    @patch("leads.tasks.send_email_task")
+    def test_send_email_in_background(
+        self, mock_task: MagicMock, api_client: Client, lead: Lead, email_template: EmailTemplate
+    ) -> None:
+        response = api_client.post(
+            f"/api/leads/{lead.id}/send-email",
+            data={
+                "template_id": email_template.id,
+                "send_in_background": True,
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == EmailSent.Status.PENDING
+        assert data["email_id"] == 0  # Not yet created
+        mock_task.delay.assert_called_once()
+
+    def test_send_email_no_content(self, api_client: Client, lead: Lead) -> None:
+        response = api_client.post(
+            f"/api/leads/{lead.id}/send-email",
+            data={},
+            content_type="application/json",
+        )
+        assert response.status_code == 400  # Either template_id or subject/body required
+
+    def test_send_email_template_not_found(self, api_client: Client, lead: Lead) -> None:
+        response = api_client.post(
+            f"/api/leads/{lead.id}/send-email",
+            data={"template_id": 99999},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+    def test_send_email_lead_not_found(self, api_client: Client) -> None:
+        response = api_client.post(
+            "/api/leads/99999/send-email",
+            data={"subject": "Test", "body": "Test"},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+    def test_send_email_no_recipient(self, api_client: Client) -> None:
+        # Create a lead without email
+        lead = Lead.objects.create(name="No Email Lead")
+        response = api_client.post(
+            f"/api/leads/{lead.id}/send-email",
+            data={"subject": "Test", "body": "Test"},
+            content_type="application/json",
+        )
+        assert response.status_code == 400  # No recipient
+
+
+class TestLeadEmailsListEndpoint:
+    def test_list_lead_emails(self, api_client: Client, email_sent: EmailSent) -> None:
+        response = api_client.get(f"/api/leads/{email_sent.lead_id}/emails")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["subject"] == email_sent.subject
+
+    def test_list_lead_emails_empty(self, api_client: Client, lead: Lead) -> None:
+        response = api_client.get(f"/api/leads/{lead.id}/emails")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 0
+
+    def test_list_lead_emails_not_found(self, api_client: Client) -> None:
+        response = api_client.get("/api/leads/99999/emails")
         assert response.status_code == 404

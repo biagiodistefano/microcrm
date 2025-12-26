@@ -9,6 +9,8 @@ from ninja_extra import NinjaExtraAPI
 from leads.controllers import (
     ActionController,
     CityController,
+    EmailSentController,
+    EmailTemplateController,
     LeadController,
     LeadTypeController,
     ResearchJobController,
@@ -68,4 +70,6 @@ api.register_controllers(
     LeadTypeController,
     TagController,
     ResearchJobController,
+    EmailTemplateController,
+    EmailSentController,
 )

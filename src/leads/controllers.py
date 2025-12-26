@@ -9,7 +9,7 @@ from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseS
 from ninja_extra.searching import Searching, searching
 
 from leads import service
-from leads.models import Action, City, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 from leads.schema import (
     ActionFilterSchema,
     ActionIn,
@@ -18,6 +18,11 @@ from leads.schema import (
     CityFilterSchema,
     CityIn,
     CitySchema,
+    EmailSentFilterSchema,
+    EmailSentSchema,
+    EmailTemplateIn,
+    EmailTemplatePatch,
+    EmailTemplateSchema,
     JobActionResponse,
     LeadFilterSchema,
     LeadIn,
@@ -28,6 +33,8 @@ from leads.schema import (
     ResearchJobFilterSchema,
     ResearchJobIn,
     ResearchJobSchema,
+    SendEmailIn,
+    SendEmailResponse,
     TagSchema,
 )
 
@@ -142,6 +149,33 @@ class LeadController(ControllerBase):
         lead = get_object_or_404(Lead, id=lead_id)
         lead.delete()
         return 204, None
+
+    @route.post("/{lead_id}/send-email", response={201: SendEmailResponse})
+    def send_email(self, lead_id: int, data: SendEmailIn) -> tuple[int, SendEmailResponse]:
+        """Send an email to a lead.
+
+        Either provide a template_id to use a pre-defined template, or provide
+        subject and body directly. If using a template, placeholders like
+        {lead.name} and {lead.city} are automatically replaced.
+
+        The email is sent to the lead's email address by default, but you can
+        override this with the `to` field.
+
+        Set `send_in_background=true` to queue the email via Celery instead of
+        sending synchronously.
+        """
+        lead = get_object_or_404(Lead, id=lead_id)
+        result = service.send_email_to_lead_api(lead, data)
+        return 201, SendEmailResponse(**result)
+
+    @route.get("/{lead_id}/emails", response=list[EmailSentSchema])
+    def list_lead_emails(self, lead_id: int) -> QuerySet[EmailSent]:
+        """List all emails sent to a lead.
+
+        Returns emails in reverse chronological order (newest first).
+        """
+        lead = get_object_or_404(Lead, id=lead_id)
+        return lead.emails_sent.order_by("-created_at")
 
 
 @api_controller("/cities", tags=["Cities"])
@@ -356,3 +390,91 @@ class ResearchJobController(ControllerBase):
             raise HttpError(400, f"Cannot delete job #{job_id} while it's {job.get_status_display()}")
         job.delete()
         return 204, None
+
+
+@api_controller("/email-templates", tags=["Email"])
+class EmailTemplateController(ControllerBase):
+    """Email template CRUD controller."""
+
+    @route.get("/", response=list[EmailTemplateSchema])
+    @searching(Searching, search_fields=["name", "subject"])
+    def list_templates(self) -> QuerySet[EmailTemplate]:
+        """List all email templates.
+
+        Supports searching by name and subject.
+        """
+        return EmailTemplate.objects.order_by("name")
+
+    @route.get("/{template_id}", response=EmailTemplateSchema)
+    def get_template(self, template_id: int) -> EmailTemplate:
+        """Get a single email template by ID."""
+        return get_object_or_404(EmailTemplate, id=template_id)
+
+    @route.post("/", response={201: EmailTemplateSchema})
+    def create_template(self, data: EmailTemplateIn) -> tuple[int, EmailTemplate]:
+        r"""Create a new email template.
+
+        Template names must be unique. Supports placeholders:
+        - {lead.name} - Lead's name
+        - {lead.city} - Lead's city (format: "City, Country")
+        - {lead.company} - Lead's company
+        - {lead.email} - Lead's email
+
+        Example:
+        ```json
+        {
+          "name": "Initial Outreach",
+          "subject": "Hello {lead.name}!",
+          "body": "Hi {lead.name},\n\nWe noticed you're from {lead.city}..."
+        }
+        ```
+        """
+        return 201, service.create_email_template(data)
+
+    @route.put("/{template_id}", response=EmailTemplateSchema)
+    def update_template(self, template_id: int, data: EmailTemplateIn) -> EmailTemplate:
+        """Update an email template (full replacement)."""
+        template = get_object_or_404(EmailTemplate, id=template_id)
+        return service.update_email_template(template, data)
+
+    @route.patch("/{template_id}", response=EmailTemplateSchema)
+    def patch_template(self, template_id: int, data: EmailTemplatePatch) -> EmailTemplate:
+        """Partially update an email template."""
+        template = get_object_or_404(EmailTemplate, id=template_id)
+        return service.patch_email_template(template, data)
+
+    @route.delete("/{template_id}", response={204: None})
+    def delete_template(self, template_id: int) -> tuple[int, None]:
+        """Delete an email template.
+
+        Note: This does not affect emails that have already been sent using
+        this template (they retain a reference to the template).
+        """
+        template = get_object_or_404(EmailTemplate, id=template_id)
+        template.delete()
+        return 204, None
+
+
+@api_controller("/emails-sent", tags=["Email"])
+class EmailSentController(ControllerBase):
+    """Read-only controller for viewing sent emails."""
+
+    @route.get("/", response=PaginatedResponseSchema[EmailSentSchema])
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    def list_emails(
+        self,
+        filters: EmailSentFilterSchema = Query(...),  # type: ignore[type-arg]
+    ) -> QuerySet[EmailSent]:
+        """List all sent emails with filtering and pagination.
+
+        Filter options:
+        - lead_id: Filter by lead ID
+        - template_id: Filter by template ID
+        - status: Filter by status (pending, sent, failed)
+        """
+        return filters.filter(EmailSent.objects.order_by("-created_at"))
+
+    @route.get("/{email_id}", response=EmailSentSchema)
+    def get_email(self, email_id: int) -> EmailSent:
+        """Get a single sent email by ID."""
+        return get_object_or_404(EmailSent, id=email_id)

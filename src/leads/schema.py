@@ -7,7 +7,7 @@ from decimal import Decimal
 from ninja import FilterLookup, FilterSchema, ModelSchema, Schema
 from pydantic import Field
 
-from leads.models import Action, City, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 
 
 # --- Output Schemas ---
@@ -131,6 +131,46 @@ class ResearchJobDetailSchema(ModelSchema):
         ]
 
 
+class EmailTemplateSchema(ModelSchema):
+    """EmailTemplate output schema."""
+
+    class Meta:
+        model = EmailTemplate
+        fields = ["id", "name", "subject", "body", "created_at", "updated_at"]
+
+
+class EmailSentSchema(ModelSchema):
+    """EmailSent output schema."""
+
+    lead_id: int
+    template_id: int | None = None
+
+    class Meta:
+        model = EmailSent
+        fields = [
+            "id",
+            "from_email",
+            "to",
+            "bcc",
+            "subject",
+            "body",
+            "status",
+            "error_message",
+            "created_at",
+            "sent_at",
+        ]
+
+    @staticmethod
+    def resolve_lead_id(obj: EmailSent) -> int:
+        """Resolve lead_id from the foreign key."""
+        return obj.lead_id
+
+    @staticmethod
+    def resolve_template_id(obj: EmailSent) -> int | None:
+        """Resolve template_id from the foreign key."""
+        return obj.template_id
+
+
 # --- Input Schemas ---
 class CityIn(Schema):
     """City input for creating/finding a city.
@@ -227,6 +267,33 @@ class ResearchJobIn(Schema):
     city_id: int = Field(..., description="ID of the city to research")
 
 
+class EmailTemplateIn(Schema):
+    """EmailTemplate create/update input schema."""
+
+    name: str = Field(..., description="Template name (must be unique)")
+    subject: str = Field(..., description="Email subject (supports placeholders like {lead.name})")
+    body: str = Field(..., description="Email body (supports placeholders like {lead.name}, {lead.city})")
+
+
+class EmailTemplatePatch(Schema):
+    """EmailTemplate partial update schema."""
+
+    name: str | None = None
+    subject: str | None = None
+    body: str | None = None
+
+
+class SendEmailIn(Schema):
+    """Input schema for sending an email to a lead."""
+
+    template_id: int | None = Field(default=None, description="Template ID to use (optional)")
+    subject: str | None = Field(default=None, description="Email subject (required if no template)")
+    body: str | None = Field(default=None, description="Email body (required if no template)")
+    to: list[str] | None = Field(default=None, description="Override recipient(s), defaults to lead's email")
+    bcc: list[str] = Field(default_factory=list, description="BCC recipients")
+    send_in_background: bool = Field(default=False, description="Send via Celery background task")
+
+
 class JobActionResponse(Schema):
     """Response for job actions (run, reprocess)."""
 
@@ -271,3 +338,19 @@ class ResearchJobFilterSchema(FilterSchema):
     city_id: t.Annotated[int | None, FilterLookup(q="city_id")] = None
     status: ResearchJob.Status | None = None
     country: t.Annotated[str | None, FilterLookup(q="city__country__icontains")] = None
+
+
+class EmailSentFilterSchema(FilterSchema):
+    """EmailSent filter schema."""
+
+    lead_id: t.Annotated[int | None, FilterLookup(q="lead_id")] = None
+    template_id: t.Annotated[int | None, FilterLookup(q="template_id")] = None
+    status: EmailSent.Status | None = None
+
+
+class SendEmailResponse(Schema):
+    """Response for send email action."""
+
+    email_id: int
+    status: str
+    message: str = ""
