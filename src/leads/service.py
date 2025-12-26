@@ -9,7 +9,17 @@ from django.utils import timezone
 from ninja.errors import HttpError
 
 from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
-from leads.schema import ActionIn, ActionPatch, CityIn, LeadIn, LeadPatch, ResearchJobIn
+from leads.schema import (
+    ActionIn,
+    ActionPatch,
+    CityIn,
+    EmailTemplateIn,
+    EmailTemplatePatch,
+    LeadIn,
+    LeadPatch,
+    ResearchJobIn,
+    SendEmailIn,
+)
 
 
 def get_or_create_city(city_in: CityIn) -> City:
@@ -381,3 +391,103 @@ def send_email_to_lead(
         raise
 
     return email_sent
+
+
+def create_email_template(data: EmailTemplateIn) -> EmailTemplate:
+    """Create a new email template."""
+    return EmailTemplate.objects.create(
+        name=data.name,
+        subject=data.subject,
+        body=data.body,
+    )
+
+
+def update_email_template(template: EmailTemplate, data: EmailTemplateIn) -> EmailTemplate:
+    """Update an email template (full replacement)."""
+    template.name = data.name
+    template.subject = data.subject
+    template.body = data.body
+    template.save()
+    return template
+
+
+def patch_email_template(template: EmailTemplate, data: EmailTemplatePatch) -> EmailTemplate:
+    """Partially update an email template."""
+    if data.name is not None:
+        template.name = data.name
+    if data.subject is not None:
+        template.subject = data.subject
+    if data.body is not None:
+        template.body = data.body
+    template.save()
+    return template
+
+
+def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
+    """Send an email to a lead via API.
+
+    This is the API wrapper that handles template rendering and background sending.
+
+    Args:
+        lead: The Lead to send email to
+        data: SendEmailIn with template_id or subject/body
+
+    Returns:
+        Dict with email_id, status, and message
+
+    Raises:
+        HttpError: 400 if validation fails
+    """
+    from leads.tasks import send_email_task
+
+    template: EmailTemplate | None = None
+
+    # Determine subject and body
+    if data.template_id:
+        try:
+            template = EmailTemplate.objects.get(id=data.template_id)
+        except EmailTemplate.DoesNotExist:
+            raise HttpError(404, f"Template with id {data.template_id} not found")
+        subject, body = render_email_template(template, lead)
+    elif data.subject and data.body:
+        subject = data.subject
+        body = data.body
+    else:
+        raise HttpError(400, "Either template_id or both subject and body are required")
+
+    # Determine recipients
+    to = data.to if data.to else [lead.email] if lead.email else []
+    if not to:
+        raise HttpError(400, "No recipient email address (lead has no email and 'to' not provided)")
+
+    bcc = data.bcc or []
+
+    # Send in background or synchronously
+    if data.send_in_background:
+        send_email_task.delay(
+            lead_id=lead.id,
+            subject=subject,
+            body=body,
+            to=to,
+            bcc=bcc,
+            template_id=template.id if template else None,
+        )
+        return {
+            "email_id": 0,  # Not yet created
+            "status": EmailSent.Status.PENDING,
+            "message": "Email queued for background sending",
+        }
+    else:
+        email_sent = send_email_to_lead(
+            lead=lead,
+            subject=subject,
+            body=body,
+            to=to,
+            bcc=bcc,
+            template=template,
+        )
+        return {
+            "email_id": email_sent.id,
+            "status": email_sent.status,
+            "message": "Email sent successfully",
+        }
