@@ -395,30 +395,21 @@ def send_email_to_lead(
 
 def create_email_template(data: EmailTemplateIn) -> EmailTemplate:
     """Create a new email template."""
-    return EmailTemplate.objects.create(
-        name=data.name,
-        subject=data.subject,
-        body=data.body,
-    )
+    return EmailTemplate.objects.create(**data.model_dump())
 
 
 def update_email_template(template: EmailTemplate, data: EmailTemplateIn) -> EmailTemplate:
     """Update an email template (full replacement)."""
-    template.name = data.name
-    template.subject = data.subject
-    template.body = data.body
+    for field, value in data.model_dump().items():
+        setattr(template, field, value)
     template.save()
     return template
 
 
 def patch_email_template(template: EmailTemplate, data: EmailTemplatePatch) -> EmailTemplate:
     """Partially update an email template."""
-    if data.name is not None:
-        template.name = data.name
-    if data.subject is not None:
-        template.subject = data.subject
-    if data.body is not None:
-        template.body = data.body
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(template, field, value)
     template.save()
     return template
 
