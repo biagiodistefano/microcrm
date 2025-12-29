@@ -289,14 +289,13 @@
         const subjectInput = document.getElementById('id_subject');
         const bodyInput = document.getElementById('id_body');
         const templateWarning = document.getElementById('template-warning');
-        const leadId = {{ lead.id }
-    };
-    // Build the base URL from current page URL (remove 'send-email/' from the end)
-    const baseUrl = window.location.pathname.replace(/send-email\/$/, '');
-    // Template IDs already used for this lead
-    const usedTemplateIds = {{ used_template_ids| safe }};
-    // Template language mapping (template_id -> language_code)
-    const templatesByLanguage = {{ templates_by_language| safe }};
+        const leadId = {{ lead.id }};
+        // Build the base URL from current page URL (remove 'send-email/' from the end)
+        const baseUrl = window.location.pathname.replace(/send-email\/$/, '');
+        // Template IDs already used for this lead
+        const usedTemplateIds = {{ used_template_ids|safe }};
+        // Template language mapping (template_id -> language_code)
+        const templatesByLanguage = {{ templates_by_language|safe }};
 
     // Store original template options for filtering
     const originalOptions = templateSelect ? Array.from(templateSelect.options) : [];
