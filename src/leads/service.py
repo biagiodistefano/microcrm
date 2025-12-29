@@ -622,10 +622,13 @@ def save_email_as_draft(
 
     Returns:
         EmailDraft record (created or updated)
+
+    Raises:
+        Http404: If draft_id is invalid or belongs to a different lead
     """
     if draft_id:
-        draft = get_object_or_404(EmailDraft, pk=draft_id)
-        draft.lead = lead
+        # Validate draft exists AND belongs to this lead
+        draft = get_object_or_404(EmailDraft, pk=draft_id, lead=lead)
         draft.template = template
         draft.from_email = settings.DEFAULT_FROM_EMAIL
         draft.to = to

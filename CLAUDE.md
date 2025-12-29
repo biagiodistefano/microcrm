@@ -90,6 +90,7 @@ Commands:
   jobs        Manage research jobs
   templates   Manage email templates
   emails      View sent emails
+  drafts      Manage email drafts
 ```
 
 ### leads
@@ -165,6 +166,16 @@ templates delete TEMPLATE_ID [--force]
 ```
 emails list     [--page] [--page-size] [--lead] [--template] [--status] [--raw]
 emails get      EMAIL_ID [--raw]
+```
+
+### drafts (Email Drafts)
+```
+drafts list     [--page] [--page-size] [--lead] [--template] [--raw]
+drafts get      DRAFT_ID [--raw]
+drafts create   --lead --subject --body [--template] [--to] [--bcc] [--raw]
+drafts update   DRAFT_ID [--subject] [--body] [--template] [--to] [--bcc] [--raw]
+drafts delete   DRAFT_ID [--force]
+drafts send     DRAFT_ID [--raw]
 ```
 
 ### Common Options

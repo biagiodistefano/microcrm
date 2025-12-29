@@ -1358,3 +1358,43 @@ class TestLeadAdminSaveDraft:
         assert "Other Draft Body XYZ" not in content
         # Draft ID should not be in the form
         assert f'value="{draft.id}"' not in content
+
+    def test_send_email_view_post_ignores_draft_for_wrong_lead(
+        self,
+        lead_admin: LeadAdmin,
+        request_factory: RequestFactory,
+        lead: models.Lead,
+    ) -> None:
+        """Test that POST with draft_id for different lead doesn't update that draft."""
+        other_lead = models.Lead.objects.create(name="Other Lead", email="other@example.com")
+        draft = models.EmailDraft.objects.create(
+            lead=other_lead,  # Different lead!
+            subject="Original Subject",
+            body="Original Body",
+            to=["other@example.com"],
+            bcc=[],
+        )
+
+        request = request_factory.post(
+            f"/admin/leads/lead/{lead.id}/send-email/",
+            data={
+                "draft_id": str(draft.id),  # Try to hijack other lead's draft
+                "to": "hijacker@example.com",
+                "subject": "Hijacked Subject",
+                "body": "Hijacked Body",
+                "language_filter": "all",
+                "save_draft": "1",
+            },
+        )
+        request.user = MagicMock()
+        request.session = {}  # type: ignore[assignment]
+        request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+        # Call the view - should either error or create new draft, but NOT hijack
+        lead_admin.send_email_view(request, lead.id)
+
+        # The draft for other_lead should NOT be modified
+        draft.refresh_from_db()
+        assert draft.subject == "Original Subject"
+        assert draft.body == "Original Body"
+        assert draft.lead == other_lead

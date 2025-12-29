@@ -576,3 +576,24 @@ class TestSaveEmailAsDraft:
                 to=["test@example.com"],
                 draft_id=99999,
             )
+
+    def test_raises_404_for_draft_belonging_to_different_lead(self, email_draft: EmailDraft) -> None:
+        """Test that updating a draft belonging to a different lead raises 404."""
+        from django.http import Http404
+
+        # Create a different lead
+        other_lead = Lead.objects.create(name="Other Lead", email="other@example.com")
+
+        # Try to update email_draft (belongs to original lead) with other_lead
+        with pytest.raises(Http404):
+            save_email_as_draft(
+                lead=other_lead,
+                subject="Hijacked",
+                body="Hijacked body",
+                to=["hijacker@example.com"],
+                draft_id=email_draft.id,
+            )
+
+        # Verify the draft was NOT modified
+        email_draft.refresh_from_db()
+        assert email_draft.subject != "Hijacked"
