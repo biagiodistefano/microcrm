@@ -191,6 +191,12 @@ class ActionInline(TabularInline):  # type: ignore[misc]
 class SendEmailForm(forms.Form):
     """Form for sending email to a lead."""
 
+    language_filter = forms.ChoiceField(
+        choices=[("all", "All Languages")] + list(models.EmailTemplate.Language.choices),
+        required=False,
+        initial="all",
+        help_text="Filter templates by language",
+    )
     template = forms.ModelChoiceField(
         queryset=models.EmailTemplate.objects.all(),
         required=False,
@@ -387,6 +393,27 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             .values_list("template_id", flat=True)
             .distinct()
         )
+        # Get all templates with their languages for JS filtering
+        templates_by_language = {t.id: t.language for t in models.EmailTemplate.objects.all()}
+        # Get next pending/in-progress action for this lead
+        next_action = (
+            models.Action.objects.filter(
+                lead=lead,
+                status__in=[models.Action.Status.PENDING, models.Action.Status.IN_PROGRESS],
+            )
+            .order_by("due_date", "created_at")
+            .first()
+        )
+        # Build next_action context dict
+        next_action_data: dict[str, t.Any] | None = None
+        if next_action:
+            is_overdue = next_action.due_date < date.today() if next_action.due_date else False
+            next_action_data = {
+                "name": next_action.name,
+                "notes": next_action.notes,
+                "due_date": next_action.due_date,
+                "is_overdue": is_overdue,
+            }
         context = {
             **self.admin_site.each_context(request),
             "title": f"Send Email to {lead.name}",
@@ -394,6 +421,8 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             "form": form,
             "from_email": settings.DEFAULT_FROM_EMAIL,
             "used_template_ids": used_template_ids,
+            "templates_by_language": templates_by_language,
+            "next_action": next_action_data,
             "opts": self.model._meta,
             "has_view_permission": True,
         }
@@ -804,13 +833,14 @@ class ActionAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
 class EmailTemplateAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
     """Admin for EmailTemplate model."""
 
-    list_display = ["name", "subject", "updated_at"]
+    list_display = ["name", "language", "subject", "updated_at"]
+    list_filter = ["language"]
     search_fields = ["name", "subject", "body"]
     readonly_fields = ["created_at", "updated_at"]
     ordering = ["name"]
 
     fieldsets = (
-        (None, {"fields": ("name", "subject", "body")}),
+        (None, {"fields": ("name", "language", "subject", "body")}),
         ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
     )
 

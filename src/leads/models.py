@@ -211,7 +211,17 @@ class ResearchJob(models.Model):
 class EmailTemplate(models.Model):
     """Reusable email template with placeholder support."""
 
+    class Language(models.TextChoices):
+        EN = "en", "English"
+        IT = "it", "Italian"
+        ES = "es", "Spanish"
+        DE = "de", "German"
+        FR = "fr", "French"
+
     name = models.CharField(max_length=255, unique=True, help_text="Template identifier (e.g., 'Initial Outreach')")
+    language = models.CharField(
+        max_length=5, choices=Language.choices, default=Language.EN, help_text="Language of the template"
+    )
     subject = models.CharField(max_length=255, help_text="Subject line. Use {lead.name}, {lead.city}, etc.")
     body = models.TextField(help_text="Email body. Use {lead.name}, {lead.city}, etc.")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -224,7 +234,7 @@ class EmailTemplate(models.Model):
 
     def __str__(self) -> str:
         """Return string representation."""
-        return self.name
+        return f"{self.name} ({self.get_language_display()})"
 
 
 class EmailSent(models.Model):

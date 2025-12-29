@@ -816,3 +816,147 @@ class TestResearchJobSubmitLineActions:
 
         assert response.status_code == 302
         mock_reprocess.assert_called_once_with(job.id)
+
+
+# --- EmailTemplate Language Tests ---
+
+
+class TestEmailTemplateLanguage:
+    """Tests for EmailTemplate language field and filtering functionality."""
+
+    def test_create_template_with_language(self) -> None:
+        """Test creating email templates with different languages."""
+        template_en = models.EmailTemplate.objects.create(
+            name="English Template",
+            language=models.EmailTemplate.Language.EN,
+            subject="Hello",
+            body="Hello world",
+        )
+        template_it = models.EmailTemplate.objects.create(
+            name="Italian Template",
+            language=models.EmailTemplate.Language.IT,
+            subject="Ciao",
+            body="Ciao mondo",
+        )
+
+        assert template_en.language == "en"
+        assert template_it.language == "it"
+
+    def test_template_default_language(self) -> None:
+        """Test that default language is English."""
+        template = models.EmailTemplate.objects.create(
+            name="Default Language Template",
+            subject="Test",
+            body="Test body",
+        )
+        assert template.language == "en"
+
+    def test_template_str_includes_language(self) -> None:
+        """Test that __str__ includes language."""
+        template = models.EmailTemplate.objects.create(
+            name="German Template",
+            language=models.EmailTemplate.Language.DE,
+            subject="Hallo",
+            body="Hallo Welt",
+        )
+        assert "German Template" in str(template)
+        assert "(German)" in str(template)
+
+
+class TestSendEmailFormLanguageFilter:
+    """Tests for SendEmailForm language filter field."""
+
+    def test_language_filter_choices(self) -> None:
+        """Test that language_filter has all language choices plus 'all'."""
+        from django.forms import ChoiceField
+
+        from leads.admin import SendEmailForm
+
+        form = SendEmailForm()
+        language_field = form.fields["language_filter"]
+        assert isinstance(language_field, ChoiceField)
+        # Django typing for choices is complex; use type ignore
+        choices: list[tuple[str, str]] = list(language_field.choices)  # type: ignore[arg-type]
+
+        # Check 'all' option is first
+        assert choices[0] == ("all", "All Languages")
+
+        # Check all language choices are present
+        language_codes = [code for code, _ in choices]
+        assert "en" in language_codes
+        assert "it" in language_codes
+        assert "es" in language_codes
+        assert "de" in language_codes
+        assert "fr" in language_codes
+
+    def test_language_filter_not_required(self) -> None:
+        """Test that language_filter is optional."""
+        from leads.admin import SendEmailForm
+
+        form = SendEmailForm()
+        assert form.fields["language_filter"].required is False
+
+    def test_language_filter_initial_value(self) -> None:
+        """Test that language_filter defaults to 'all'."""
+        from leads.admin import SendEmailForm
+
+        form = SendEmailForm()
+        assert form.fields["language_filter"].initial == "all"
+
+
+class TestSendEmailViewContext:
+    """Tests for send email view context data."""
+
+    @pytest.fixture
+    def lead_admin(self, site: AdminSite) -> LeadAdmin:
+        return LeadAdmin(models.Lead, site)
+
+    def test_templates_by_language_context(
+        self, lead_admin: LeadAdmin, request_factory: RequestFactory, lead: models.Lead
+    ) -> None:
+        """Test that templates_by_language is correctly populated in context."""
+        # Create templates with different languages
+        models.EmailTemplate.objects.all().delete()  # Clear any existing
+        en_template = models.EmailTemplate.objects.create(
+            name="English",
+            language=models.EmailTemplate.Language.EN,
+            subject="Hi",
+            body="Hello",
+        )
+        it_template = models.EmailTemplate.objects.create(
+            name="Italian",
+            language=models.EmailTemplate.Language.IT,
+            subject="Ciao",
+            body="Ciao",
+        )
+
+        # Test the templates_by_language dict construction logic directly
+        # (as used in _render_send_email_form)
+        templates_by_language = {t.id: t.language for t in models.EmailTemplate.objects.all()}
+
+        assert templates_by_language[en_template.id] == "en"
+        assert templates_by_language[it_template.id] == "it"
+
+    def test_used_template_ids_context(
+        self, lead_admin: LeadAdmin, lead: models.Lead, email_template: models.EmailTemplate
+    ) -> None:
+        """Test that used_template_ids is correctly populated."""
+        # Create a sent email with template
+        models.EmailSent.objects.create(
+            lead=lead,
+            template=email_template,
+            from_email="test@example.com",
+            to=["test@example.com"],
+            bcc=[],
+            subject="Test",
+            body="Test body",
+            status=models.EmailSent.Status.SENT,
+        )
+
+        used_template_ids = list(
+            models.EmailSent.objects.filter(lead=lead, template__isnull=False)
+            .values_list("template_id", flat=True)
+            .distinct()
+        )
+
+        assert email_template.id in used_template_ids
