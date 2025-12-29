@@ -102,6 +102,7 @@
         max-height: 150px;
         overflow-y: auto;
         border: 1px solid #e5e7eb;
+        color: #374151;
     }
 
     .lead-info .next-action {
@@ -110,11 +111,13 @@
         background: #fef3c7;
         border: 1px solid #fcd34d;
         border-radius: 0.375rem;
+        color: #1f2937;
     }
 
     .lead-info .next-action.overdue {
         background: #fee2e2;
         border-color: #fca5a5;
+        color: #1f2937;
     }
 
     .lead-info .tag {
@@ -200,9 +203,8 @@
         <div class="next-action{% if next_action.is_overdue %} overdue{% endif %}">
             <strong>Next Action:</strong> {{ next_action.name }}
             {% if next_action.due_date %}
-            <span style="color: #666; font-size: 0.875rem;">(Due: {{ next_action.due_date }}{% if next_action.is_overdue
-                %} - <strong style="color: #dc2626;">Overdue!</strong>{% endif %})</span>
-            {% endif %}
+            <span style="color: #666; font-size: 0.875rem;">(Due: {{ next_action.due_date }}{% if next_action.is_overdue %} - <strong style="color: #dc2626;">Overdue!</strong>{% endif %})</span>
+        {% endif %}
             {% if next_action.notes %}
             <br><span style="color: #666; font-size: 0.875rem;">{{ next_action.notes|truncatechars:100 }}</span>
             {% endif %}
@@ -271,8 +273,7 @@
             <label for="id_send_in_background" style="display: inline; font-weight: normal;">
                 Send in background (via Celery)
             </label>
-            {% if form.send_in_background.help_text %}<p class="help">{{ form.send_in_background.help_text }}</p>{%
-            endif %}
+            {% if form.send_in_background.help_text %}<p class="help">{{ form.send_in_background.help_text }}</p>{% endif %}
         </div>
 
         <div class="button-row">
