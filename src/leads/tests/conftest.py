@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import pytest
 from django.test import Client
 
-from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 
 
 @pytest.fixture
@@ -116,4 +116,18 @@ def email_sent(lead: Lead, email_template: EmailTemplate) -> EmailSent:
         subject="Hello Test Lead!",
         body="Hi Test Lead,\n\nWe noticed you're from Berlin, Germany.\n\nBest regards",
         status=EmailSent.Status.SENT,
+    )
+
+
+@pytest.fixture
+def email_draft(lead: Lead, email_template: EmailTemplate) -> EmailDraft:
+    """Create a test email draft record."""
+    return EmailDraft.objects.create(
+        lead=lead,
+        template=email_template,
+        from_email="test@example.com",
+        to=["recipient@example.com"],
+        bcc=["bcc@example.com"],
+        subject="Draft: Hello Test Lead!",
+        body="Hi Test Lead,\n\nThis is a draft email.\n\nBest regards",
     )

@@ -191,6 +191,10 @@ class ActionInline(TabularInline):  # type: ignore[misc]
 class SendEmailForm(forms.Form):
     """Form for sending email to a lead."""
 
+    draft_id = forms.IntegerField(
+        required=False,
+        widget=forms.HiddenInput(),
+    )
     language_filter = forms.ChoiceField(
         choices=[("all", "All Languages")] + list(models.EmailTemplate.Language.choices),
         required=False,
@@ -337,11 +341,32 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         if request.method == "POST":
             form = SendEmailForm(request.POST)
             if form.is_valid():
-                result = self._process_send_email(request, lead, form)
+                # Check which button was clicked
+                if "save_draft" in request.POST:
+                    result = self._process_save_draft(request, lead, form)
+                else:
+                    result = self._process_send_email(request, lead, form)
                 if result:
                     return result
         else:
-            initial = {"to": lead.email} if lead.email else {}
+            initial: dict[str, t.Any] = {"to": lead.email} if lead.email else {}
+
+            # Check if loading an existing draft
+            draft_id = request.GET.get("draft_id")
+            if draft_id:
+                try:
+                    draft = models.EmailDraft.objects.get(pk=draft_id, lead=lead)
+                    initial = {
+                        "draft_id": draft.id,
+                        "template": draft.template,
+                        "to": ", ".join(draft.to) if draft.to else "",
+                        "bcc": ", ".join(draft.bcc) if draft.bcc else "",
+                        "subject": draft.subject,
+                        "body": draft.body,
+                    }
+                except models.EmailDraft.DoesNotExist:
+                    messages.warning(request, "Draft not found.")
+
             form = SendEmailForm(initial=initial)
 
         return self._render_send_email_form(request, lead, form)
@@ -353,6 +378,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         """
         data = form.cleaned_data
         template = data.get("template")
+        draft_id = data.get("draft_id")
 
         try:
             if data.get("send_in_background"):
@@ -376,12 +402,48 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
                 )
                 messages.success(request, f"Email sent successfully to {lead.name}.")
 
+            # Delete the draft if one was being edited
+            if draft_id:
+                models.EmailDraft.objects.filter(id=draft_id).delete()
+
             return redirect(reverse("admin:leads_lead_change", args=[lead.id]))
 
         except ValueError as e:
             messages.error(request, str(e))
         except Exception as e:
             messages.error(request, f"Failed to send email: {e}")
+
+        return None
+
+    def _process_save_draft(self, request: HttpRequest, lead: models.Lead, form: SendEmailForm) -> HttpResponse | None:
+        """Process save as draft form submission.
+
+        Returns redirect on success, None on failure (to re-render form with errors).
+        """
+        data = form.cleaned_data
+        template = data.get("template")
+        draft_id = data.get("draft_id")
+
+        try:
+            draft = lead_service.save_email_as_draft(
+                lead=lead,
+                subject=data["subject"],
+                body=data["body"],
+                to=data["to"],
+                bcc=data["bcc"],
+                template=template,
+                draft_id=draft_id,
+            )
+            if draft_id:
+                messages.success(request, f"Draft updated for {lead.name}.")
+            else:
+                messages.success(request, f"Draft saved for {lead.name}.")
+            # Redirect back to the same send-email form with draft_id, so subsequent saves update
+            url = reverse("admin:leads_lead_send_email", args=[lead.id])
+            return redirect(f"{url}?draft_id={draft.id}")
+
+        except Exception as e:
+            messages.error(request, f"Failed to save draft: {e}")
 
         return None
 
@@ -907,6 +969,90 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
         if len(recipients) == 1:
             return recipients[0]
         return f"{recipients[0]} (+{len(recipients) - 1})"
+
+
+@admin.register(models.EmailDraft)
+class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
+    """Admin for EmailDraft model."""
+
+    list_display = ["edit_link", "lead_link", "subject_preview", "template", "updated_at", "created_at"]
+    list_display_links = None  # Disable default linking since we have custom edit_link
+    list_filter = ["template", ("created_at", RangeDateFilter), ("updated_at", RangeDateFilter)]
+    search_fields = ["subject", "body", "lead__name", "to"]
+    readonly_fields = ["id", "created_at", "updated_at"]
+    autocomplete_fields = ["lead", "template"]
+    actions = ["send_selected_drafts"]
+    actions_submit_line = ["send_draft"]
+    ordering = ["-updated_at"]
+    list_per_page = 25
+
+    fieldsets = (
+        (None, {"fields": ("id", "lead", "template")}),
+        ("Recipients", {"fields": ("from_email", "to", "bcc")}),
+        ("Content", {"fields": ("subject", "body")}),
+        ("Timestamps", {"fields": ("created_at", "updated_at")}),
+    )
+
+    @admin.display(description="Edit")
+    def edit_link(self, obj: models.EmailDraft) -> str:
+        """Return an edit link."""
+        url = reverse("admin:leads_emaildraft_change", args=[obj.id])
+        return format_html('<a href="{}">Edit</a>', url)
+
+    def lead_link(self, obj: models.EmailDraft) -> str:
+        """Return a link to the lead."""
+        url = reverse("admin:leads_lead_change", args=[obj.lead.id])
+        return format_html('<a href="{}">{}</a>', url, obj.lead.name)
+
+    lead_link.short_description = "Lead"  # type: ignore[attr-defined]
+
+    @admin.display(description="Subject")
+    def subject_preview(self, obj: models.EmailDraft) -> str:
+        """Display subject preview."""
+        if not obj.subject:
+            return "(no subject)"
+        return obj.subject[:60] + "..." if len(obj.subject) > 60 else obj.subject
+
+    @admin.action(description="Send selected drafts")
+    def send_selected_drafts(self, request: HttpRequest, queryset: QuerySet[models.EmailDraft]) -> None:
+        """Send all selected drafts."""
+        sent_count = 0
+        failed_count = 0
+        for draft in queryset:
+            try:
+                lead_service.send_email_draft(draft)
+                sent_count += 1
+            except Exception as e:
+                failed_count += 1
+                self.message_user(
+                    request,
+                    f"Failed to send draft '{draft.subject[:30]}...' to {draft.lead.name}: {e}",
+                    messages.ERROR,
+                )
+
+        if sent_count:
+            self.message_user(
+                request,
+                f"Successfully sent {sent_count} email(s).",
+                messages.SUCCESS,
+            )
+
+    @action(description="Send Draft", url_path="send", icon="send", variant="primary")  # type: ignore[untyped-decorator]
+    def send_draft(self, request: HttpRequest, instance: models.EmailDraft) -> HttpResponse:
+        """Send this draft email."""
+        from django.http import HttpResponseRedirect
+
+        try:
+            email_sent = lead_service.send_email_draft(instance)
+            messages.success(request, f"Email sent successfully to {email_sent.lead.name}.")
+            # Redirect to lead change view since draft is now deleted
+            return HttpResponseRedirect(reverse("admin:leads_lead_change", args=[email_sent.lead.pk]))
+        except ValueError as e:
+            messages.error(request, str(e))
+        except Exception as e:
+            messages.error(request, f"Failed to send email: {e}")
+
+        return HttpResponseRedirect(reverse("admin:leads_emaildraft_change", args=[instance.pk]))
 
 
 @admin.register(models.ResearchPromptConfig)

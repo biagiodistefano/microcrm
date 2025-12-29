@@ -272,3 +272,43 @@ class EmailSent(models.Model):
     def __str__(self) -> str:
         """Return string representation."""
         return f"Email to {self.lead.name}: {self.subject[:50]}"
+
+
+class EmailDraft(models.Model):
+    """Draft email to be sent to a lead."""
+
+    lead = models.ForeignKey(
+        Lead,
+        on_delete=models.CASCADE,
+        related_name="email_drafts",
+    )
+    template = models.ForeignKey(
+        EmailTemplate,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="email_drafts",
+    )
+    from_email = models.EmailField(blank=True, help_text="Sender email address (defaults to DEFAULT_FROM_EMAIL)")
+    to = models.JSONField(default=list, help_text="List of recipient email addresses")
+    bcc = models.JSONField(default=list, blank=True, help_text="List of BCC email addresses")
+    subject = models.CharField(max_length=255, help_text="Email subject")
+    body = models.TextField(help_text="Email body")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = HistoricalRecords()
+
+    class Meta:
+        ordering = ["-updated_at"]
+        verbose_name = "Email Draft"
+        verbose_name_plural = "Email Drafts"
+        indexes = [
+            models.Index(fields=["created_at"], name="leads_emaildraft_created"),
+            models.Index(fields=["updated_at"], name="leads_emaildraft_updated"),
+        ]
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        subject_preview = self.subject[:50] if self.subject else "(no subject)"
+        return f"Draft: {subject_preview} -> {self.lead.name}"

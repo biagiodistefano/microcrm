@@ -5,14 +5,17 @@ import typing as t
 
 from django.conf import settings
 from django.core.mail import EmailMessage
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from ninja.errors import HttpError
 
-from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 from leads.schema import (
     ActionIn,
     ActionPatch,
     CityIn,
+    EmailDraftIn,
+    EmailDraftPatch,
     EmailTemplateIn,
     EmailTemplatePatch,
     LeadIn,
@@ -482,3 +485,165 @@ def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
             "status": email_sent.status,
             "message": "Email sent successfully",
         }
+
+
+# --- Email Draft Functions ---
+
+
+def create_email_draft(data: EmailDraftIn) -> EmailDraft:
+    """Create a new email draft.
+
+    Args:
+        data: EmailDraftIn with lead_id, subject, body, etc.
+
+    Returns:
+        EmailDraft record
+
+    Raises:
+        Http404: If lead or template not found
+    """
+    lead = get_object_or_404(Lead, pk=data.lead_id)
+    template = get_object_or_404(EmailTemplate, pk=data.template_id) if data.template_id else None
+
+    return EmailDraft.objects.create(
+        lead=lead,
+        template=template,
+        from_email=data.from_email or settings.DEFAULT_FROM_EMAIL,
+        to=data.to or ([lead.email] if lead.email else []),
+        bcc=data.bcc,
+        subject=data.subject,
+        body=data.body,
+    )
+
+
+def update_email_draft(draft: EmailDraft, data: EmailDraftIn) -> EmailDraft:
+    """Update an email draft (full replacement).
+
+    Args:
+        draft: The EmailDraft to update
+        data: EmailDraftIn with new values
+
+    Returns:
+        Updated EmailDraft record
+
+    Raises:
+        Http404: If lead or template not found
+    """
+    draft.lead = get_object_or_404(Lead, pk=data.lead_id)
+    draft.template = get_object_or_404(EmailTemplate, pk=data.template_id) if data.template_id else None
+    draft.from_email = data.from_email or settings.DEFAULT_FROM_EMAIL
+    draft.to = data.to or ([draft.lead.email] if draft.lead.email else [])
+    draft.bcc = data.bcc
+    draft.subject = data.subject
+    draft.body = data.body
+    draft.save()
+    return draft
+
+
+def patch_email_draft(draft: EmailDraft, data: EmailDraftPatch) -> EmailDraft:
+    """Partially update an email draft.
+
+    Args:
+        draft: The EmailDraft to update
+        data: EmailDraftPatch with fields to update
+
+    Returns:
+        Updated EmailDraft record
+
+    Raises:
+        Http404: If template not found
+    """
+    for field, value in data.model_dump(exclude_unset=True).items():
+        if field == "template_id":
+            draft.template = get_object_or_404(EmailTemplate, pk=value) if value else None
+        else:
+            setattr(draft, field, value)
+    draft.save()
+    return draft
+
+
+def send_email_draft(draft: EmailDraft) -> EmailSent:
+    """Send an email draft.
+
+    Creates EmailSent record, updates lead's last_contact, and deletes the draft.
+
+    Args:
+        draft: The EmailDraft to send
+
+    Returns:
+        EmailSent record
+
+    Raises:
+        ValueError: If there are unreplaced placeholders in subject or body
+    """
+    # Validate no placeholders remain
+    errors = validate_no_placeholders(draft.subject, draft.body)
+    if errors:
+        raise ValueError(f"Unreplaced placeholders found: {', '.join(errors)}")
+
+    # Send the email using existing function
+    email_sent = send_email_to_lead(
+        lead=draft.lead,
+        subject=draft.subject,
+        body=draft.body,
+        to=draft.to,
+        bcc=draft.bcc or None,
+        template=draft.template,
+    )
+
+    # Delete the draft after successful send
+    draft.delete()
+
+    return email_sent
+
+
+def save_email_as_draft(
+    lead: Lead,
+    subject: str,
+    body: str,
+    to: list[str],
+    bcc: list[str] | None = None,
+    template: EmailTemplate | None = None,
+    draft_id: int | None = None,
+) -> EmailDraft:
+    """Save email form data as a draft.
+
+    Called from admin send_email view when "Save as Draft" is clicked.
+    If draft_id is provided, updates the existing draft instead of creating a new one.
+
+    Args:
+        lead: The Lead this draft is for
+        subject: Email subject
+        body: Email body
+        to: List of recipient email addresses
+        bcc: Optional list of BCC email addresses
+        template: Optional EmailTemplate used
+        draft_id: Optional ID of existing draft to update
+
+    Returns:
+        EmailDraft record (created or updated)
+
+    Raises:
+        Http404: If draft_id is invalid or belongs to a different lead
+    """
+    if draft_id:
+        # Validate draft exists AND belongs to this lead
+        draft = get_object_or_404(EmailDraft, pk=draft_id, lead=lead)
+        draft.template = template
+        draft.from_email = settings.DEFAULT_FROM_EMAIL
+        draft.to = to
+        draft.bcc = bcc or []
+        draft.subject = subject
+        draft.body = body
+        draft.save()
+        return draft
+
+    return EmailDraft.objects.create(
+        lead=lead,
+        template=template,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        to=to,
+        bcc=bcc or [],
+        subject=subject,
+        body=body,
+    )

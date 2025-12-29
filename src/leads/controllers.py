@@ -9,7 +9,7 @@ from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseS
 from ninja_extra.searching import Searching, searching
 
 from leads import service
-from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 from leads.schema import (
     ActionFilterSchema,
     ActionIn,
@@ -18,6 +18,10 @@ from leads.schema import (
     CityFilterSchema,
     CityIn,
     CitySchema,
+    EmailDraftFilterSchema,
+    EmailDraftIn,
+    EmailDraftPatch,
+    EmailDraftSchema,
     EmailSentFilterSchema,
     EmailSentSchema,
     EmailTemplateIn,
@@ -478,3 +482,75 @@ class EmailSentController(ControllerBase):
     def get_email(self, email_id: int) -> EmailSent:
         """Get a single sent email by ID."""
         return get_object_or_404(EmailSent, id=email_id)
+
+
+@api_controller("/email-drafts", tags=["Email Drafts"])
+class EmailDraftController(ControllerBase):
+    """Controller for email draft operations."""
+
+    @route.get("/", response=PaginatedResponseSchema[EmailDraftSchema])
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["subject", "body", "lead__name"])
+    def list_drafts(
+        self,
+        filters: EmailDraftFilterSchema = Query(...),  # type: ignore[type-arg]
+    ) -> QuerySet[EmailDraft]:
+        """List all email drafts with filtering and pagination.
+
+        Filter options:
+        - lead_id: Filter by lead ID
+        - template_id: Filter by template ID
+        """
+        return filters.filter(EmailDraft.objects.select_related("lead", "template").all())
+
+    @route.get("/{draft_id}", response=EmailDraftSchema)
+    def get_draft(self, draft_id: int) -> EmailDraft:
+        """Get a single email draft by ID."""
+        return get_object_or_404(EmailDraft, pk=draft_id)
+
+    @route.post("/", response={201: EmailDraftSchema})
+    def create_draft(self, data: EmailDraftIn) -> tuple[int, EmailDraft]:
+        """Create a new email draft.
+
+        Lead ID is required. Template ID is optional.
+        If 'to' is not provided, defaults to the lead's email address.
+        """
+        return 201, service.create_email_draft(data)
+
+    @route.put("/{draft_id}", response=EmailDraftSchema)
+    def update_draft(self, draft_id: int, data: EmailDraftIn) -> EmailDraft:
+        """Update an email draft (full replacement)."""
+        draft = get_object_or_404(EmailDraft, pk=draft_id)
+        return service.update_email_draft(draft, data)
+
+    @route.patch("/{draft_id}", response=EmailDraftSchema)
+    def patch_draft(self, draft_id: int, data: EmailDraftPatch) -> EmailDraft:
+        """Partially update an email draft."""
+        draft = get_object_or_404(EmailDraft, pk=draft_id)
+        return service.patch_email_draft(draft, data)
+
+    @route.delete("/{draft_id}", response={204: None})
+    def delete_draft(self, draft_id: int) -> tuple[int, None]:
+        """Delete an email draft."""
+        draft = get_object_or_404(EmailDraft, pk=draft_id)
+        draft.delete()
+        return 204, None
+
+    @route.post("/{draft_id}/send", response={201: EmailSentSchema})
+    def send_draft(self, draft_id: int) -> tuple[int, EmailSent]:
+        """Send an email draft.
+
+        This will:
+        1. Validate no unreplaced placeholders remain
+        2. Send the email
+        3. Create an EmailSent record
+        4. Update the lead's last_contact date
+        5. Delete the draft
+
+        Returns the EmailSent record on success.
+        """
+        draft = get_object_or_404(EmailDraft, pk=draft_id)
+        try:
+            return 201, service.send_email_draft(draft)
+        except ValueError as e:
+            raise HttpError(400, str(e))
