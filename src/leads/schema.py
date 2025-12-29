@@ -136,7 +136,7 @@ class EmailTemplateSchema(ModelSchema):
 
     class Meta:
         model = EmailTemplate
-        fields = ["id", "name", "subject", "body", "created_at", "updated_at"]
+        fields = ["id", "name", "language", "subject", "body", "created_at", "updated_at"]
 
 
 class EmailSentSchema(ModelSchema):
@@ -271,6 +271,7 @@ class EmailTemplateIn(Schema):
     """EmailTemplate create/update input schema."""
 
     name: str = Field(..., description="Template name (must be unique)")
+    language: str = Field(default="en", description="Language code (e.g., 'en', 'it', 'es', 'de', 'fr')")
     subject: str = Field(..., description="Email subject (supports placeholders like {lead.name})")
     body: str = Field(..., description="Email body (supports placeholders like {lead.name}, {lead.city})")
 
@@ -279,6 +280,7 @@ class EmailTemplatePatch(Schema):
     """EmailTemplate partial update schema."""
 
     name: str | None = None
+    language: str | None = None
     subject: str | None = None
     body: str | None = None
 
