@@ -7,7 +7,7 @@ from decimal import Decimal
 from ninja import FilterLookup, FilterSchema, ModelSchema, Schema
 from pydantic import Field
 
-from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 
 
 # --- Output Schemas ---
@@ -171,6 +171,36 @@ class EmailSentSchema(ModelSchema):
         return obj.template_id
 
 
+class EmailDraftSchema(ModelSchema):
+    """EmailDraft output schema."""
+
+    lead_id: int
+    template_id: int | None = None
+
+    class Meta:
+        model = EmailDraft
+        fields = [
+            "id",
+            "from_email",
+            "to",
+            "bcc",
+            "subject",
+            "body",
+            "created_at",
+            "updated_at",
+        ]
+
+    @staticmethod
+    def resolve_lead_id(obj: EmailDraft) -> int:
+        """Resolve lead_id from the foreign key."""
+        return obj.lead_id
+
+    @staticmethod
+    def resolve_template_id(obj: EmailDraft) -> int | None:
+        """Resolve template_id from the foreign key."""
+        return obj.template_id
+
+
 # --- Input Schemas ---
 class CityIn(Schema):
     """City input for creating/finding a city.
@@ -285,6 +315,29 @@ class EmailTemplatePatch(Schema):
     body: str | None = None
 
 
+class EmailDraftIn(Schema):
+    """EmailDraft create/update input schema."""
+
+    lead_id: int = Field(..., description="ID of the lead this draft is for")
+    template_id: int | None = Field(default=None, description="Template ID used (optional)")
+    from_email: str | None = Field(default=None, description="Sender email (defaults to DEFAULT_FROM_EMAIL)")
+    to: list[str] | None = Field(default=None, description="Recipients (defaults to lead's email)")
+    bcc: list[str] = Field(default_factory=list, description="BCC recipients")
+    subject: str = Field(..., description="Email subject")
+    body: str = Field(..., description="Email body")
+
+
+class EmailDraftPatch(Schema):
+    """EmailDraft partial update schema."""
+
+    template_id: int | None = None
+    from_email: str | None = None
+    to: list[str] | None = None
+    bcc: list[str] | None = None
+    subject: str | None = None
+    body: str | None = None
+
+
 class SendEmailIn(Schema):
     """Input schema for sending an email to a lead."""
 
@@ -348,6 +401,13 @@ class EmailSentFilterSchema(FilterSchema):
     lead_id: t.Annotated[int | None, FilterLookup(q="lead_id")] = None
     template_id: t.Annotated[int | None, FilterLookup(q="template_id")] = None
     status: EmailSent.Status | None = None
+
+
+class EmailDraftFilterSchema(FilterSchema):
+    """EmailDraft filter schema."""
+
+    lead_id: t.Annotated[int | None, FilterLookup(q="lead_id")] = None
+    template_id: t.Annotated[int | None, FilterLookup(q="template_id")] = None
 
 
 class SendEmailResponse(Schema):

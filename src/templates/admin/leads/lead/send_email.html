@@ -174,6 +174,16 @@
         background: var(--close-button-bg, #888);
         color: white;
     }
+
+    .button-row button.secondary {
+        background: #6b7280;
+        color: white;
+        border: none;
+    }
+
+    .button-row button.secondary:hover {
+        background: #4b5563;
+    }
 </style>
 {% endblock %}
 
@@ -220,6 +230,7 @@
 
     <form method="post" id="send-email-form">
         {% csrf_token %}
+        {{ form.draft_id }}
 
         <div class="form-row">
             <label for="id_language_filter">Filter by Language</label>
@@ -277,7 +288,8 @@
         </div>
 
         <div class="button-row">
-            <button type="submit">Send Email</button>
+            <button type="submit" name="send_email">Send Email</button>
+            <button type="submit" name="save_draft" class="secondary">Save as Draft</button>
             <a href="{% url 'admin:leads_lead_change' lead.id %}" class="cancel">Cancel</a>
         </div>
     </form>

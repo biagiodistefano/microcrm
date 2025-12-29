@@ -16,6 +16,7 @@ from leads.admin import (
     ActionAdmin,
     CityAdmin,
     CityLinkMixin,
+    EmailDraftAdmin,
     HasEmailFilter,
     HasInstagramFilter,
     HasPhoneFilter,
@@ -24,6 +25,7 @@ from leads.admin import (
     LeadTypeAdmin,
     LeadTypeLinkMixin,
     ResearchJobAdmin,
+    SendEmailForm,
     TagAdmin,
 )
 
@@ -960,3 +962,399 @@ class TestSendEmailViewContext:
         )
 
         assert email_template.id in used_template_ids
+
+
+# --- EmailDraft Admin Tests ---
+
+
+class TestEmailDraftAdminRegistration:
+    def test_email_draft_admin_registered(self) -> None:
+        assert models.EmailDraft in admin.site._registry
+        assert isinstance(admin.site._registry[models.EmailDraft], EmailDraftAdmin)
+
+
+class TestEmailDraftAdminDisplayMethods:
+    @pytest.fixture
+    def draft_admin(self, site: AdminSite) -> EmailDraftAdmin:
+        return EmailDraftAdmin(models.EmailDraft, site)
+
+    @pytest.fixture
+    def email_draft(self, lead: models.Lead, email_template: models.EmailTemplate) -> models.EmailDraft:
+        return models.EmailDraft.objects.create(
+            lead=lead,
+            template=email_template,
+            from_email="test@example.com",
+            to=["recipient@example.com"],
+            bcc=["bcc@example.com"],
+            subject="Draft Subject for Testing",
+            body="Draft body content",
+        )
+
+    def test_lead_link(self, draft_admin: EmailDraftAdmin, email_draft: models.EmailDraft) -> None:
+        result = draft_admin.lead_link(email_draft)
+        assert email_draft.lead.name in result
+        assert f"/admin/leads/lead/{email_draft.lead.id}/change/" in result
+
+    def test_subject_preview_short(self, draft_admin: EmailDraftAdmin, email_draft: models.EmailDraft) -> None:
+        email_draft.subject = "Short Subject"
+        result = draft_admin.subject_preview(email_draft)
+        assert result == "Short Subject"
+
+    def test_subject_preview_long(self, draft_admin: EmailDraftAdmin, email_draft: models.EmailDraft) -> None:
+        email_draft.subject = "A" * 100  # Very long subject
+        result = draft_admin.subject_preview(email_draft)
+        assert len(result) == 63  # 60 chars + "..."
+        assert result.endswith("...")
+
+
+class TestEmailDraftAdminActions:
+    @pytest.fixture
+    def draft_admin(self, site: AdminSite) -> EmailDraftAdmin:
+        return EmailDraftAdmin(models.EmailDraft, site)
+
+    @pytest.fixture
+    def email_draft(self, lead: models.Lead) -> models.EmailDraft:
+        return models.EmailDraft.objects.create(
+            lead=lead,
+            from_email="test@example.com",
+            to=["recipient@example.com"],
+            bcc=[],
+            subject="Test Draft",
+            body="Test body",
+        )
+
+    @patch("leads.service.EmailMessage")
+    def test_send_selected_drafts(
+        self,
+        mock_email_class: MagicMock,
+        draft_admin: EmailDraftAdmin,
+        admin_request: HttpRequest,
+        email_draft: models.EmailDraft,
+    ) -> None:
+        draft_id = email_draft.id
+        qs = models.EmailDraft.objects.filter(id=draft_id)
+
+        draft_admin.send_selected_drafts(admin_request, qs)
+
+        # Draft should be deleted after sending
+        assert not models.EmailDraft.objects.filter(id=draft_id).exists()
+        # Email should be sent
+        mock_email_class.return_value.send.assert_called_once()
+
+    @patch("leads.service.EmailMessage")
+    def test_send_selected_drafts_multiple(
+        self,
+        mock_email_class: MagicMock,
+        draft_admin: EmailDraftAdmin,
+        admin_request: HttpRequest,
+        lead: models.Lead,
+    ) -> None:
+        # Create multiple drafts
+        draft1 = models.EmailDraft.objects.create(
+            lead=lead, subject="Draft 1", body="Body 1", to=["test@example.com"], bcc=[]
+        )
+        draft2 = models.EmailDraft.objects.create(
+            lead=lead, subject="Draft 2", body="Body 2", to=["test@example.com"], bcc=[]
+        )
+
+        qs = models.EmailDraft.objects.filter(id__in=[draft1.id, draft2.id])
+        draft_admin.send_selected_drafts(admin_request, qs)
+
+        # Both drafts should be deleted
+        assert models.EmailDraft.objects.count() == 0
+        # Email should be sent twice
+        assert mock_email_class.return_value.send.call_count == 2
+
+    def test_send_selected_drafts_with_placeholders_fails(
+        self,
+        draft_admin: EmailDraftAdmin,
+        admin_request: HttpRequest,
+        lead: models.Lead,
+    ) -> None:
+        draft = models.EmailDraft.objects.create(
+            lead=lead, subject="Hello {name}", body="Body", to=["test@example.com"], bcc=[]
+        )
+        qs = models.EmailDraft.objects.filter(id=draft.id)
+
+        # Should not raise, but draft should remain
+        draft_admin.send_selected_drafts(admin_request, qs)
+
+        # Draft should NOT be deleted due to validation error
+        assert models.EmailDraft.objects.filter(id=draft.id).exists()
+
+
+class TestEmailDraftSubmitLineActions:
+    """Tests for EmailDraftAdmin submit line actions (single instance)."""
+
+    @pytest.fixture
+    def draft_admin(self, site: AdminSite) -> EmailDraftAdmin:
+        return EmailDraftAdmin(models.EmailDraft, site)
+
+    @pytest.fixture
+    def email_draft(self, lead: models.Lead) -> models.EmailDraft:
+        return models.EmailDraft.objects.create(
+            lead=lead,
+            from_email="test@example.com",
+            to=["recipient@example.com"],
+            bcc=[],
+            subject="Test Draft",
+            body="Test body",
+        )
+
+    @patch("leads.service.EmailMessage")
+    def test_send_draft_action(
+        self,
+        mock_email_class: MagicMock,
+        draft_admin: EmailDraftAdmin,
+        admin_request: HttpRequest,
+        email_draft: models.EmailDraft,
+    ) -> None:
+        draft_id = email_draft.id
+        lead_id = email_draft.lead_id
+
+        response = draft_admin.send_draft(admin_request, email_draft)
+
+        assert response.status_code == 302  # Redirect
+        # Should redirect to lead change page since draft is deleted
+        assert f"/admin/leads/lead/{lead_id}/change/" in str(response.url)
+        # Draft should be deleted
+        assert not models.EmailDraft.objects.filter(id=draft_id).exists()
+
+    def test_send_draft_action_with_placeholders(
+        self,
+        draft_admin: EmailDraftAdmin,
+        admin_request: HttpRequest,
+        lead: models.Lead,
+    ) -> None:
+        draft = models.EmailDraft.objects.create(
+            lead=lead, subject="Hello {name}", body="Body", to=["test@example.com"], bcc=[]
+        )
+
+        response = draft_admin.send_draft(admin_request, draft)
+
+        assert response.status_code == 302  # Redirect
+        # Should redirect back to draft change page on error
+        assert f"/admin/leads/emaildraft/{draft.id}/change/" in str(response.url)
+        # Draft should NOT be deleted
+        assert models.EmailDraft.objects.filter(id=draft.id).exists()
+
+
+# --- LeadAdmin Save Draft Tests ---
+
+
+class TestLeadAdminSaveDraft:
+    """Tests for save as draft functionality in LeadAdmin send_email view."""
+
+    @pytest.fixture
+    def lead_admin(self, site: AdminSite) -> LeadAdmin:
+        return LeadAdmin(models.Lead, site)
+
+    def test_send_email_form_has_draft_id_field(self) -> None:
+        """Test that SendEmailForm includes draft_id hidden field."""
+        form = SendEmailForm()
+        assert "draft_id" in form.fields
+        assert form.fields["draft_id"].required is False
+
+    def test_send_email_view_creates_draft(
+        self,
+        lead_admin: LeadAdmin,
+        request_factory: RequestFactory,
+        lead: models.Lead,
+    ) -> None:
+        """Test that clicking 'Save as Draft' creates a draft."""
+        request = request_factory.post(
+            f"/admin/leads/lead/{lead.id}/send-email/",
+            data={
+                "to": "test@example.com",
+                "subject": "Test Subject",
+                "body": "Test Body",
+                "language_filter": "all",
+                "save_draft": "1",  # This indicates save draft button was clicked
+            },
+        )
+        request.user = MagicMock()
+        request.session = {}  # type: ignore[assignment]
+        request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+        response = lead_admin.send_email_view(request, lead.id)
+
+        # Should redirect
+        assert response.status_code == 302
+        # Draft should be created
+        assert models.EmailDraft.objects.filter(lead=lead).exists()
+        draft = models.EmailDraft.objects.get(lead=lead)
+        assert draft.subject == "Test Subject"
+        assert draft.body == "Test Body"
+
+    def test_send_email_view_updates_existing_draft(
+        self,
+        lead_admin: LeadAdmin,
+        request_factory: RequestFactory,
+        lead: models.Lead,
+    ) -> None:
+        """Test that saving with existing draft_id updates the draft."""
+        # Create initial draft
+        draft = models.EmailDraft.objects.create(
+            lead=lead,
+            subject="Original Subject",
+            body="Original Body",
+            to=["original@example.com"],
+            bcc=[],
+        )
+
+        request = request_factory.post(
+            f"/admin/leads/lead/{lead.id}/send-email/",
+            data={
+                "draft_id": str(draft.id),
+                "to": "updated@example.com",
+                "subject": "Updated Subject",
+                "body": "Updated Body",
+                "language_filter": "all",
+                "save_draft": "1",
+            },
+        )
+        request.user = MagicMock()
+        request.session = {}  # type: ignore[assignment]
+        request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+        response = lead_admin.send_email_view(request, lead.id)
+
+        assert response.status_code == 302
+        # Should still only have one draft
+        assert models.EmailDraft.objects.filter(lead=lead).count() == 1
+        # Draft should be updated
+        draft.refresh_from_db()
+        assert draft.subject == "Updated Subject"
+        assert draft.body == "Updated Body"
+        assert draft.to == ["updated@example.com"]
+
+    @patch("leads.service.EmailMessage")
+    def test_send_email_view_deletes_draft_after_send(
+        self,
+        mock_email_class: MagicMock,
+        lead_admin: LeadAdmin,
+        request_factory: RequestFactory,
+        lead: models.Lead,
+    ) -> None:
+        """Test that sending email from draft form deletes the draft."""
+        draft = models.EmailDraft.objects.create(
+            lead=lead,
+            subject="Draft to Send",
+            body="Draft body",
+            to=["test@example.com"],
+            bcc=[],
+        )
+
+        request = request_factory.post(
+            f"/admin/leads/lead/{lead.id}/send-email/",
+            data={
+                "draft_id": str(draft.id),
+                "to": "test@example.com",
+                "subject": "Draft to Send",
+                "body": "Draft body",
+                "language_filter": "all",
+                "send_email": "1",  # Send button clicked, not save_draft
+            },
+        )
+        request.user = MagicMock()
+        request.session = {}  # type: ignore[assignment]
+        request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+        response = lead_admin.send_email_view(request, lead.id)
+
+        assert response.status_code == 302
+        # Draft should be deleted after successful send
+        assert not models.EmailDraft.objects.filter(id=draft.id).exists()
+        # Email should have been sent
+        mock_email_class.return_value.send.assert_called_once()
+
+    def test_send_email_view_loads_draft_from_query_param(
+        self,
+        lead_admin: LeadAdmin,
+        request_factory: RequestFactory,
+        lead: models.Lead,
+    ) -> None:
+        """Test that GET with draft_id query param loads draft data."""
+        draft = models.EmailDraft.objects.create(
+            lead=lead,
+            subject="Draft Subject",
+            body="Draft Body",
+            to=["draft@example.com"],
+            bcc=["bcc@example.com"],
+        )
+
+        request = request_factory.get(
+            f"/admin/leads/lead/{lead.id}/send-email/",
+            {"draft_id": str(draft.id)},
+        )
+        request.user = MagicMock()
+        request.session = {}  # type: ignore[assignment]
+        request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+        response = lead_admin.send_email_view(request, lead.id)
+
+        assert response.status_code == 200
+        # Check rendered HTML contains draft data
+        content = response.content.decode()
+        assert "Draft Subject" in content
+        assert "Draft Body" in content
+        assert "draft@example.com" in content
+        assert "bcc@example.com" in content
+        # Hidden draft_id field should be present
+        assert f'value="{draft.id}"' in content
+
+    def test_send_email_view_ignores_invalid_draft_id(
+        self,
+        lead_admin: LeadAdmin,
+        request_factory: RequestFactory,
+        lead: models.Lead,
+    ) -> None:
+        """Test that GET with invalid draft_id shows warning."""
+        request = request_factory.get(
+            f"/admin/leads/lead/{lead.id}/send-email/",
+            {"draft_id": "99999"},
+        )
+        request.user = MagicMock()
+        request.session = {}  # type: ignore[assignment]
+        request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+        response = lead_admin.send_email_view(request, lead.id)
+
+        assert response.status_code == 200
+        # Form should render without draft_id value (no value="99999" in hidden field)
+        content = response.content.decode()
+        assert 'value="99999"' not in content
+
+    def test_send_email_view_ignores_draft_for_wrong_lead(
+        self,
+        lead_admin: LeadAdmin,
+        request_factory: RequestFactory,
+        lead: models.Lead,
+    ) -> None:
+        """Test that draft for different lead is not loaded."""
+        other_lead = models.Lead.objects.create(name="Other Lead", email="other@example.com")
+        draft = models.EmailDraft.objects.create(
+            lead=other_lead,  # Different lead!
+            subject="Other Draft Subject XYZ",
+            body="Other Draft Body XYZ",
+            to=["other@example.com"],
+            bcc=[],
+        )
+
+        request = request_factory.get(
+            f"/admin/leads/lead/{lead.id}/send-email/",
+            {"draft_id": str(draft.id)},
+        )
+        request.user = MagicMock()
+        request.session = {}  # type: ignore[assignment]
+        request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+        response = lead_admin.send_email_view(request, lead.id)
+
+        assert response.status_code == 200
+        # Form should NOT have draft data since it belongs to different lead
+        content = response.content.decode()
+        assert "Other Draft Subject XYZ" not in content
+        assert "Other Draft Body XYZ" not in content
+        # Draft ID should not be in the form
+        assert f'value="{draft.id}"' not in content

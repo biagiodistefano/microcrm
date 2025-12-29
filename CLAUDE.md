@@ -70,6 +70,134 @@ uv run pytest src/leads/tests/test_service.py::test_create_lead -v
 uv run pytest --cov=leads.service src/leads/tests/test_service.py -v
 ```
 
+## CLI Client (cli.py)
+
+A Typer-based CLI client for the MicroCRM API. Configure via environment variables:
+- `CRM_BASE_URL` - API base URL (default: `http://localhost:8000/api`)
+- `API_KEY` - API authentication key
+
+### Main Commands
+```
+python cli.py [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  config      Show current CLI configuration
+  leads       Manage leads
+  cities      Manage cities
+  types       Browse lead types
+  tags        Browse tags
+  actions     Manage actions/tasks
+  jobs        Manage research jobs
+  templates   Manage email templates
+  emails      View sent emails
+```
+
+### leads
+```
+leads list      [--page] [--page-size] [--search] [--status] [--temperature]
+                [--type] [--city-id] [--city] [--country] [--tag] [--raw]
+leads get       LEAD_ID [--raw]
+leads create    --name [--email] [--phone] [--company] [--type] [--city]
+                [--country] [--iso2] [--telegram] [--instagram] [--website]
+                [--source] [--status] [--temperature] [--tag] [--notes]
+                [--value] [--raw]
+leads update    LEAD_ID [--name] [--email] [--phone] [--company] [--type]
+                [--city] [--country] [--iso2] [--telegram] [--instagram]
+                [--website] [--source] [--status] [--temperature] [--tag]
+                [--notes] [--value] [--raw]
+leads delete    LEAD_ID [--force]
+leads import    FILE [--dry-run]
+leads send-email LEAD_ID [--template] [--subject] [--body] [--to] [--bcc]
+                [--background] [--send] [--raw]
+                NOTE: Runs in DRY-RUN mode by default. Use --send to actually send.
+leads emails    LEAD_ID [--raw]
+```
+
+### cities
+```
+cities list     [--page] [--page-size] [--search] [--country] [--raw]
+cities get      CITY_ID [--raw]
+cities create   --name --country [--iso2] [--raw]
+cities research CITY_ID [--raw]
+```
+
+### types
+```
+types list      [--raw]
+```
+
+### tags
+```
+tags list       [--search] [--raw]
+```
+
+### actions
+```
+actions list    [--page] [--page-size] [--search] [--lead] [--status]
+                [--due-date] [--due-before] [--due-after] [--raw]
+actions get     ACTION_ID [--raw]
+actions create  --lead --name [--notes] [--due-date] [--raw]
+actions update  ACTION_ID [--name] [--notes] [--status] [--due-date] [--raw]
+actions delete  ACTION_ID [--force]
+```
+
+### jobs (Research Jobs)
+```
+jobs list       [--page] [--page-size] [--search] [--city-id] [--status]
+                [--country] [--raw]
+jobs get        JOB_ID [--raw]
+jobs create     --city [--raw]
+jobs run        JOB_ID [--raw]
+jobs reprocess  JOB_ID [--raw]
+jobs delete     JOB_ID [--force]
+```
+
+### templates (Email Templates)
+```
+templates list   [--search] [--raw]
+templates get    TEMPLATE_ID [--raw]
+templates create --name --subject --body [--language] [--raw]
+templates update TEMPLATE_ID [--name] [--subject] [--body] [--language] [--raw]
+templates delete TEMPLATE_ID [--force]
+```
+
+### emails (Sent Emails)
+```
+emails list     [--page] [--page-size] [--lead] [--template] [--status] [--raw]
+emails get      EMAIL_ID [--raw]
+```
+
+### Common Options
+- `-r, --raw` - Output raw JSON instead of formatted tables
+- `-p, --page` - Page number for paginated results
+- `-s, --page-size` - Items per page
+- `-q, --search` - Search/filter text
+- `-f, --force` - Skip confirmation prompts
+
+### Examples
+```bash
+# List leads in Berlin with hot temperature
+python cli.py leads list --city Berlin --temperature hot
+
+# Create a new lead
+python cli.py leads create --name "Test Venue" --city Berlin --country Germany --type Venue
+
+# Import leads from JSON file
+python cli.py leads import leads.json
+
+# Preview email (dry-run, safe)
+python cli.py leads send-email 123 --template 2
+
+# Actually send email
+python cli.py leads send-email 123 --template 2 --send
+
+# Start research for a city
+python cli.py cities research 11
+
+# Check research job status
+python cli.py jobs list --status completed
+```
+
 ## Architecture
 
 ### Project Layout

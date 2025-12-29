@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.test import Client
 
-from leads.models import Action, City, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
 
 pytestmark = pytest.mark.django_db
 
@@ -888,3 +888,227 @@ class TestLeadEmailsListEndpoint:
     def test_list_lead_emails_not_found(self, api_client: Client) -> None:
         response = api_client.get("/api/leads/99999/emails")
         assert response.status_code == 404
+
+
+# --- Email Draft Endpoints ---
+
+
+class TestEmailDraftListEndpoint:
+    def test_list_drafts_empty(self, api_client: Client) -> None:
+        response = api_client.get("/api/email-drafts/")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+        assert data["results"] == []
+
+    def test_list_drafts_with_data(self, api_client: Client, email_draft: EmailDraft) -> None:
+        response = api_client.get("/api/email-drafts/")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["results"][0]["subject"] == email_draft.subject
+        assert data["results"][0]["lead_id"] == email_draft.lead_id
+
+    def test_list_drafts_filter_by_lead_id(self, api_client: Client, email_draft: EmailDraft) -> None:
+        response = api_client.get(f"/api/email-drafts/?lead_id={email_draft.lead_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+
+        response = api_client.get("/api/email-drafts/?lead_id=99999")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+
+    def test_list_drafts_filter_by_template_id(self, api_client: Client, email_draft: EmailDraft) -> None:
+        assert email_draft.template is not None
+        response = api_client.get(f"/api/email-drafts/?template_id={email_draft.template_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+
+    def test_list_drafts_search(self, api_client: Client, email_draft: EmailDraft) -> None:
+        response = api_client.get("/api/email-drafts/?search=Draft")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+
+        response = api_client.get("/api/email-drafts/?search=nonexistent")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+
+
+class TestEmailDraftGetEndpoint:
+    def test_get_draft(self, api_client: Client, email_draft: EmailDraft) -> None:
+        response = api_client.get(f"/api/email-drafts/{email_draft.id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["subject"] == email_draft.subject
+        assert data["lead_id"] == email_draft.lead_id
+        assert data["to"] == email_draft.to
+        assert data["bcc"] == email_draft.bcc
+
+    def test_get_draft_not_found(self, api_client: Client) -> None:
+        response = api_client.get("/api/email-drafts/99999")
+        assert response.status_code == 404
+
+
+class TestEmailDraftCreateEndpoint:
+    def test_create_draft(self, api_client: Client, lead: Lead) -> None:
+        response = api_client.post(
+            "/api/email-drafts/",
+            data={
+                "lead_id": lead.id,
+                "subject": "New Draft",
+                "body": "Draft body content",
+                "to": ["recipient@example.com"],
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["subject"] == "New Draft"
+        assert data["lead_id"] == lead.id
+        assert EmailDraft.objects.count() == 1
+
+    def test_create_draft_with_template(self, api_client: Client, lead: Lead, email_template: EmailTemplate) -> None:
+        response = api_client.post(
+            "/api/email-drafts/",
+            data={
+                "lead_id": lead.id,
+                "template_id": email_template.id,
+                "subject": "Template Draft",
+                "body": "Body",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["template_id"] == email_template.id
+
+    def test_create_draft_invalid_lead(self, api_client: Client) -> None:
+        response = api_client.post(
+            "/api/email-drafts/",
+            data={
+                "lead_id": 99999,
+                "subject": "Test",
+                "body": "Test",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+    def test_create_draft_invalid_template(self, api_client: Client, lead: Lead) -> None:
+        response = api_client.post(
+            "/api/email-drafts/",
+            data={
+                "lead_id": lead.id,
+                "template_id": 99999,
+                "subject": "Test",
+                "body": "Test",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+
+class TestEmailDraftUpdateEndpoint:
+    def test_update_draft(self, api_client: Client, email_draft: EmailDraft) -> None:
+        response = api_client.put(
+            f"/api/email-drafts/{email_draft.id}",
+            data={
+                "lead_id": email_draft.lead_id,
+                "subject": "Updated Subject",
+                "body": "Updated Body",
+                "to": ["new@example.com"],
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["subject"] == "Updated Subject"
+        assert data["body"] == "Updated Body"
+        assert data["to"] == ["new@example.com"]
+
+    def test_update_draft_not_found(self, api_client: Client, lead: Lead) -> None:
+        response = api_client.put(
+            "/api/email-drafts/99999",
+            data={
+                "lead_id": lead.id,
+                "subject": "Test",
+                "body": "Test",
+            },
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+
+class TestEmailDraftPatchEndpoint:
+    def test_patch_draft(self, api_client: Client, email_draft: EmailDraft) -> None:
+        original_body = email_draft.body
+        response = api_client.patch(
+            f"/api/email-drafts/{email_draft.id}",
+            data={"subject": "Patched Subject"},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["subject"] == "Patched Subject"
+        assert data["body"] == original_body  # Unchanged
+
+    def test_patch_draft_not_found(self, api_client: Client) -> None:
+        response = api_client.patch(
+            "/api/email-drafts/99999",
+            data={"subject": "Test"},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+
+class TestEmailDraftDeleteEndpoint:
+    def test_delete_draft(self, api_client: Client, email_draft: EmailDraft) -> None:
+        draft_id = email_draft.id
+        response = api_client.delete(f"/api/email-drafts/{draft_id}")
+        assert response.status_code == 204
+        assert not EmailDraft.objects.filter(id=draft_id).exists()
+
+    def test_delete_draft_not_found(self, api_client: Client) -> None:
+        response = api_client.delete("/api/email-drafts/99999")
+        assert response.status_code == 404
+
+
+class TestEmailDraftSendEndpoint:
+    @patch("leads.service.EmailMessage")
+    def test_send_draft(self, mock_email_class: MagicMock, api_client: Client, email_draft: EmailDraft) -> None:
+        draft_id = email_draft.id
+        lead_id = email_draft.lead_id
+
+        response = api_client.post(f"/api/email-drafts/{draft_id}/send")
+        assert response.status_code == 201
+        data = response.json()
+        assert data["lead_id"] == lead_id
+        assert data["status"] == EmailSent.Status.SENT
+        mock_email_class.return_value.send.assert_called_once()
+
+        # Draft should be deleted
+        assert not EmailDraft.objects.filter(id=draft_id).exists()
+        # EmailSent should be created
+        assert EmailSent.objects.filter(lead_id=lead_id).exists()
+
+    def test_send_draft_not_found(self, api_client: Client) -> None:
+        response = api_client.post("/api/email-drafts/99999/send")
+        assert response.status_code == 404
+
+    def test_send_draft_with_placeholders_fails(self, api_client: Client, lead: Lead) -> None:
+        draft = EmailDraft.objects.create(
+            lead=lead,
+            subject="Hello {name}",
+            body="Body",
+            to=["test@example.com"],
+            bcc=[],
+        )
+        response = api_client.post(f"/api/email-drafts/{draft.id}/send")
+        assert response.status_code == 400  # Validation error
+        # Draft should NOT be deleted
+        assert EmailDraft.objects.filter(id=draft.id).exists()

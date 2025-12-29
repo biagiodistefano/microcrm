@@ -4,16 +4,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from leads.models import City, EmailSent, EmailTemplate, Lead, LeadType, Tag
-from leads.schema import CityIn, LeadIn, LeadPatch
+from leads.models import City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, Tag
+from leads.schema import CityIn, EmailDraftIn, EmailDraftPatch, LeadIn, LeadPatch
 from leads.service import (
+    create_email_draft,
     create_lead,
     get_or_create_city,
     get_or_create_lead_type,
     get_or_create_tags,
+    patch_email_draft,
     patch_lead,
     render_email_template,
+    save_email_as_draft,
+    send_email_draft,
     send_email_to_lead,
+    update_email_draft,
     update_lead,
     validate_no_placeholders,
 )
@@ -305,3 +310,269 @@ class TestSendEmailToLead:
         # last_contact should NOT be updated on failure
         lead.refresh_from_db()
         assert lead.last_contact is None
+
+
+class TestCreateEmailDraft:
+    """Tests for create_email_draft function."""
+
+    def test_creates_draft_with_all_fields(self, lead: Lead, email_template: EmailTemplate) -> None:
+        data = EmailDraftIn(
+            lead_id=lead.id,
+            template_id=email_template.id,
+            from_email="sender@example.com",
+            to=["recipient@example.com"],
+            bcc=["bcc@example.com"],
+            subject="Test Subject",
+            body="Test Body",
+        )
+        draft = create_email_draft(data)
+
+        assert draft.lead == lead
+        assert draft.template == email_template
+        assert draft.from_email == "sender@example.com"
+        assert draft.to == ["recipient@example.com"]
+        assert draft.bcc == ["bcc@example.com"]
+        assert draft.subject == "Test Subject"
+        assert draft.body == "Test Body"
+
+    def test_creates_draft_with_minimal_fields(self, lead: Lead) -> None:
+        data = EmailDraftIn(
+            lead_id=lead.id,
+            subject="Minimal Draft",
+            body="Body only",
+        )
+        draft = create_email_draft(data)
+
+        assert draft.lead == lead
+        assert draft.template is None
+        assert draft.to == [lead.email]  # Defaults to lead email
+        assert draft.bcc == []
+        assert draft.subject == "Minimal Draft"
+
+    def test_raises_404_for_invalid_lead(self) -> None:
+        from django.http import Http404
+
+        data = EmailDraftIn(
+            lead_id=99999,
+            subject="Test",
+            body="Test",
+        )
+        with pytest.raises(Http404):
+            create_email_draft(data)
+
+    def test_raises_404_for_invalid_template(self, lead: Lead) -> None:
+        from django.http import Http404
+
+        data = EmailDraftIn(
+            lead_id=lead.id,
+            template_id=99999,
+            subject="Test",
+            body="Test",
+        )
+        with pytest.raises(Http404):
+            create_email_draft(data)
+
+
+class TestUpdateEmailDraft:
+    """Tests for update_email_draft function."""
+
+    def test_updates_all_fields(
+        self, email_draft: EmailDraft, lead: Lead, email_template_no_placeholders: EmailTemplate
+    ) -> None:
+        # Create a new lead for updating
+        new_lead = Lead.objects.create(name="New Lead", email="new@example.com")
+
+        data = EmailDraftIn(
+            lead_id=new_lead.id,
+            template_id=email_template_no_placeholders.id,
+            from_email="new-sender@example.com",
+            to=["new-recipient@example.com"],
+            bcc=["new-bcc@example.com"],
+            subject="Updated Subject",
+            body="Updated Body",
+        )
+        updated = update_email_draft(email_draft, data)
+
+        assert updated.lead == new_lead
+        assert updated.template == email_template_no_placeholders
+        assert updated.from_email == "new-sender@example.com"
+        assert updated.to == ["new-recipient@example.com"]
+        assert updated.bcc == ["new-bcc@example.com"]
+        assert updated.subject == "Updated Subject"
+        assert updated.body == "Updated Body"
+
+    def test_raises_404_for_invalid_lead(self, email_draft: EmailDraft) -> None:
+        from django.http import Http404
+
+        data = EmailDraftIn(
+            lead_id=99999,
+            subject="Test",
+            body="Test",
+        )
+        with pytest.raises(Http404):
+            update_email_draft(email_draft, data)
+
+
+class TestPatchEmailDraft:
+    """Tests for patch_email_draft function."""
+
+    def test_patches_single_field(self, email_draft: EmailDraft) -> None:
+        original_body = email_draft.body
+        data = EmailDraftPatch(subject="Patched Subject")
+
+        patched = patch_email_draft(email_draft, data)
+
+        assert patched.subject == "Patched Subject"
+        assert patched.body == original_body  # Unchanged
+
+    def test_patches_multiple_fields(self, email_draft: EmailDraft) -> None:
+        data = EmailDraftPatch(
+            subject="New Subject",
+            body="New Body",
+            bcc=["new-bcc@example.com"],
+        )
+        patched = patch_email_draft(email_draft, data)
+
+        assert patched.subject == "New Subject"
+        assert patched.body == "New Body"
+        assert patched.bcc == ["new-bcc@example.com"]
+
+    def test_patches_template(self, email_draft: EmailDraft, email_template_no_placeholders: EmailTemplate) -> None:
+        data = EmailDraftPatch(template_id=email_template_no_placeholders.id)
+
+        patched = patch_email_draft(email_draft, data)
+
+        assert patched.template == email_template_no_placeholders
+
+    def test_clears_template_with_none(self, email_draft: EmailDraft) -> None:
+        assert email_draft.template is not None
+        data = EmailDraftPatch(template_id=None)
+
+        patched = patch_email_draft(email_draft, data)
+
+        assert patched.template is None
+
+    def test_raises_404_for_invalid_template(self, email_draft: EmailDraft) -> None:
+        from django.http import Http404
+
+        data = EmailDraftPatch(template_id=99999)
+        with pytest.raises(Http404):
+            patch_email_draft(email_draft, data)
+
+
+class TestSendEmailDraft:
+    """Tests for send_email_draft function."""
+
+    @patch("leads.service.EmailMessage")
+    def test_sends_draft_and_creates_email_sent(self, mock_email_class: MagicMock, email_draft: EmailDraft) -> None:
+        draft_id = email_draft.id
+        lead = email_draft.lead
+
+        email_sent = send_email_draft(email_draft)
+
+        assert email_sent.lead == lead
+        assert email_sent.subject == email_draft.subject
+        assert email_sent.body == email_draft.body
+        assert email_sent.to == email_draft.to
+        assert email_sent.bcc == email_draft.bcc
+        assert email_sent.status == EmailSent.Status.SENT
+        mock_email_class.return_value.send.assert_called_once()
+
+        # Draft should be deleted
+        assert not EmailDraft.objects.filter(id=draft_id).exists()
+
+    @patch("leads.service.EmailMessage")
+    def test_updates_lead_last_contact(self, mock_email_class: MagicMock, email_draft: EmailDraft) -> None:
+        lead = email_draft.lead
+        assert lead.last_contact is None
+
+        send_email_draft(email_draft)
+
+        lead.refresh_from_db()
+        assert lead.last_contact is not None
+
+    def test_raises_error_for_unreplaced_placeholders(self, lead: Lead) -> None:
+        draft = EmailDraft.objects.create(
+            lead=lead,
+            subject="Hello {name}",
+            body="Test body",
+            to=["test@example.com"],
+            bcc=[],
+        )
+
+        with pytest.raises(ValueError, match="Unreplaced placeholders"):
+            send_email_draft(draft)
+
+        # Draft should NOT be deleted on error
+        assert EmailDraft.objects.filter(id=draft.id).exists()
+
+    @patch("leads.service.EmailMessage")
+    def test_preserves_template_association(self, mock_email_class: MagicMock, email_draft: EmailDraft) -> None:
+        template = email_draft.template
+
+        email_sent = send_email_draft(email_draft)
+
+        assert email_sent.template == template
+
+
+class TestSaveEmailAsDraft:
+    """Tests for save_email_as_draft function."""
+
+    def test_creates_new_draft(self, lead: Lead, email_template: EmailTemplate) -> None:
+        draft = save_email_as_draft(
+            lead=lead,
+            subject="New Draft",
+            body="Draft body",
+            to=["recipient@example.com"],
+            bcc=["bcc@example.com"],
+            template=email_template,
+        )
+
+        assert draft.lead == lead
+        assert draft.template == email_template
+        assert draft.subject == "New Draft"
+        assert draft.body == "Draft body"
+        assert draft.to == ["recipient@example.com"]
+        assert draft.bcc == ["bcc@example.com"]
+        assert EmailDraft.objects.count() == 1
+
+    def test_creates_draft_without_template(self, lead: Lead) -> None:
+        draft = save_email_as_draft(
+            lead=lead,
+            subject="No Template",
+            body="Body",
+            to=["test@example.com"],
+        )
+
+        assert draft.template is None
+        assert draft.bcc == []
+
+    def test_updates_existing_draft_when_draft_id_provided(self, email_draft: EmailDraft) -> None:
+        original_id = email_draft.id
+        lead = email_draft.lead
+
+        updated = save_email_as_draft(
+            lead=lead,
+            subject="Updated Subject",
+            body="Updated Body",
+            to=["updated@example.com"],
+            draft_id=email_draft.id,
+        )
+
+        assert updated.id == original_id  # Same draft
+        assert updated.subject == "Updated Subject"
+        assert updated.body == "Updated Body"
+        assert updated.to == ["updated@example.com"]
+        assert EmailDraft.objects.count() == 1  # No new draft created
+
+    def test_raises_404_for_invalid_draft_id(self, lead: Lead) -> None:
+        from django.http import Http404
+
+        with pytest.raises(Http404):
+            save_email_as_draft(
+                lead=lead,
+                subject="Test",
+                body="Test",
+                to=["test@example.com"],
+                draft_id=99999,
+            )

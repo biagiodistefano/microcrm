@@ -240,6 +240,11 @@ UNFOLD = {
                         "link": reverse_lazy("admin:leads_emailtemplate_changelist"),
                     },
                     {
+                        "title": "Drafts",
+                        "icon": "edit_note",
+                        "link": reverse_lazy("admin:leads_emaildraft_changelist"),
+                    },
+                    {
                         "title": "Sent Emails",
                         "icon": "outgoing_mail",
                         "link": reverse_lazy("admin:leads_emailsent_changelist"),
