@@ -195,6 +195,10 @@ class SendEmailForm(forms.Form):
         required=False,
         widget=forms.HiddenInput(),
     )
+    back_url = forms.CharField(
+        required=False,
+        widget=forms.HiddenInput(),
+    )
     language_filter = forms.ChoiceField(
         choices=[("all", "All Languages")] + list(models.EmailTemplate.Language.choices),
         required=False,
@@ -337,6 +341,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
     def send_email_view(self, request: HttpRequest, lead_id: int) -> HttpResponse:
         """Custom view for sending email to a lead."""
         lead = get_object_or_404(models.Lead, id=lead_id)
+        default_back_url = reverse("admin:leads_lead_change", args=[lead.id])
 
         if request.method == "POST":
             form = SendEmailForm(request.POST)
@@ -351,19 +356,35 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         else:
             initial: dict[str, t.Any] = {"to": lead.email} if lead.email else {}
 
+            # Check for back_url in session first (preserved across save-draft redirects)
+            session_back_url = request.session.pop("send_email_back_url", None)
+            if session_back_url:
+                initial["back_url"] = session_back_url
+            else:
+                # Capture referrer for back navigation (only on initial GET)
+                referrer = request.META.get("HTTP_REFERER", "")
+                # Only use referrer if it's not the current page (avoid self-reference)
+                current_path = request.build_absolute_uri()
+                if referrer and referrer != current_path and "/send-email/" not in referrer:
+                    initial["back_url"] = referrer
+                else:
+                    initial["back_url"] = default_back_url
+
             # Check if loading an existing draft
             draft_id = request.GET.get("draft_id")
             if draft_id:
                 try:
                     draft = models.EmailDraft.objects.get(pk=draft_id, lead=lead)
-                    initial = {
-                        "draft_id": draft.id,
-                        "template": draft.template,
-                        "to": ", ".join(draft.to) if draft.to else "",
-                        "bcc": ", ".join(draft.bcc) if draft.bcc else "",
-                        "subject": draft.subject,
-                        "body": draft.body,
-                    }
+                    initial.update(
+                        {
+                            "draft_id": draft.id,
+                            "template": draft.template,
+                            "to": ", ".join(draft.to) if draft.to else "",
+                            "bcc": ", ".join(draft.bcc) if draft.bcc else "",
+                            "subject": draft.subject,
+                            "body": draft.body,
+                        }
+                    )
                 except models.EmailDraft.DoesNotExist:
                     messages.warning(request, "Draft not found.")
 
@@ -379,6 +400,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         data = form.cleaned_data
         template = data.get("template")
         draft_id = data.get("draft_id")
+        back_url = data.get("back_url") or reverse("admin:leads_lead_change", args=[lead.id])
 
         try:
             if data.get("send_in_background"):
@@ -406,7 +428,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             if draft_id:
                 models.EmailDraft.objects.filter(id=draft_id).delete()
 
-            return redirect(reverse("admin:leads_lead_change", args=[lead.id]))
+            return redirect(back_url)
 
         except ValueError as e:
             messages.error(request, str(e))
@@ -423,6 +445,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         data = form.cleaned_data
         template = data.get("template")
         draft_id = data.get("draft_id")
+        back_url = data.get("back_url") or reverse("admin:leads_lead_change", args=[lead.id])
 
         try:
             draft = lead_service.save_email_as_draft(
@@ -439,6 +462,8 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             else:
                 messages.success(request, f"Draft saved for {lead.name}.")
             # Redirect back to the same send-email form with draft_id, so subsequent saves update
+            # Also preserve back_url by storing it in session temporarily
+            request.session["send_email_back_url"] = back_url
             url = reverse("admin:leads_lead_send_email", args=[lead.id])
             return redirect(f"{url}?draft_id={draft.id}")
 
@@ -476,6 +501,12 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
                 "due_date": next_action.due_date,
                 "is_overdue": is_overdue,
             }
+        # Get back_url from form (either from initial on GET, or from POST data)
+        back_url = (
+            form.data.get("back_url")
+            or form.initial.get("back_url")
+            or reverse("admin:leads_lead_change", args=[lead.id])
+        )
         context = {
             **self.admin_site.each_context(request),
             "title": f"Send Email to {lead.name}",
@@ -485,6 +516,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             "used_template_ids": used_template_ids,
             "templates_by_language": templates_by_language,
             "next_action": next_action_data,
+            "back_url": back_url,
             "opts": self.model._meta,
             "has_view_permission": True,
         }

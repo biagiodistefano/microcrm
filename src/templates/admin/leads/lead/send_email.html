@@ -248,6 +248,7 @@
     <form method="post" id="send-email-form">
         {% csrf_token %}
         {{ form.draft_id }}
+        {{ form.back_url }}
 
         <div class="form-row">
             <label for="id_language_filter">Filter by Language</label>
@@ -307,7 +308,7 @@
         <div class="button-row">
             <button type="submit" name="send_email">Send Email</button>
             <button type="submit" name="save_draft" class="secondary">Save as Draft</button>
-            <a href="{% url 'admin:leads_lead_change' lead.id %}" class="cancel">Cancel</a>
+            <a href="{{ back_url }}" class="cancel">Cancel</a>
         </div>
     </form>
 </div>
