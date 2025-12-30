@@ -975,7 +975,7 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
 class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
     """Admin for EmailDraft model."""
 
-    list_display = ["edit_link", "lead_link", "subject_preview", "template", "updated_at", "created_at"]
+    list_display = ["id", "edit_link", "lead_link", "subject_preview", "template", "updated_at", "created_at"]
     list_display_links = None  # Disable default linking since we have custom edit_link
     list_filter = ["template", ("created_at", RangeDateFilter), ("updated_at", RangeDateFilter)]
     search_fields = ["subject", "body", "lead__name", "to"]
@@ -995,9 +995,9 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
 
     @admin.display(description="Edit")
     def edit_link(self, obj: models.EmailDraft) -> str:
-        """Return an edit link."""
-        url = reverse("admin:leads_emaildraft_change", args=[obj.id])
-        return format_html('<a href="{}">Edit</a>', url)
+        """Return a link to the email writing form."""
+        url = reverse("admin:leads_lead_send_email", args=[obj.lead.id])
+        return format_html('<a href="{}?draft_id={}">Edit</a>', url, obj.id)
 
     def lead_link(self, obj: models.EmailDraft) -> str:
         """Return a link to the lead."""
@@ -1039,8 +1039,37 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
 
     @action(description="Send Draft", url_path="send", icon="send", variant="primary")  # type: ignore[untyped-decorator]
     def send_draft(self, request: HttpRequest, instance: models.EmailDraft) -> HttpResponse:
-        """Send this draft email."""
+        """Send this draft email.
+
+        Saves any pending form changes before sending to ensure the latest version is sent.
+        """
         from django.http import HttpResponseRedirect
+
+        # Save form data first if this is a POST with form fields
+        if request.method == "POST" and "subject" in request.POST:
+            # Update instance with form data before sending
+            instance.subject = request.POST.get("subject", instance.subject)
+            instance.body = request.POST.get("body", instance.body)
+            instance.from_email = request.POST.get("from_email", instance.from_email)
+            # Handle list fields - stored as JSON in the model
+            to_value = request.POST.get("to", "")
+            if to_value:
+                instance.to = [e.strip() for e in to_value.split(",") if e.strip()]
+            bcc_value = request.POST.get("bcc", "")
+            if bcc_value:
+                instance.bcc = [e.strip() for e in bcc_value.split(",") if e.strip()]
+            else:
+                instance.bcc = []
+            # Handle foreign keys
+            template_id = request.POST.get("template")
+            if template_id:
+                instance.template_id = int(template_id)
+            else:
+                instance.template = None
+            lead_id = request.POST.get("lead")
+            if lead_id:
+                instance.lead_id = int(lead_id)
+            instance.save()
 
         try:
             email_sent = lead_service.send_email_draft(instance)

@@ -289,7 +289,9 @@ class EmailDraft(models.Model):
         blank=True,
         related_name="email_drafts",
     )
-    from_email = models.CharField(blank=True, help_text="Sender email address (defaults to DEFAULT_FROM_EMAIL)", max_length=255)
+    from_email = models.CharField(
+        blank=True, help_text="Sender email address (defaults to DEFAULT_FROM_EMAIL)", max_length=255
+    )
     to = models.JSONField(default=list, help_text="List of recipient email addresses")
     bcc = models.JSONField(default=list, blank=True, help_text="List of BCC email addresses")
     subject = models.CharField(max_length=255, help_text="Email subject")

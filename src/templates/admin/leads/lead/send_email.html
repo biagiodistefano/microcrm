@@ -203,6 +203,23 @@
             {% endfor %}
         </p>
         {% endif %}
+        {% if lead.telegram or lead.instagram or lead.website %}
+        <p><strong>Links:</strong>
+            {% if lead.telegram %}
+                {% if "http" in lead.telegram %}
+                <a href="{{ lead.telegram }}" target="_blank" title="{{ lead.telegram }}" style="margin-right: 0.75rem;">📱 Telegram</a>
+                {% else %}
+                <a href="https://t.me/{{ lead.telegram|cut:'@' }}" target="_blank" title="{{ lead.telegram }}" style="margin-right: 0.75rem;">📱 Telegram</a>
+                {% endif %}
+            {% endif %}
+            {% if lead.instagram %}
+                <a href="https://instagram.com/{{ lead.instagram|cut:'@' }}" target="_blank" title="@{{ lead.instagram|cut:'@' }}" style="margin-right: 0.75rem;">📷 Instagram</a>
+            {% endif %}
+            {% if lead.website %}
+                <a href="{{ lead.website }}" target="_blank" title="{{ lead.website }}">🌐 Website</a>
+            {% endif %}
+        </p>
+        {% endif %}
         {% if lead.notes %}
         <div class="notes-section">
             <p style="margin-bottom: 0.25rem;"><strong>Notes:</strong></p>
