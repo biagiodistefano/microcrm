@@ -741,7 +741,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
 
     @admin.display(description="Next Action")
     def display_next_action(self, obj: models.Lead) -> str:
-        """Display next action with date color coding, linked to the Action."""
+        """Display next action with date color coding, linked to the Action, with notes on hover."""
         # Use prefetched pending_actions (ordered by due_date nulls last, then created_at)
         pending_actions: list[models.Action] = getattr(obj, "pending_actions", [])
         if not pending_actions:
@@ -751,10 +751,19 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         action_text = action.name[:20]
         action_url = reverse("admin:leads_action_change", args=[action.id])
 
+        # Prepare tooltip and styling for notes (similar to display_name_with_notes)
+        tooltip_notes = ""
+        notes_style = ""
+        if action.notes:
+            tooltip_notes = action.notes[:500] + "..." if len(action.notes) > 500 else action.notes
+            notes_style = "cursor: help; border-bottom: 1px dotted currentColor;"
+
         if not action.due_date:
             return format_html(
-                '<a href="{}" onclick="event.stopPropagation()" style="color: #666;">{}</a>',
+                '<a href="{}" onclick="event.stopPropagation()" style="color: #666; {}" title="{}">{}</a>',
                 action_url,
+                notes_style,
+                tooltip_notes,
                 action_text,
             )
 
@@ -764,35 +773,43 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         if days_until < 0:
             # Overdue - red
             return format_html(
-                '<a href="{}" onclick="event.stopPropagation()" style="color: #ef4444; font-weight: bold;">'
-                '{}<br><span style="font-size: 0.8em;">⚠️ {} days overdue</span></a>',
+                '<a href="{}" onclick="event.stopPropagation()" style="color: #ef4444; font-weight: bold; {}" '
+                'title="{}">{}<br><span style="font-size: 0.8em;">⚠️ {} days overdue</span></a>',
                 action_url,
+                notes_style,
+                tooltip_notes,
                 action_text,
                 abs(days_until),
             )
         elif days_until == 0:
             # Today - orange
             return format_html(
-                '<a href="{}" onclick="event.stopPropagation()" style="color: #f59e0b; font-weight: bold;">'
-                '{}<br><span style="font-size: 0.8em;">📅 Today</span></a>',
+                '<a href="{}" onclick="event.stopPropagation()" style="color: #f59e0b; font-weight: bold; {}" '
+                'title="{}">{}<br><span style="font-size: 0.8em;">📅 Today</span></a>',
                 action_url,
+                notes_style,
+                tooltip_notes,
                 action_text,
             )
         elif days_until <= 3:
             # Soon - amber
             return format_html(
-                '<a href="{}" onclick="event.stopPropagation()" style="color: #d97706;">'
+                '<a href="{}" onclick="event.stopPropagation()" style="color: #d97706; {}" title="{}">'
                 '{}<br><span style="font-size: 0.8em;">In {} days</span></a>',
                 action_url,
+                notes_style,
+                tooltip_notes,
                 action_text,
                 days_until,
             )
         else:
             # Future - normal
             return format_html(
-                '<a href="{}" onclick="event.stopPropagation()">'
+                '<a href="{}" onclick="event.stopPropagation()" style="{}" title="{}">'
                 '{}<br><span style="font-size: 0.8em; color: #666;">{}</span></a>',
                 action_url,
+                notes_style,
+                tooltip_notes,
                 action_text,
                 action.due_date.strftime("%b %d"),
             )
