@@ -71,6 +71,7 @@ class LeadController(ControllerBase):
         - city: Filter by city name (partial match)
         - country: Filter by country name (partial match)
         - tag: Filter by tag name (exact, case-insensitive)
+        - has_draft: Filter by whether lead has an email draft (true/false)
         """
         return filters.filter(self.get_queryset()).distinct()
 

@@ -7,7 +7,7 @@ packages = { find = { where = ["src"] } }
 
 [project]
 name = "crm"
-version = "1.5.2"
+version = "1.6.0"
 description = "MicroCRM - Lead management for product promotion"
 readme = "README.md"
 requires-python = ">=3.14"

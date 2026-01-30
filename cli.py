@@ -143,12 +143,13 @@ def leads_list(
     city: str | None = typer.Option(None, "--city", "-c", help="Filter by city name (partial match)"),
     country: str | None = typer.Option(None, "--country", help="Filter by country (partial match)"),
     tag: str | None = typer.Option(None, "--tag", help="Filter by tag name"),
+    no_draft: bool = typer.Option(False, "--no-draft", help="Only leads without email drafts"),
     # Output
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
 ) -> None:
     """List leads with filtering, searching, and pagination."""
     try:
-        params = {
+        params: dict[str, t.Any] = {
             "page": page,
             "page_size": page_size,
             "search": search,
@@ -160,6 +161,8 @@ def leads_list(
             "country": country,
             "tag": tag,
         }
+        if no_draft:
+            params["has_draft"] = "false"
         result = api.get("/leads/", params)
         if raw:
             output_json(result, raw=True)

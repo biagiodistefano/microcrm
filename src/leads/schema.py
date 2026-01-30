@@ -4,6 +4,7 @@ import typing as t
 from datetime import date
 from decimal import Decimal
 
+from django.db.models import Q
 from ninja import FilterLookup, FilterSchema, ModelSchema, Schema
 from pydantic import Field
 
@@ -369,6 +370,13 @@ class LeadFilterSchema(FilterSchema):
     city: t.Annotated[str | None, FilterLookup(q="city__name__icontains")] = None
     country: t.Annotated[str | None, FilterLookup(q="city__country__icontains")] = None
     tag: t.Annotated[str | None, FilterLookup(q="tags__name__iexact")] = None
+    has_draft: bool | None = Field(None, description="Filter by draft existence (true/false)")
+
+    def filter_has_draft(self, value: bool) -> Q:  # noqa: FBT001
+        """Filter leads by draft existence."""
+        if value:
+            return Q(email_drafts__isnull=False)
+        return Q(email_drafts__isnull=True)
 
 
 class CityFilterSchema(FilterSchema):

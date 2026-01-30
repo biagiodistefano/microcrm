@@ -96,7 +96,7 @@ Commands:
 ### leads
 ```
 leads list      [--page] [--page-size] [--search] [--status] [--temperature]
-                [--type] [--city-id] [--city] [--country] [--tag] [--raw]
+                [--type] [--city-id] [--city] [--country] [--tag] [--no-draft] [--raw]
 leads get       LEAD_ID [--raw]
 leads create    --name [--email] [--phone] [--company] [--type] [--city]
                 [--country] [--iso2] [--telegram] [--instagram] [--website]
@@ -377,3 +377,79 @@ Always use the service layer functions for related object creation:
 - `get_or_create_tags(tag_names)` - case-insensitive by name
 
 These ensure consistent lookup behavior across API and tasks.
+
+## Skills
+
+Project-local skills are available in `.claude/skills/` for specialized workflows.
+
+### Researching Lead (`/researching-lead`)
+
+Research a specific lead to gather context before outreach.
+
+```
+/researching-lead 123
+/researching-lead --city Vienna --status new
+```
+
+**Workflow:**
+1. Get lead data via CLI
+2. Check email history
+3. Web search (website, Instagram if available)
+4. Identify pain points and Revel fit
+5. Update lead notes with research findings
+
+See `.claude/skills/researching-lead/SKILL.md` for full documentation.
+
+### Drafting Email (`/drafting-email`)
+
+Write personalized warm outreach emails and create drafts.
+
+```
+/drafting-email 123
+/drafting-email --city Berlin --status new
+```
+
+**Workflow:**
+1. Get lead data via CLI
+2. Check email history (avoid repetition)
+3. Determine language (IT for Italy, EN otherwise)
+4. Select template type based on lead_type
+5. Write personalized email following tone guidelines
+6. Validate against quality checklist
+7. Create draft via CLI (no sending)
+
+See `.claude/skills/drafting-email/SKILL.md` for full documentation.
+
+### Email Templates
+
+9 templates available (3 types x 3 languages):
+
+| Lead Type | EN | DE | IT |
+|-----------|----|----|-----|
+| Individual/Facilitator | #2 | #15 | #11 |
+| Organization/Collective | #3 | #16 | #12 |
+| Venue | #4 | #17 | #13 |
+
+**Language Selection:**
+- Italy: Italian (IT)
+- All others (including DACH): English (EN)
+
+Note: Prefer English for Germany/Austria/Switzerland to enable warm follow-up conversations.
+
+### Combined Workflow
+
+For comprehensive outreach:
+
+```
+# 1. Research leads in a city
+/researching-lead --city Vienna --status new
+
+# 2. Draft emails for researched leads
+/drafting-email --city Vienna --status new
+
+# 3. Review drafts
+python cli.py drafts list
+
+# 4. Send approved drafts
+python cli.py drafts send {DRAFT_ID}
+```

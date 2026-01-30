@@ -50,6 +50,27 @@ class TestLeadListEndpoint:
         assert response.status_code == 200
         assert response.json()["count"] == 0
 
+    def test_list_leads_filter_has_draft_true(self, api_client: Client, lead: Lead) -> None:
+        # Create a draft for the lead
+        EmailDraft.objects.create(lead=lead, subject="Test", body="Test body")
+
+        response = api_client.get("/api/leads/?has_draft=true")
+        assert response.status_code == 200
+        assert response.json()["count"] == 1
+
+    def test_list_leads_filter_has_draft_false(self, api_client: Client, lead: Lead) -> None:
+        # Lead has no draft
+        response = api_client.get("/api/leads/?has_draft=false")
+        assert response.status_code == 200
+        assert response.json()["count"] == 1
+
+        # Create a draft
+        EmailDraft.objects.create(lead=lead, subject="Test", body="Test body")
+
+        response = api_client.get("/api/leads/?has_draft=false")
+        assert response.status_code == 200
+        assert response.json()["count"] == 0
+
 
 class TestLeadGetEndpoint:
     def test_get_lead(self, api_client: Client, lead: Lead) -> None:
