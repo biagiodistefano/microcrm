@@ -353,6 +353,10 @@ def _get_gmail_connection(user: User | None) -> GmailConnection | None:
 def _resolve_from_email(gmail_connection: GmailConnection | None) -> str:
     """Determine the from_email based on Gmail connection status."""
     if gmail_connection:
+        user = gmail_connection.user
+        full_name = user.get_full_name()
+        if full_name:
+            return f"{full_name} <{gmail_connection.email}>"
         return gmail_connection.email
     return str(settings.DEFAULT_FROM_EMAIL)
 
