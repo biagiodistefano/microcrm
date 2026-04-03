@@ -268,7 +268,12 @@
 
         <div class="form-row">
             <label>From</label>
-            <div class="readonly-field">{{ from_email }}</div>
+            <div class="readonly-field">
+                {{ from_email }}
+                {% if gmail_connected %}
+                    <span style="background: #10b981; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 6px;">via Gmail</span>
+                {% endif %}
+            </div>
         </div>
 
         <div class="form-row">
@@ -305,8 +310,14 @@
             {% if form.send_in_background.help_text %}<p class="help">{{ form.send_in_background.help_text }}</p>{% endif %}
         </div>
 
+        {% if not gmail_connected %}
+        <div style="background: #fef3c7; border: 1px solid #f59e0b; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #92400e;">
+            Gmail not connected. <a href="{% url 'gmail_connect' %}" style="color: #92400e; font-weight: 600;">Connect your Gmail account</a> to send emails.
+        </div>
+        {% endif %}
+
         <div class="button-row">
-            <button type="submit" name="send_email">Send Email</button>
+            <button type="submit" name="send_email" {% if not gmail_connected %}disabled style="opacity: 0.5; cursor: not-allowed;"{% endif %}>Send Email</button>
             <button type="submit" name="save_draft" class="secondary">Save as Draft</button>
             <a href="{{ back_url }}" class="cancel">Cancel</a>
         </div>

@@ -1,5 +1,6 @@
 from django.db import models
 from django.db.models import F
+from encrypted_fields.fields import EncryptedTextField
 from simple_history.models import HistoricalRecords
 from solo.models import SingletonModel
 
@@ -255,6 +256,14 @@ class EmailSent(models.Model):
     subject = models.CharField(max_length=255, help_text="Rendered subject at send time")
     body = models.TextField(help_text="Rendered body at send time")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    sent_by = models.ForeignKey(
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="emails_sent_by_user",
+        help_text="User who initiated the send",
+    )
     error_message = models.TextField(blank=True, help_text="Error details if sending failed")
     created_at = models.DateTimeField(auto_now_add=True)
     sent_at = models.DateTimeField(null=True, blank=True)
@@ -314,3 +323,27 @@ class EmailDraft(models.Model):
         """Return string representation."""
         subject_preview = self.subject[:50] if self.subject else "(no subject)"
         return f"Draft: {subject_preview} -> {self.lead.name}"
+
+
+class GmailConnection(models.Model):
+    """Per-user Gmail OAuth2 connection for sending emails via Gmail API."""
+
+    user = models.OneToOneField(
+        "auth.User",
+        on_delete=models.CASCADE,
+        related_name="gmail_connection",
+    )
+    email = models.EmailField(help_text="The Gmail address connected")
+    refresh_token = EncryptedTextField(help_text="OAuth2 refresh token (encrypted at rest)")
+    is_active = models.BooleanField(default=True, help_text="Set to False on auth errors")
+    connected_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Gmail Connection"
+        verbose_name_plural = "Gmail Connections"
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        status = "active" if self.is_active else "disconnected"
+        return f"{self.email} ({status})"

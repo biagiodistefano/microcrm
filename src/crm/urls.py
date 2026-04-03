@@ -6,6 +6,7 @@ from django.urls import include, path
 from django.views.generic import RedirectView
 
 from crm.api import api
+from leads.gmail import gmail_callback_view, gmail_connect_view, gmail_disconnect_view
 
 admin.site.site_header = f"{settings.SITE_NAME} v{settings.VERSION}"
 admin.site.index_title = f"Welcome to {settings.SITE_NAME} v{settings.VERSION} Admin"
@@ -16,4 +17,7 @@ urlpatterns = [
     path(settings.ADMIN_URL, admin.site.urls),
     path("api/", api.urls),
     path("google_sso/", include("django_google_sso.urls", namespace="django_google_sso")),
+    path("gmail/oauth/connect/", gmail_connect_view, name="gmail_connect"),
+    path("gmail/oauth/callback/", gmail_callback_view, name="gmail_callback"),
+    path("gmail/oauth/disconnect/", gmail_disconnect_view, name="gmail_disconnect"),
 ]

@@ -1,15 +1,28 @@
 """Business logic for leads."""
 
+import logging
 import re
 import typing as t
 
 from django.conf import settings
+from django.contrib.auth.models import User
 from django.core.mail import EmailMessage
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from ninja.errors import HttpError
 
-from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import (
+    Action,
+    City,
+    EmailDraft,
+    EmailSent,
+    EmailTemplate,
+    GmailConnection,
+    Lead,
+    LeadType,
+    ResearchJob,
+    Tag,
+)
 from leads.schema import (
     ActionIn,
     ActionPatch,
@@ -23,6 +36,8 @@ from leads.schema import (
     ResearchJobIn,
     SendEmailIn,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_or_create_city(city_in: CityIn) -> City:
@@ -325,6 +340,41 @@ def validate_no_placeholders(subject: str, body: str) -> list[str]:
     return placeholders
 
 
+def _get_gmail_connection(user: User | None) -> GmailConnection | None:
+    """Get active Gmail connection for a user, if any."""
+    if not isinstance(user, User):
+        return None
+    try:
+        return GmailConnection.objects.get(user=user, is_active=True)
+    except GmailConnection.DoesNotExist:
+        return None
+
+
+def _resolve_from_email(gmail_connection: GmailConnection | None) -> str:
+    """Determine the from_email based on Gmail connection status."""
+    if gmail_connection:
+        return gmail_connection.email
+    return str(settings.DEFAULT_FROM_EMAIL)
+
+
+def _send_via_smtp(
+    subject: str,
+    body: str,
+    from_email: str,
+    to: list[str],
+    bcc: list[str] | None,
+) -> None:
+    """Send an email via Django's SMTP backend."""
+    email = EmailMessage(
+        subject=subject,
+        body=body,
+        from_email=from_email,
+        to=to,
+        bcc=bcc if bcc else None,
+    )
+    email.send(fail_silently=False)
+
+
 def send_email_to_lead(
     lead: Lead,
     subject: str,
@@ -332,8 +382,12 @@ def send_email_to_lead(
     to: list[str],
     bcc: list[str] | None = None,
     template: EmailTemplate | None = None,
+    user: User | None = None,
 ) -> EmailSent:
     """Send an email to a lead and log it.
+
+    If user is provided, requires an active Gmail connection — no SMTP fallback.
+    If user is None (API/CLI), sends via SMTP.
 
     Args:
         lead: The Lead receiving the email
@@ -342,19 +396,28 @@ def send_email_to_lead(
         to: List of recipient email addresses
         bcc: Optional list of BCC email addresses
         template: Optional EmailTemplate used (for reference)
+        user: Optional User who initiated the send (for Gmail OAuth lookup)
 
     Returns:
         EmailSent record
 
     Raises:
-        ValueError: If there are unreplaced placeholders in subject or body
+        ValueError: If there are unreplaced placeholders or user has no Gmail connection
     """
+    from leads.gmail import get_gmail_credentials, send_email_via_gmail
+
     # Validate no placeholders remain
     unreplaced = validate_no_placeholders(subject, body)
     if unreplaced:
         raise ValueError(f"Unreplaced placeholders found: {', '.join(unreplaced)}")
 
-    from_email = settings.DEFAULT_FROM_EMAIL
+    gmail_connection = _get_gmail_connection(user)
+
+    # Require Gmail connection when sending as a user
+    if user and isinstance(user, User) and not gmail_connection:
+        raise ValueError("Gmail account not connected. Please connect your Gmail before sending emails.")
+
+    from_email = _resolve_from_email(gmail_connection)
     bcc = bcc or []
 
     # Create the EmailSent record first with PENDING status
@@ -367,17 +430,15 @@ def send_email_to_lead(
         subject=subject,
         body=body,
         status=EmailSent.Status.PENDING,
+        sent_by=user if isinstance(user, User) else None,
     )
 
     try:
-        email = EmailMessage(
-            subject=subject,
-            body=body,
-            from_email=from_email,
-            to=to,
-            bcc=bcc if bcc else None,
-        )
-        email.send(fail_silently=False)
+        if gmail_connection:
+            credentials = get_gmail_credentials(gmail_connection)
+            send_email_via_gmail(credentials, from_email, to, subject, body, bcc or None)
+        else:
+            _send_via_smtp(subject, body, from_email, to, bcc)
 
         email_sent.status = EmailSent.Status.SENT
         email_sent.sent_at = timezone.now()
@@ -562,13 +623,14 @@ def patch_email_draft(draft: EmailDraft, data: EmailDraftPatch) -> EmailDraft:
     return draft
 
 
-def send_email_draft(draft: EmailDraft) -> EmailSent:
+def send_email_draft(draft: EmailDraft, user: User | None = None) -> EmailSent:
     """Send an email draft.
 
     Creates EmailSent record, updates lead's last_contact, and deletes the draft.
 
     Args:
         draft: The EmailDraft to send
+        user: Optional User who initiated the send (for Gmail OAuth lookup)
 
     Returns:
         EmailSent record
@@ -589,6 +651,7 @@ def send_email_draft(draft: EmailDraft) -> EmailSent:
         to=draft.to,
         bcc=draft.bcc or None,
         template=draft.template,
+        user=user,
     )
 
     # Delete the draft after successful send
@@ -605,6 +668,7 @@ def save_email_as_draft(
     bcc: list[str] | None = None,
     template: EmailTemplate | None = None,
     draft_id: int | None = None,
+    user: User | None = None,
 ) -> EmailDraft:
     """Save email form data as a draft.
 
@@ -619,6 +683,7 @@ def save_email_as_draft(
         bcc: Optional list of BCC email addresses
         template: Optional EmailTemplate used
         draft_id: Optional ID of existing draft to update
+        user: Optional User (for resolving from_email via Gmail connection)
 
     Returns:
         EmailDraft record (created or updated)
@@ -626,11 +691,13 @@ def save_email_as_draft(
     Raises:
         Http404: If draft_id is invalid or belongs to a different lead
     """
+    from_email = _resolve_from_email(_get_gmail_connection(user))
+
     if draft_id:
         # Validate draft exists AND belongs to this lead
         draft = get_object_or_404(EmailDraft, pk=draft_id, lead=lead)
         draft.template = template
-        draft.from_email = settings.DEFAULT_FROM_EMAIL
+        draft.from_email = from_email
         draft.to = to
         draft.bcc = bcc or []
         draft.subject = subject
@@ -641,7 +708,7 @@ def save_email_as_draft(
     return EmailDraft.objects.create(
         lead=lead,
         template=template,
-        from_email=settings.DEFAULT_FROM_EMAIL,
+        from_email=from_email,
         to=to,
         bcc=bcc or [],
         subject=subject,
