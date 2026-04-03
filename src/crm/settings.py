@@ -166,7 +166,11 @@ GOOGLE_SSO_STAFF_LIST = GOOGLE_SSO_SUPERUSER_LIST
 SSO_SHOW_FORM_ON_ADMIN_PAGE = DEBUG
 
 # Gmail OAuth2 (per-user email sending via Gmail API)
-GMAIL_SCOPES: list[str] = ["https://www.googleapis.com/auth/gmail.send"]
+GMAIL_SCOPES: list[str] = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
 GMAIL_ALLOWED_DOMAIN: str = config("GMAIL_ALLOWED_DOMAIN", default="")
 
 # Email
