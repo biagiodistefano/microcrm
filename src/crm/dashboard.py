@@ -11,7 +11,7 @@ from django.http import HttpRequest
 from django.urls import reverse
 from django.utils import timezone
 
-from leads.models import Action, City, Lead, LeadType, ResearchJob, Tag
+from leads.models import Action, City, GmailConnection, Lead, LeadType, ResearchJob, Tag
 
 
 def _get_leads_by_status() -> dict[str, int]:
@@ -298,6 +298,21 @@ def dashboard_callback(request: HttpRequest, context: dict[str, t.Any]) -> dict[
 
     upcoming_actions = _get_upcoming_actions(days=7)
 
+    # Gmail connection status
+    gmail_status: dict[str, t.Any] = {
+        "is_connected": False,
+        "email": None,
+        "connect_url": reverse("gmail_connect"),
+        "disconnect_url": reverse("gmail_disconnect"),
+    }
+    try:
+        gmail_conn = GmailConnection.objects.get(user=user)
+        if gmail_conn.is_active:
+            gmail_status["is_connected"] = True
+            gmail_status["email"] = gmail_conn.email
+    except GmailConnection.DoesNotExist:
+        pass
+
     # Quick actions
     quick_actions = [
         {
@@ -362,6 +377,7 @@ def dashboard_callback(request: HttpRequest, context: dict[str, t.Any]) -> dict[
                 "system_health": _get_system_health(days=7),
                 "system_info": _get_system_info(),
                 "recent_research_jobs": _get_recent_research_jobs(limit=5),
+                "gmail": gmail_status,
             }
         }
     )

@@ -4,6 +4,7 @@ from datetime import date
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
+from django.contrib.auth.models import User
 from django.db.models import DateField, QuerySet
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -121,6 +122,13 @@ class CityAdmin(ModelAdmin):  # type: ignore[misc]
     def lead_count(self, obj: models.City) -> int:
         """Return the number of leads for this city."""
         return obj._lead_count  # type: ignore[attr-defined, no-any-return]
+
+    def get_actions(self, request: HttpRequest) -> dict[str, t.Any]:
+        """Only superusers can trigger research (Gemini API calls are expensive)."""
+        actions: dict[str, t.Any] = super().get_actions(request)
+        if not request.user.is_superuser:
+            actions.pop("start_research", None)
+        return actions
 
     @admin.action(description="🔬 Start Lead Research")
     def start_research(self, request: HttpRequest, queryset: QuerySet[models.City]) -> None:
@@ -411,6 +419,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
                     to=data["to"],
                     bcc=data["bcc"],
                     template_id=template.id if template else None,
+                    user_id=request.user.id,
                 )
                 messages.success(request, f"Email to {lead.name} queued for background sending.")
             else:
@@ -421,6 +430,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
                     to=data["to"],
                     bcc=data["bcc"],
                     template=template,
+                    user=t.cast(User, request.user),
                 )
                 messages.success(request, f"Email sent successfully to {lead.name}.")
 
@@ -456,6 +466,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
                 bcc=data["bcc"],
                 template=template,
                 draft_id=draft_id,
+                user=t.cast(User, request.user),
             )
             if draft_id:
                 messages.success(request, f"Draft updated for {lead.name}.")
@@ -507,12 +518,23 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             or form.initial.get("back_url")
             or reverse("admin:leads_lead_change", args=[lead.id])
         )
+        gmail_connected = False
+        from_email = settings.DEFAULT_FROM_EMAIL
+        try:
+            gmail_conn = request.user.gmail_connection  # type: ignore[union-attr]
+            if gmail_conn.is_active:
+                from_email = gmail_conn.email
+                gmail_connected = True
+        except models.GmailConnection.DoesNotExist:
+            pass
+
         context = {
             **self.admin_site.each_context(request),
             "title": f"Send Email to {lead.name}",
             "lead": lead,
             "form": form,
-            "from_email": settings.DEFAULT_FROM_EMAIL,
+            "from_email": from_email,
+            "gmail_connected": gmail_connected,
             "used_template_ids": used_template_ids,
             "templates_by_language": templates_by_language,
             "next_action": next_action_data,
@@ -973,6 +995,7 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
         "body",
         "status",
         "error_message",
+        "sent_by",
         "created_at",
         "sent_at",
     ]
@@ -980,7 +1003,7 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
     list_per_page = 25
 
     fieldsets = (
-        (None, {"fields": ("lead", "template", "status")}),
+        (None, {"fields": ("lead", "template", "status", "sent_by")}),
         ("Recipients", {"fields": ("from_email", "to", "bcc")}),
         ("Content", {"fields": ("subject", "body")}),
         ("Status", {"fields": ("error_message", "created_at", "sent_at")}),
@@ -1069,7 +1092,7 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
         failed_count = 0
         for draft in queryset:
             try:
-                lead_service.send_email_draft(draft)
+                lead_service.send_email_draft(draft, user=t.cast(User, request.user))
                 sent_count += 1
             except Exception as e:
                 failed_count += 1
@@ -1121,7 +1144,7 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
             instance.save()
 
         try:
-            email_sent = lead_service.send_email_draft(instance)
+            email_sent = lead_service.send_email_draft(instance, user=t.cast(User, request.user))
             messages.success(request, f"Email sent successfully to {email_sent.lead.name}.")
             # Redirect to lead change view since draft is now deleted
             return HttpResponseRedirect(reverse("admin:leads_lead_change", args=[email_sent.lead.pk]))
@@ -1131,6 +1154,20 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
             messages.error(request, f"Failed to send email: {e}")
 
         return HttpResponseRedirect(reverse("admin:leads_emaildraft_change", args=[instance.pk]))
+
+
+@admin.register(models.GmailConnection)
+class GmailConnectionAdmin(ModelAdmin):  # type: ignore[misc]
+    list_display = ["user", "email", "is_active", "connected_at", "updated_at"]
+    list_filter = ["is_active"]
+    readonly_fields = ["user", "email", "is_active", "connected_at", "updated_at"]
+    exclude = ["refresh_token"]
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj: t.Any = None) -> bool:
+        return False
 
 
 @admin.register(models.ResearchPromptConfig)
@@ -1159,6 +1196,20 @@ class ResearchJobAdmin(ModelAdmin, CityLinkMixin):  # type: ignore[misc]
     ordering = ["-created_at"]
     actions = ["run_job", "reprocess_job"]
     actions_submit_line = ["run_job_single", "reprocess_job_single"]
+
+    def get_actions(self, request: HttpRequest) -> dict[str, t.Any]:
+        """Only superusers can trigger research (Gemini API calls are expensive)."""
+        actions: dict[str, t.Any] = super().get_actions(request)
+        if not request.user.is_superuser:
+            actions.pop("run_job", None)
+            actions.pop("reprocess_job", None)
+        return actions
+
+    def get_actions_submit_line(self, request: HttpRequest, object_id: int) -> list[t.Any]:
+        """Only superusers can see run/reprocess buttons on detail page."""
+        if not request.user.is_superuser:
+            return []
+        return super().get_actions_submit_line(request, object_id)  # type: ignore[no-any-return]
 
     @admin.display(description="Status")
     def display_status(self, obj: models.ResearchJob) -> str:

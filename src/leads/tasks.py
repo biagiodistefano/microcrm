@@ -462,6 +462,7 @@ def send_email_task(
     to: list[str],
     bcc: list[str] | None = None,
     template_id: int | None = None,
+    user_id: int | None = None,
 ) -> dict[str, t.Any]:
     """Send an email to a lead in the background.
 
@@ -472,15 +473,19 @@ def send_email_task(
         to: List of recipient email addresses
         bcc: Optional list of BCC email addresses
         template_id: Optional EmailTemplate ID (for reference)
+        user_id: Optional User ID (for Gmail OAuth credential lookup)
 
     Returns:
         Dict with email_sent_id and status
     """
+    from django.contrib.auth.models import User
+
     from leads.models import EmailTemplate
     from leads.service import send_email_to_lead
 
     lead = Lead.objects.get(id=lead_id)
     template = EmailTemplate.objects.get(id=template_id) if template_id else None
+    user = User.objects.filter(id=user_id).first() if user_id else None
 
     try:
         email_sent = send_email_to_lead(
@@ -490,6 +495,7 @@ def send_email_task(
             to=to,
             bcc=bcc,
             template=template,
+            user=user,
         )
         return {"email_sent_id": email_sent.id, "status": "sent"}
     except ValueError as e:

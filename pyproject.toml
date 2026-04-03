@@ -24,6 +24,10 @@ dependencies = [
     "django-storages>=1.14.6",
     "django-unfold>=0.74.1",
     "faker>=38.2.0",
+    "django-fernet-encrypted-fields>=0.3.1",
+    "google-api-python-client>=2.170.0",
+    "google-auth>=2.38.0",
+    "google-auth-oauthlib>=1.2.0",
     "google-genai>=1.56.0",
     "gunicorn>=23.0.0",
     "psycopg[binary]>=3.3.2",
@@ -112,6 +116,22 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "solo.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "encrypted_fields.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "google.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "google_auth_oauthlib.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "googleapiclient.*"
 ignore_missing_imports = true
 
 [tool.django-stubs]

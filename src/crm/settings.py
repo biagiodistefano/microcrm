@@ -7,6 +7,7 @@ from django.urls import reverse_lazy
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = config("SECRET_KEY", default="dev-secret-key-change-in-production")
+SALT_KEY = config("SALT_KEY", default="dev-salt-key-change-in-production")
 DEBUG = config("DEBUG", default=True, cast=bool)
 ADMIN_URL = config("ADMIN_URL", default="admin/")
 
@@ -164,6 +165,10 @@ GOOGLE_SSO_SUPERUSER_LIST = [
 GOOGLE_SSO_STAFF_LIST = GOOGLE_SSO_SUPERUSER_LIST
 SSO_SHOW_FORM_ON_ADMIN_PAGE = DEBUG
 
+# Gmail OAuth2 (per-user email sending via Gmail API)
+GMAIL_SCOPES: list[str] = ["https://www.googleapis.com/auth/gmail.send"]
+GMAIL_ALLOWED_DOMAIN: str = config("GMAIL_ALLOWED_DOMAIN", default="")
+
 # Email
 EMAIL_HOST = config("EMAIL_HOST", default="smtp.gmail.com")
 EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
@@ -248,6 +253,11 @@ UNFOLD = {
                         "title": "Sent Emails",
                         "icon": "outgoing_mail",
                         "link": reverse_lazy("admin:leads_emailsent_changelist"),
+                    },
+                    {
+                        "title": "Gmail Connections",
+                        "icon": "mail",
+                        "link": reverse_lazy("admin:leads_gmailconnection_changelist"),
                     },
                 ],
             },
