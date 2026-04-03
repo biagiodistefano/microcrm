@@ -154,53 +154,67 @@ def gmail_connect_view(request: HttpRequest) -> HttpResponse:
 @staff_member_required
 def gmail_callback_view(request: HttpRequest) -> HttpResponse:
     """Handle the OAuth2 callback from Google."""
+    logger.info("Gmail OAuth callback received: %s", request.GET.dict())
+
     stored_state = request.session.pop("gmail_oauth_state", None)
     received_state = request.GET.get("state")
 
     if not stored_state or stored_state != received_state:
+        logger.warning("OAuth state mismatch: stored=%s received=%s", stored_state, received_state)
         messages.error(request, "Invalid OAuth state. Please try again.")
         return HttpResponseRedirect(reverse("admin:index"))
 
     error = request.GET.get("error")
     if error:
+        logger.warning("Google OAuth error: %s", error)
         messages.error(request, f"Google OAuth error: {error}")
         return HttpResponseRedirect(reverse("admin:index"))
 
-    flow = _build_flow(request)
+    try:
+        flow = _build_flow(request)
+        logger.info("Fetching token with redirect_uri=%s", flow.redirect_uri)
 
-    flow.fetch_token(authorization_response=request.build_absolute_uri())
+        flow.fetch_token(authorization_response=request.build_absolute_uri())
 
-    credentials = flow.credentials
-    if not credentials or not credentials.refresh_token:
-        messages.error(request, "Failed to obtain refresh token. Please try again.")
+        credentials = flow.credentials
+        if not credentials or not credentials.refresh_token:
+            logger.error("No refresh token in credentials. Scopes granted: %s", getattr(credentials, "scopes", None))
+            messages.error(request, "Failed to obtain refresh token. Please try again.")
+            return HttpResponseRedirect(reverse("admin:index"))
+
+        # Get the authenticated user's email from Google
+        from googleapiclient.discovery import build
+
+        oauth2_service = build("oauth2", "v2", credentials=credentials, cache_discovery=False)
+        user_info = oauth2_service.userinfo().get().execute()
+        gmail_email: str = user_info["email"]
+        logger.info("Gmail OAuth successful for %s", gmail_email)
+
+        # Validate domain if restricted
+        allowed_domain = settings.GMAIL_ALLOWED_DOMAIN
+        if allowed_domain and not gmail_email.endswith(f"@{allowed_domain}"):
+            logger.warning("Domain rejected: %s (allowed: %s)", gmail_email, allowed_domain)
+            messages.error(request, f"Only @{allowed_domain} accounts are allowed.")
+            return HttpResponseRedirect(reverse("admin:index"))
+
+        # Store the connection — refresh_token is encrypted transparently by EncryptedTextField
+        user = t.cast(User, request.user)
+        GmailConnection.objects.update_or_create(
+            user=user,
+            defaults={
+                "email": gmail_email,
+                "refresh_token": credentials.refresh_token,
+                "is_active": True,
+            },
+        )
+
+        messages.success(request, f"Gmail connected: {gmail_email}")
         return HttpResponseRedirect(reverse("admin:index"))
 
-    # Get the authenticated user's email from Google
-    from googleapiclient.discovery import build
-
-    oauth2_service = build("oauth2", "v2", credentials=credentials, cache_discovery=False)
-    user_info = oauth2_service.userinfo().get().execute()
-    gmail_email: str = user_info["email"]
-
-    # Validate domain if restricted
-    allowed_domain = settings.GMAIL_ALLOWED_DOMAIN
-    if allowed_domain and not gmail_email.endswith(f"@{allowed_domain}"):
-        messages.error(request, f"Only @{allowed_domain} accounts are allowed.")
+    except Exception:
+        logger.exception("Gmail OAuth callback failed")
+        messages.error(request, "Gmail connection failed. Check server logs for details.")
         return HttpResponseRedirect(reverse("admin:index"))
-
-    # Store the connection — refresh_token is encrypted transparently by EncryptedTextField
-    user = t.cast(User, request.user)
-    GmailConnection.objects.update_or_create(
-        user=user,
-        defaults={
-            "email": gmail_email,
-            "refresh_token": credentials.refresh_token,
-            "is_active": True,
-        },
-    )
-
-    messages.success(request, f"Gmail connected: {gmail_email}")
-    return HttpResponseRedirect(reverse("admin:index"))
 
 
 @login_required
