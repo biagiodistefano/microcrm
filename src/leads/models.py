@@ -347,3 +347,28 @@ class GmailConnection(models.Model):
         """Return string representation."""
         status = "active" if self.is_active else "disconnected"
         return f"{self.email} ({status})"
+
+
+class EmailSignature(models.Model):
+    """Per-user HTML email signature, auto-appended to outgoing emails."""
+
+    user = models.OneToOneField(
+        "auth.User",
+        on_delete=models.CASCADE,
+        related_name="email_signature",
+    )
+    body = models.TextField(
+        blank=True,
+        default="",
+        help_text="HTML signature content. Appended to all outgoing emails.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Email Signature"
+        verbose_name_plural = "Email Signatures"
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        return f"Signature for {self.user.get_full_name() or self.user.username}"

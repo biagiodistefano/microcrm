@@ -292,6 +292,18 @@ class TestSendEmailToLead:
         assert EmailSent.objects.count() == 0
 
     @patch("leads.service.EmailMessage")
+    def test_sends_html_email(self, mock_email_class: MagicMock, lead: Lead) -> None:
+        send_email_to_lead(
+            lead=lead,
+            subject="Test",
+            body="<p>Hello</p>",
+            to=["test@example.com"],
+        )
+
+        mock_email_instance = mock_email_class.return_value
+        assert mock_email_instance.content_subtype == "html"
+
+    @patch("leads.service.EmailMessage")
     def test_marks_failed_on_send_error(self, mock_email_class: MagicMock, lead: Lead) -> None:
         mock_email = mock_email_class.return_value
         mock_email.send.side_effect = Exception("SMTP error")

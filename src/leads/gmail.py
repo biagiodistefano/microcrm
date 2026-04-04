@@ -79,7 +79,7 @@ def send_email_via_gmail(
 
     Respects the EMAIL_DRY_RUN setting — logs instead of sending when active.
     """
-    message = MIMEText(body)
+    message = MIMEText(body, "html")
     message["to"] = ", ".join(to)
     message["from"] = from_email
     message["subject"] = subject

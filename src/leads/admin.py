@@ -528,6 +528,16 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         except models.GmailConnection.DoesNotExist:
             pass
 
+        # Get user's email signature
+        signature_html = ""
+        user_pk = getattr(request.user, "pk", None)
+        if user_pk is not None:
+            try:
+                sig = models.EmailSignature.objects.get(user_id=user_pk)
+                signature_html = sig.body
+            except (models.EmailSignature.DoesNotExist, TypeError, ValueError):
+                pass
+
         context = {
             **self.admin_site.each_context(request),
             "title": f"Send Email to {lead.name}",
@@ -539,6 +549,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             "templates_by_language": templates_by_language,
             "next_action": next_action_data,
             "back_url": back_url,
+            "signature_html": signature_html,
             "opts": self.model._meta,
             "has_view_permission": True,
         }
@@ -966,6 +977,7 @@ class ActionAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
 class EmailTemplateAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
     """Admin for EmailTemplate model."""
 
+    change_form_template = "admin/leads/emailtemplate/change_form.html"
     list_display = ["name", "language", "subject", "updated_at"]
     list_filter = ["language"]
     search_fields = ["name", "subject", "body"]
@@ -992,7 +1004,7 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
         "to",
         "bcc",
         "subject",
-        "body",
+        "display_body",
         "status",
         "error_message",
         "sent_by",
@@ -1005,9 +1017,18 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
     fieldsets = (
         (None, {"fields": ("lead", "template", "status", "sent_by")}),
         ("Recipients", {"fields": ("from_email", "to", "bcc")}),
-        ("Content", {"fields": ("subject", "body")}),
+        ("Content", {"fields": ("subject", "display_body")}),
         ("Status", {"fields": ("error_message", "created_at", "sent_at")}),
     )
+
+    @admin.display(description="Body")
+    def display_body(self, obj: models.EmailSent) -> str:
+        """Render HTML email body."""
+        return format_html(
+            '<div style="background: white; padding: 1rem; border: 1px solid #e5e7eb; '
+            'border-radius: 0.375rem; max-height: 400px; overflow-y: auto;">{}</div>',
+            mark_safe(obj.body),
+        )
 
     def lead_link(self, obj: models.EmailSent) -> str:
         """Return a link to the lead."""
@@ -1046,6 +1067,8 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
 @admin.register(models.EmailDraft)
 class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
     """Admin for EmailDraft model."""
+
+    change_form_template = "admin/leads/emaildraft/change_form.html"
 
     list_display = ["id", "edit_link", "lead_link", "subject_preview", "template", "updated_at", "created_at"]
     list_display_links = None  # Disable default linking since we have custom edit_link
@@ -1168,6 +1191,21 @@ class GmailConnectionAdmin(ModelAdmin):  # type: ignore[misc]
 
     def has_change_permission(self, request: HttpRequest, obj: t.Any = None) -> bool:
         return False
+
+
+@admin.register(models.EmailSignature)
+class EmailSignatureAdmin(ModelAdmin):  # type: ignore[misc]
+    """Admin for per-user email signatures."""
+
+    change_form_template = "admin/leads/emailsignature/change_form.html"
+    list_display = ["user", "updated_at"]
+    readonly_fields = ["created_at", "updated_at"]
+    autocomplete_fields = ["user"]
+
+    fieldsets = (
+        (None, {"fields": ("user", "body")}),
+        ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
+    )
 
 
 @admin.register(models.ResearchPromptConfig)

@@ -376,6 +376,7 @@ def _send_via_smtp(
         to=to,
         bcc=bcc if bcc else None,
     )
+    email.content_subtype = "html"
     email.send(fail_silently=False)
 
 

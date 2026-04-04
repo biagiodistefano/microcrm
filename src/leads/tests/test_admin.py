@@ -17,6 +17,7 @@ from leads.admin import (
     CityAdmin,
     CityLinkMixin,
     EmailDraftAdmin,
+    EmailSignatureAdmin,
     HasEmailFilter,
     HasInstagramFilter,
     HasPhoneFilter,
@@ -81,6 +82,10 @@ class TestAdminRegistration:
     def test_research_job_admin_registered(self) -> None:
         assert models.ResearchJob in admin.site._registry
         assert isinstance(admin.site._registry[models.ResearchJob], ResearchJobAdmin)
+
+    def test_email_signature_admin_registered(self) -> None:
+        assert models.EmailSignature in admin.site._registry
+        assert isinstance(admin.site._registry[models.EmailSignature], EmailSignatureAdmin)
 
 
 # --- Custom Filter Tests ---

@@ -263,6 +263,11 @@ UNFOLD = {
                         "icon": "mail",
                         "link": reverse_lazy("admin:leads_gmailconnection_changelist"),
                     },
+                    {
+                        "title": "Signatures",
+                        "icon": "signature",
+                        "link": reverse_lazy("admin:leads_emailsignature_changelist"),
+                    },
                 ],
             },
             {

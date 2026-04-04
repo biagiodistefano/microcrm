@@ -6,7 +6,7 @@ import pytest
 from django.contrib.auth.models import User
 
 from leads.gmail import send_email_via_gmail
-from leads.models import City, EmailDraft, EmailSent, GmailConnection, Lead, LeadType
+from leads.models import City, EmailDraft, EmailSent, EmailSignature, GmailConnection, Lead, LeadType
 from leads.service import send_email_draft, send_email_to_lead
 
 pytestmark = pytest.mark.django_db
@@ -95,6 +95,66 @@ class TestSendEmailViaGmail:
 
         mock_service = mock_build.return_value
         mock_service.users().messages().send.assert_called_once()
+
+    @patch("googleapiclient.discovery.build")
+    def test_sends_html_mime_type(self, mock_build: MagicMock, settings: MagicMock) -> None:
+        settings.EMAIL_DRY_RUN = False
+        credentials = MagicMock()
+
+        send_email_via_gmail(
+            credentials=credentials,
+            from_email="sales@letsrevel.io",
+            to=["venue@example.com"],
+            subject="Hello",
+            body="<p>Test</p>",
+        )
+
+        # Verify the raw message sent to Gmail contains HTML content type
+        mock_service = mock_build.return_value
+        call_args = mock_service.users().messages().send.call_args
+        raw_msg = call_args.kwargs.get("body", call_args[1].get("body", {})) if call_args else {}
+        import base64
+
+        decoded = base64.urlsafe_b64decode(raw_msg["raw"]).decode()
+        assert "Content-Type: text/html" in decoded
+        assert "<p>Test</p>" in decoded
+
+
+# ---------------------------------------------------------------------------
+# EmailSignature model tests
+# ---------------------------------------------------------------------------
+
+
+class TestEmailSignature:
+    def test_create_signature(self, gmail_user: User) -> None:
+        sig = EmailSignature.objects.create(
+            user=gmail_user,
+            body="<p>Best regards,</p><p>Sales Team</p>",
+        )
+        assert sig.body == "<p>Best regards,</p><p>Sales Team</p>"
+        assert sig.user == gmail_user
+
+    def test_str_with_full_name(self, gmail_user: User) -> None:
+        gmail_user.first_name = "John"
+        gmail_user.last_name = "Doe"
+        gmail_user.save()
+        sig = EmailSignature.objects.create(user=gmail_user, body="<p>sig</p>")
+        assert str(sig) == "Signature for John Doe"
+
+    def test_str_without_full_name(self, gmail_user: User) -> None:
+        sig = EmailSignature.objects.create(user=gmail_user, body="<p>sig</p>")
+        assert str(sig) == "Signature for salesperson"
+
+    def test_one_to_one_constraint(self, gmail_user: User) -> None:
+        EmailSignature.objects.create(user=gmail_user, body="<p>first</p>")
+        from django.db import IntegrityError
+
+        with pytest.raises(IntegrityError):
+            EmailSignature.objects.create(user=gmail_user, body="<p>second</p>")
+
+    def test_blank_body_allowed(self, gmail_user: User) -> None:
+        sig = EmailSignature.objects.create(user=gmail_user, body="")
+        assert sig.body == ""
 
 
 # ---------------------------------------------------------------------------

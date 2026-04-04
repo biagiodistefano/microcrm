@@ -3,6 +3,8 @@
 
 {% block extrahead %}
 {{ block.super }}
+<link href="https://cdn.quilljs.com/1.3.7/quill.snow.css" rel="stylesheet">
+<script src="https://cdn.quilljs.com/1.3.7/quill.min.js"></script>
 <style>
     .send-email-form {
         max-width: 800px;
@@ -19,7 +21,6 @@
     }
 
     .send-email-form input[type="text"],
-    .send-email-form textarea,
     .send-email-form select {
         width: 100%;
         padding: 0.5rem;
@@ -29,9 +30,8 @@
         font-size: 0.875rem;
     }
 
-    .send-email-form textarea {
-        min-height: 300px;
-        font-family: monospace;
+    .send-email-form textarea#id_body {
+        display: none;
     }
 
     .send-email-form .help {
@@ -184,6 +184,21 @@
     .button-row button.secondary:hover {
         background: #4b5563;
     }
+
+    /* Quill editor styling */
+    #quill-editor .ql-toolbar {
+        border-top-left-radius: 0.375rem;
+        border-top-right-radius: 0.375rem;
+        background: #f9fafb;
+    }
+
+    #quill-editor .ql-container {
+        border-bottom-left-radius: 0.375rem;
+        border-bottom-right-radius: 0.375rem;
+        min-height: 250px;
+        font-family: inherit;
+        font-size: 0.875rem;
+    }
 </style>
 {% endblock %}
 
@@ -245,6 +260,8 @@
     </div>
     {% endif %}
 
+    {{ signature_html|json_script:"signature-data" }}
+
     <form method="post" id="send-email-form">
         {% csrf_token %}
         {{ form.draft_id }}
@@ -298,6 +315,7 @@
 
         <div class="form-row">
             <label for="id_body">Body</label>
+            <div id="quill-editor"></div>
             {{ form.body }}
             {{ form.body.errors }}
         </div>
@@ -329,83 +347,117 @@
         const templateSelect = document.getElementById('id_template');
         const languageFilter = document.getElementById('id_language_filter');
         const subjectInput = document.getElementById('id_subject');
-        const bodyInput = document.getElementById('id_body');
+        const bodyTextarea = document.getElementById('id_body');
         const templateWarning = document.getElementById('template-warning');
         const leadId = {{ lead.id }};
-        // Build the base URL from current page URL (remove 'send-email/' from the end)
         const baseUrl = window.location.pathname.replace(/send-email\/$/, '');
-        // Template IDs already used for this lead
         const usedTemplateIds = {{ used_template_ids|safe }};
-        // Template language mapping (template_id -> language_code)
         const templatesByLanguage = {{ templates_by_language|safe }};
 
-    // Store original template options for filtering
-    const originalOptions = templateSelect ? Array.from(templateSelect.options) : [];
+        // Load signature
+        const signatureHtml = JSON.parse(document.getElementById('signature-data').textContent);
 
-    function filterTemplatesByLanguage(language) {
-        if (!templateSelect) return;
-
-        // Clear current options except the empty one
-        templateSelect.innerHTML = '';
-
-        // Add back matching options
-        originalOptions.forEach(option => {
-            if (!option.value) {
-                // Always keep the empty option
-                templateSelect.appendChild(option.cloneNode(true));
-            } else if (language === 'all' || templatesByLanguage[parseInt(option.value)] === language) {
-                templateSelect.appendChild(option.cloneNode(true));
-            }
+        // Initialize Quill editor
+        const quill = new Quill('#quill-editor', {
+            theme: 'snow',
+            modules: {
+                toolbar: [
+                    ['bold', 'italic', 'underline'],
+                    ['link'],
+                    [{ 'list': 'ordered' }, { 'list': 'bullet' }],
+                    ['clean']
+                ]
+            },
+            placeholder: 'Compose your email...'
         });
-    }
 
-    function checkTemplateWarning(templateId) {
-        if (templateId && usedTemplateIds.includes(parseInt(templateId))) {
-            templateWarning.classList.add('visible');
-        } else {
-            templateWarning.classList.remove('visible');
+        // Helper: convert plain text (newlines) to HTML paragraphs
+        function textToHtml(text) {
+            if (/<[a-z][\s\S]*>/i.test(text)) {
+                return text;  // already contains HTML tags
+            }
+            return text.split('\n').map(function (line) {
+                return '<p>' + (line || '<br>') + '</p>';
+            }).join('');
         }
-    }
 
-    if (languageFilter) {
-        languageFilter.addEventListener('change', function () {
-            filterTemplatesByLanguage(this.value);
-            // Reset template selection and clear fields
-            if (templateSelect) {
-                templateSelect.value = '';
-            }
-            checkTemplateWarning('');
+        // Helper: build signature block with separator
+        function getSignatureBlock() {
+            if (!signatureHtml) return '';
+            return '<p><br></p><p>--</p>' + signatureHtml;
+        }
+
+        // Load existing body content into Quill
+        if (bodyTextarea.value) {
+            quill.root.innerHTML = textToHtml(bodyTextarea.value);
+        } else if (signatureHtml) {
+            // Empty body — pre-load with just the signature
+            quill.root.innerHTML = '<p><br></p>' + getSignatureBlock();
+        }
+
+        // Sync Quill content to hidden textarea on form submit
+        document.getElementById('send-email-form').addEventListener('submit', function () {
+            bodyTextarea.value = quill.root.innerHTML;
         });
-        // Apply initial filter
-        filterTemplatesByLanguage(languageFilter.value);
-    }
 
-    if (templateSelect) {
-        // Check on page load if a template is pre-selected
-        checkTemplateWarning(templateSelect.value);
+        // Store original template options for filtering
+        const originalOptions = templateSelect ? Array.from(templateSelect.options) : [];
 
-        templateSelect.addEventListener('change', function () {
-            const templateId = this.value;
+        function filterTemplatesByLanguage(language) {
+            if (!templateSelect) return;
+            templateSelect.innerHTML = '';
+            originalOptions.forEach(option => {
+                if (!option.value) {
+                    templateSelect.appendChild(option.cloneNode(true));
+                } else if (language === 'all' || templatesByLanguage[parseInt(option.value)] === language) {
+                    templateSelect.appendChild(option.cloneNode(true));
+                }
+            });
+        }
 
-            // Check if template was already used
-            checkTemplateWarning(templateId);
-
-            if (!templateId) {
-                return;
+        function checkTemplateWarning(templateId) {
+            if (templateId && usedTemplateIds.includes(parseInt(templateId))) {
+                templateWarning.classList.add('visible');
+            } else {
+                templateWarning.classList.remove('visible');
             }
+        }
 
-            // Fetch rendered template via AJAX
-            fetch(`${baseUrl}render-template/${templateId}/`)
-                .then(response => response.json())
-                .then(data => {
-                    if (subjectInput) subjectInput.value = data.subject;
-                    if (bodyInput) bodyInput.value = data.body;
-                })
-                .catch(error => {
-                    console.error('Error fetching template:', error);
-                });
-        });
-    }
-});
+        if (languageFilter) {
+            languageFilter.addEventListener('change', function () {
+                filterTemplatesByLanguage(this.value);
+                if (templateSelect) {
+                    templateSelect.value = '';
+                }
+                checkTemplateWarning('');
+            });
+            filterTemplatesByLanguage(languageFilter.value);
+        }
+
+        if (templateSelect) {
+            checkTemplateWarning(templateSelect.value);
+
+            templateSelect.addEventListener('change', function () {
+                const templateId = this.value;
+                checkTemplateWarning(templateId);
+
+                if (!templateId) {
+                    return;
+                }
+
+                fetch(`${baseUrl}render-template/${templateId}/`)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (subjectInput) subjectInput.value = data.subject;
+                        // Set rendered template body + signature in editor
+                        const templateBody = textToHtml(data.body);
+                        quill.root.innerHTML = templateBody + getSignatureBlock();
+                    })
+                    .catch(error => {
+                        console.error('Error fetching template:', error);
+                    });
+            });
+        }
+    });
 </script>
 {% endblock %}
