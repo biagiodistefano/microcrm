@@ -10,11 +10,15 @@ Revel is a **privacy-first, community-focused event management platform** design
 
 ### Key Value Propositions
 
-1. **Privacy-First**: Built for communities that need advanced screening (questionnaires, manual approval)
+1. **Privacy-First**: Built for communities that need advanced screening (questionnaires with AI evaluation, manual approval, conditional logic)
 2. **Self-Hostable**: Complete data ownership, no vendor lock-in
 3. **Fair Pricing**: 1.5% + €0.25 per ticket (vs 5-15% on competitors) OR self-host for free
-4. **Community Features**: Organizations, memberships, recurring events, potluck coordination
+4. **Community Features**: Organizations, memberships, recurring event series, potluck coordination, announcements, discount codes, referral program
 5. **No Platform Restrictions**: Designed for adult/queer/activist content that mainstream platforms restrict
+6. **Flexible Attendance**: Both free RSVP-based gatherings AND Stripe-powered ticketing in one platform — plus guest access without forced account creation
+7. **Multi-Language**: English, German, Italian — ready for DACH and Italian markets
+8. **Modern Event Ops**: QR code check-in, Apple Wallet tickets, venue & seat management, waitlists
+9. **GDPR-Native**: Data export, account deletion, no tracking — strong differentiator in the EU
 
 ---
 
@@ -81,9 +85,18 @@ Revel is a **privacy-first, community-focused event management platform** design
 - `"[city]" + "kink workshop"`
 - `"[city]" + "trans meetup"`
 - `"[city]" + "flinta events"`
+- `"[city]" + "FLINTA workshop"`
 - `"[city]" + "BDSM events"`
 - `"[city]" + "shibari events"`
 - `"[city]" + "polyamorous community"`
+- `"[city]" + "drag shows"`
+- `"[city]" + "burlesque"` / `"cabaret"`
+- `"[city]" + "ecstatic dance"` / `"conscious dance"`
+- `"[city]" + "contact improvisation"`
+- `"[city]" + "breathwork workshop"` / `"somatic workshop"`
+- `"[city]" + "consent workshop"`
+- `"[city]" + "body positivity"` events
+- `"[city]" + "cacao ceremony"` / `"women's circle"` / `"men's circle"`
 
 **Secondary searches:**
 - `"[city]" + "independent theater"`
@@ -91,21 +104,25 @@ Revel is a **privacy-first, community-focused event management platform** design
 - `"[city]" + "art collective events"`
 - `"[city]" + "community space rental"`
 - `"[city]" + "alternative culture"`
-- `"[city]" + "drag shows"`
-- 
+
 **Pain point searches:**
 - `"event registration" + "[city]" + "LGBTQ"`
 - `"eventbrite alternative" + "[community type]"`
 - `"email RSVP" + "[city]" + "[event type]"`
+- `"DM to register"` / `"DM for link"` + `"[city]"` + `"[event type]"`
+- `"WhatsApp group"` + `"[city]"` + `"[event type]"`
+- `"registration via email"` + `"[city]"` + `"[community type]"`
+- `"privacy"` + `"event platform"` + `"[city]"`
 
 ### 2. Platform Scanning
 
 Check these platforms for active organizers in the city:
 
-- **Social Media**: Instagram hashtags (#queer[city], #lgbt[city]), Facebook Events
+- **Social Media**: Instagram hashtags (#queer[city], #lgbt[city], #flinta[city]), Facebook Events
 - **Existing Event Platforms**: Eventbrite, Meetup, Resident Advisor (note who's using what)
 - **Community Calendars**: Local LGBTQ+ center websites, alternative culture guides
 - **Venue Directories**: Google Maps for "LGBTQ bars", "community spaces", "small theaters"
+- **Telegram**: Community groups, event channels, registration bots (many target communities coordinate via Telegram)
 
 ---
 
@@ -121,10 +138,10 @@ Check these platforms for active organizers in the city:
 
 ### Tags
 Add relevant tags:
-- Community: "LGBTQ+", "Queer", "Sex-positive", "Kink"
+- Community: "LGBTQ+", "Queer", "Sex-positive", "Kink", "FLINTA", "Polyamorous", "Body Positivity"
 - Venue: "Bar", "Club", "Theater", "Community Space"
-- Event: "Workshop", "Party", "Meetup", "Performance"
-- Pain points: "Manual RSVP", "Google Forms", "Eventbrite"
+- Event: "Workshop", "Party", "Meetup", "Performance", "Ecstatic Dance", "Breathwork", "Burlesque", "Consent Education"
+- Pain points: "Manual RSVP", "Google Forms", "Eventbrite", "DM Registration", "WhatsApp Registration", "Telegram Group"
 
 ---
 
@@ -142,6 +159,7 @@ For each lead, gather:
 - **email**: If publicly available
 - **notes**: Include:
   - Current registration method
+  - Event model: RSVP-based (free gatherings) vs ticketed events vs both
   - Event frequency
   - Event size estimate
   - Pain points or opportunities
