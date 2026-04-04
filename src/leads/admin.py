@@ -237,7 +237,7 @@ class SendEmailForm(forms.Form):
     )
     send_in_background = forms.BooleanField(
         required=False,
-        initial=False,
+        initial=True,
         help_text="Send email asynchronously via Celery",
     )
 

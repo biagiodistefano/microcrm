@@ -262,7 +262,7 @@
 
     {{ signature_html|json_script:"signature-data" }}
 
-    <form method="post" id="send-email-form">
+    <form method="post" id="send-email-form" novalidate>
         {% csrf_token %}
         {{ form.draft_id }}
         {{ form.back_url }}
