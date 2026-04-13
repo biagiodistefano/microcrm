@@ -14,13 +14,57 @@ from django.utils.safestring import mark_safe
 from simple_history.admin import SimpleHistoryAdmin
 from solo.admin import SingletonModelAdmin
 from unfold.admin import ModelAdmin, TabularInline
-from unfold.contrib.filters.admin import RangeDateFilter
+from unfold.contrib.filters.admin import DropdownFilter, RangeDateFilter
 from unfold.decorators import action
 from unfold.widgets import UnfoldAdminSingleDateWidget
 
 from . import models
 from . import service as lead_service
 from . import tasks as lead_tasks
+
+
+class CountryFilter(DropdownFilter):  # type: ignore[misc]
+    """Filter leads by country (derived from city)."""
+
+    title = "country"
+    parameter_name = "country"
+
+    def lookups(self, request: HttpRequest, model_admin: t.Any) -> list[tuple[str, str]]:
+        """Return distinct countries that have at least one lead."""
+        countries = (
+            models.City.objects.filter(leads__isnull=False)
+            .values_list("country", flat=True)
+            .distinct()
+            .order_by("country")
+        )
+        return [(c, c) for c in countries]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> QuerySet[t.Any]:
+        """Filter leads by city__country."""
+        if self.value():
+            return queryset.filter(city__country=self.value())
+        return queryset
+
+
+class CityByCountryFilter(DropdownFilter):  # type: ignore[misc]
+    """Filter leads by city, scoped to the currently selected country."""
+
+    title = "city"
+    parameter_name = "city__id__exact"
+
+    def lookups(self, request: HttpRequest, model_admin: t.Any) -> list[tuple[str, str]]:
+        """Return cities scoped to the selected country, or all cities with leads."""
+        country = request.GET.get("country")
+        qs = models.City.objects.filter(leads__isnull=False).distinct().order_by("name")
+        if country:
+            qs = qs.filter(country=country)
+        return [(str(c.id), str(c)) for c in qs]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> QuerySet[t.Any]:
+        """Filter leads by city id."""
+        if self.value():
+            return queryset.filter(city__id=self.value())
+        return queryset
 
 
 class HasContactFieldFilter(admin.SimpleListFilter):
@@ -290,12 +334,12 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         "display_value",
     ]
     list_filter = [
+        CountryFilter,
+        CityByCountryFilter,
         "status",
         "temperature",
         "lead_type",
         "tags",
-        ("city", admin.RelatedOnlyFieldListFilter),
-        "city__country",
         HasEmailFilter,
         HasPhoneFilter,
         HasInstagramFilter,
