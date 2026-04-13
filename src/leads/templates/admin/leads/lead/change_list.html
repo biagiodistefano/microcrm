@@ -1,0 +1,8 @@
+{% extends "admin/change_list.html" %}
+
+{% load admin_urls %}
+
+{% block content %}
+<div id="chained-filters-url" data-url="{% url 'admin:leads_lead_filter_cities' %}" hidden></div>
+{{ block.super }}
+{% endblock %}

@@ -352,6 +352,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
     readonly_fields = ["created_at", "updated_at"]
     date_hierarchy = "created_at"
     list_per_page = 25
+    list_filter_submit = True
     save_on_top = True
     actions = [
         "set_status_contacted",
@@ -373,10 +374,18 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
     )
 
+    class Media:
+        js = ["leads/js/chained_filters.js"]
+
     def get_urls(self) -> list[t.Any]:
-        """Add custom URLs for email functionality."""
+        """Add custom URLs for email and filter endpoints."""
         urls: list[t.Any] = super().get_urls()
         custom_urls = [
+            path(
+                "filter-cities/",
+                self.admin_site.admin_view(self.filter_cities_view),
+                name="leads_lead_filter_cities",
+            ),
             path(
                 "<int:lead_id>/send-email/",
                 self.admin_site.admin_view(self.send_email_view),
@@ -389,6 +398,15 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             ),
         ]
         return custom_urls + urls
+
+    def filter_cities_view(self, request: HttpRequest) -> JsonResponse:
+        """Return cities as JSON, optionally filtered by country."""
+        country = request.GET.get("country")
+        qs = models.City.objects.filter(leads__isnull=False).distinct().order_by("name")
+        if country:
+            qs = qs.filter(country=country)
+        cities = [{"id": c.id, "label": str(c)} for c in qs]
+        return JsonResponse({"cities": cities})
 
     def send_email_view(self, request: HttpRequest, lead_id: int) -> HttpResponse:
         """Custom view for sending email to a lead."""
