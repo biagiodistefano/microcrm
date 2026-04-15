@@ -260,6 +260,35 @@ def test_send_email_with_explicit_contact_id(lead: Lead, email_template: EmailTe
 
 
 @pytest.mark.django_db
+def test_lead_admin_hides_legacy_contact_fieldset() -> None:
+    """Phase 3: the 'Contact' fieldset is gone so the 5 legacy fields can't be edited."""
+    from django.contrib.admin.sites import AdminSite
+
+    from leads import models as m
+    from leads.admin import LeadAdmin
+
+    admin_instance = LeadAdmin(m.Lead, AdminSite())
+    fieldset_titles = [name for name, _opts in admin_instance.fieldsets]
+    assert "Contact" not in fieldset_titles
+    # And the inline now manages contacts
+    assert any(inline.__name__ == "ContactInline" for inline in admin_instance.inlines)
+
+
+@pytest.mark.django_db
+def test_send_email_view_defaults_to_primary_contact_email(lead: Lead, api_client: Client) -> None:
+    """Initial 'to' on the admin send-email form comes from the primary contact."""
+    from django.contrib.auth.models import User
+
+    Contact.objects.create(lead=lead, name="Primary", email="primary@x.com", is_primary=True)
+    superuser = User.objects.create_superuser("admin", "admin@x.com", "pw")
+    api_client.force_login(superuser)
+
+    resp = api_client.get(f"/admin/leads/lead/{lead.pk}/send-email/")
+    assert resp.status_code == 200
+    assert b"primary@x.com" in resp.content
+
+
+@pytest.mark.django_db
 def test_create_email_draft_defaults_to_primary_contact(lead: Lead) -> None:
     """create_email_draft picks up primary contact's email when 'to' is omitted."""
     Contact.objects.create(lead=lead, name="Primary", email="p@x.com", is_primary=True)
