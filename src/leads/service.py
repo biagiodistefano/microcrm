@@ -7,6 +7,7 @@ import typing as t
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.mail import EmailMessage
+from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from ninja.errors import HttpError
@@ -14,6 +15,7 @@ from ninja.errors import HttpError
 from leads.models import (
     Action,
     City,
+    Contact,
     EmailDraft,
     EmailSent,
     EmailTemplate,
@@ -27,6 +29,8 @@ from leads.schema import (
     ActionIn,
     ActionPatch,
     CityIn,
+    ContactIn,
+    ContactPatch,
     EmailDraftIn,
     EmailDraftPatch,
     EmailTemplateIn,
@@ -36,6 +40,8 @@ from leads.schema import (
     ResearchJobIn,
     SendEmailIn,
 )
+
+CONTACT_FIELDS: tuple[str, ...] = ("email", "phone", "telegram", "instagram", "website")
 
 logger = logging.getLogger(__name__)
 
@@ -65,29 +71,61 @@ def get_or_create_tags(tag_names: list[str]) -> list[Tag]:
     return tags
 
 
-def apply_lead_data(lead: Lead, data: LeadIn | LeadPatch, is_patch: bool = False) -> Lead:
-    """Apply data to a lead, handling related objects."""
-    exclude = {"city", "lead_type", "tags"}
-    data_dict = data.model_dump(exclude=exclude, exclude_unset=is_patch)
+def get_or_create_primary_contact(lead: Lead) -> Contact:
+    """Return the primary Contact for a lead, creating a default one if missing."""
+    primary = lead.contacts.filter(is_primary=True).first()
+    if primary:
+        return primary
+    return Contact.objects.create(lead=lead, name="Primary", is_primary=True)
 
-    for field, value in data_dict.items():
-        setattr(lead, field, value)
 
-    # Handle city
+def _apply_lead_relations(lead: Lead, data: LeadIn | LeadPatch, is_patch: bool) -> None:
+    """Set city / lead_type FKs from input data."""
     if data.city is not None:
         lead.city = get_or_create_city(data.city)
     elif not is_patch:
         lead.city = None
 
-    # Handle lead_type
     if data.lead_type is not None:
         lead.lead_type = get_or_create_lead_type(data.lead_type)
     elif not is_patch:
         lead.lead_type = None
 
+
+def _dual_write_primary_contact(lead: Lead, contact_updates: dict[str, str], is_patch: bool) -> None:
+    """Mirror contact-field writes onto the lead's primary contact.
+
+    Phase 4 will remove the Lead-level columns; until then writes land in both places.
+    PUT semantics reset any non-mentioned contact fields on the primary.
+    """
+    if not contact_updates and is_patch:
+        return
+    primary = get_or_create_primary_contact(lead)
+    for field, value in contact_updates.items():
+        setattr(primary, field, value)
+    if not is_patch:
+        for field in CONTACT_FIELDS:
+            if field not in contact_updates:
+                setattr(primary, field, "")
+    primary.save()
+
+
+def apply_lead_data(lead: Lead, data: LeadIn | LeadPatch, is_patch: bool = False) -> Lead:
+    """Apply data to a lead, handling related objects and dual-writing contact fields."""
+    exclude = {"city", "lead_type", "tags"}
+    data_dict = data.model_dump(exclude=exclude, exclude_unset=is_patch)
+
+    contact_updates: dict[str, str] = {}
+    for field, value in data_dict.items():
+        setattr(lead, field, value)
+        if field in CONTACT_FIELDS:
+            contact_updates[field] = value or ""
+
+    _apply_lead_relations(lead, data, is_patch)
     lead.save()
 
-    # Handle tags
+    _dual_write_primary_contact(lead, contact_updates, is_patch)
+
     if data.tags is not None:
         tags = get_or_create_tags(data.tags)
         lead.tags.set(tags)
@@ -111,6 +149,79 @@ def update_lead(lead: Lead, data: LeadIn) -> Lead:
 def patch_lead(lead: Lead, data: LeadPatch) -> Lead:
     """Partially update a lead."""
     return apply_lead_data(lead, data, is_patch=True)
+
+
+# --- Contact Functions ---
+
+
+def _demote_existing_primary(lead: Lead, exclude_pk: int | None = None) -> None:
+    """Clear is_primary on any existing primary contact for a lead (except exclude_pk)."""
+    qs = lead.contacts.filter(is_primary=True)
+    if exclude_pk is not None:
+        qs = qs.exclude(pk=exclude_pk)
+    qs.update(is_primary=False)
+
+
+def create_contact(data: ContactIn) -> Contact:
+    """Create a new contact for a lead.
+
+    If is_primary=True, any existing primary contact is demoted atomically.
+
+    Raises:
+        HttpError: 404 if the lead doesn't exist.
+    """
+    try:
+        lead = Lead.objects.get(id=data.lead_id)
+    except Lead.DoesNotExist:
+        raise HttpError(404, f"Lead with id {data.lead_id} not found")
+
+    fields = data.model_dump(exclude={"lead_id"})
+    with transaction.atomic():
+        if data.is_primary:
+            _demote_existing_primary(lead)
+        return Contact.objects.create(lead=lead, **fields)
+
+
+def update_contact(contact: Contact, data: ContactIn) -> Contact:
+    """Update a contact (full replacement).
+
+    Changing lead_id moves the contact to a different lead.
+    """
+    if contact.lead_id != data.lead_id:
+        if not Lead.objects.filter(id=data.lead_id).exists():
+            raise HttpError(404, f"Lead with id {data.lead_id} not found")
+        contact.lead_id = data.lead_id
+
+    fields = data.model_dump(exclude={"lead_id"})
+    with transaction.atomic():
+        if data.is_primary:
+            _demote_existing_primary(contact.lead, exclude_pk=contact.pk)
+        for field, value in fields.items():
+            setattr(contact, field, value)
+        contact.save()
+    return contact
+
+
+def patch_contact(contact: Contact, data: ContactPatch) -> Contact:
+    """Partially update a contact."""
+    updates = data.model_dump(exclude_unset=True)
+    with transaction.atomic():
+        if updates.get("is_primary"):
+            _demote_existing_primary(contact.lead, exclude_pk=contact.pk)
+        for field, value in updates.items():
+            setattr(contact, field, value)
+        contact.save()
+    return contact
+
+
+def set_primary_contact(contact: Contact) -> Contact:
+    """Mark a contact as primary for its lead, demoting any existing primary."""
+    with transaction.atomic():
+        _demote_existing_primary(contact.lead, exclude_pk=contact.pk)
+        if not contact.is_primary:
+            contact.is_primary = True
+            contact.save(update_fields=["is_primary", "updated_at"])
+    return contact
 
 
 # --- Action Functions ---
@@ -291,31 +402,44 @@ def reprocess_research_job(job: ResearchJob) -> dict[str, t.Any]:
 PLACEHOLDER_PATTERN = re.compile(r"\{[^}]+\}")
 
 
-def render_email_template(template: EmailTemplate, lead: Lead) -> tuple[str, str]:
-    """Render an email template with lead data.
+def render_email_template(template: EmailTemplate, lead: Lead, contact: Contact | None = None) -> tuple[str, str]:
+    """Render an email template with lead + contact data.
 
     Available placeholders:
     - {lead.name}, {lead.email}, {lead.phone}, {lead.company}
     - {lead.city}, {lead.lead_type}
     - {lead.instagram}, {lead.telegram}, {lead.website}
 
+    Contact-scoped placeholders resolve from the given contact (or the lead's
+    primary contact if not provided), falling back to the Lead-level field.
+
     Args:
         template: The EmailTemplate to render
         lead: The Lead to use for placeholder values
+        contact: Optional Contact to prefer over the primary contact
 
     Returns:
         Tuple of (rendered_subject, rendered_body)
     """
+    resolved_contact = contact or lead.contacts.filter(is_primary=True).first()
+
+    def field(attr: str) -> str:
+        if resolved_contact is not None:
+            value = getattr(resolved_contact, attr, "")
+            if value:
+                return str(value)
+        return str(getattr(lead, attr, "") or "")
+
     context = {
         "lead.name": lead.name or "",
-        "lead.email": lead.email or "",
-        "lead.phone": lead.phone or "",
+        "lead.email": field("email"),
+        "lead.phone": field("phone"),
         "lead.company": lead.company or "",
         "lead.city": str(lead.city) if lead.city else "",
         "lead.lead_type": str(lead.lead_type) if lead.lead_type else "",
-        "lead.instagram": lead.instagram or "",
-        "lead.telegram": lead.telegram or "",
-        "lead.website": lead.website or "",
+        "lead.instagram": field("instagram"),
+        "lead.telegram": field("telegram"),
+        "lead.website": field("website"),
     }
 
     subject = template.subject
@@ -380,7 +504,7 @@ def _send_via_smtp(
     email.send(fail_silently=False)
 
 
-def send_email_to_lead(
+def send_email_to_lead(  # noqa: PLR0913
     lead: Lead,
     subject: str,
     body: str,
@@ -388,6 +512,7 @@ def send_email_to_lead(
     bcc: list[str] | None = None,
     template: EmailTemplate | None = None,
     user: User | None = None,
+    contact: Contact | None = None,
 ) -> EmailSent:
     """Send an email to a lead and log it.
 
@@ -402,6 +527,7 @@ def send_email_to_lead(
         bcc: Optional list of BCC email addresses
         template: Optional EmailTemplate used (for reference)
         user: Optional User who initiated the send (for Gmail OAuth lookup)
+        contact: Optional Contact this email is addressed to (recorded on EmailSent)
 
     Returns:
         EmailSent record
@@ -428,6 +554,7 @@ def send_email_to_lead(
     # Create the EmailSent record first with PENDING status
     email_sent = EmailSent.objects.create(
         lead=lead,
+        contact=contact,
         template=template,
         from_email=from_email,
         to=to,
@@ -483,6 +610,43 @@ def patch_email_template(template: EmailTemplate, data: EmailTemplatePatch) -> E
     return template
 
 
+def _resolve_send_contact(lead: Lead, contact_id: int | None) -> Contact | None:
+    """Resolve the contact to use when sending: explicit id > primary > None."""
+    if contact_id:
+        try:
+            return Contact.objects.get(id=contact_id, lead=lead)
+        except Contact.DoesNotExist:
+            raise HttpError(404, f"Contact with id {contact_id} not found for this lead")
+    return lead.contacts.filter(is_primary=True).first()
+
+
+def _resolve_send_subject_body(
+    lead: Lead, data: SendEmailIn, contact: Contact | None
+) -> tuple[EmailTemplate | None, str, str]:
+    """Resolve the (template, subject, body) tuple for an outgoing email."""
+    if data.template_id:
+        try:
+            template = EmailTemplate.objects.get(id=data.template_id)
+        except EmailTemplate.DoesNotExist:
+            raise HttpError(404, f"Template with id {data.template_id} not found")
+        subject, body = render_email_template(template, lead, contact=contact)
+        return template, subject, body
+    if data.subject and data.body:
+        return None, data.subject, data.body
+    raise HttpError(400, "Either template_id or both subject and body are required")
+
+
+def _resolve_send_recipients(explicit_to: list[str] | None, contact: Contact | None, lead: Lead) -> list[str]:
+    """Determine recipient list: explicit > contact email > lead email."""
+    if explicit_to:
+        return explicit_to
+    if contact and contact.email:
+        return [contact.email]
+    if lead.email:
+        return [lead.email]
+    raise HttpError(400, "No recipient email address (lead has no contact email and 'to' not provided)")
+
+
 def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
     """Send an email to a lead via API.
 
@@ -500,26 +664,9 @@ def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
     """
     from leads.tasks import send_email_task
 
-    template: EmailTemplate | None = None
-
-    # Determine subject and body
-    if data.template_id:
-        try:
-            template = EmailTemplate.objects.get(id=data.template_id)
-        except EmailTemplate.DoesNotExist:
-            raise HttpError(404, f"Template with id {data.template_id} not found")
-        subject, body = render_email_template(template, lead)
-    elif data.subject and data.body:
-        subject = data.subject
-        body = data.body
-    else:
-        raise HttpError(400, "Either template_id or both subject and body are required")
-
-    # Determine recipients
-    to = data.to if data.to else [lead.email] if lead.email else []
-    if not to:
-        raise HttpError(400, "No recipient email address (lead has no email and 'to' not provided)")
-
+    contact = _resolve_send_contact(lead, data.contact_id)
+    template, subject, body = _resolve_send_subject_body(lead, data, contact)
+    to = _resolve_send_recipients(data.to, contact, lead)
     bcc = data.bcc or []
 
     # Send in background or synchronously
@@ -531,6 +678,7 @@ def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
             to=to,
             bcc=bcc,
             template_id=template.id if template else None,
+            contact_id=contact.id if contact else None,
         )
         return {
             "email_id": 0,  # Not yet created
@@ -545,6 +693,7 @@ def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
             to=to,
             bcc=bcc,
             template=template,
+            contact=contact,
         )
         return {
             "email_id": email_sent.id,
@@ -554,6 +703,22 @@ def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
 
 
 # --- Email Draft Functions ---
+
+
+def _resolve_draft_contact(lead: Lead, contact_id: int | None) -> Contact | None:
+    """Resolve the contact for a draft: explicit id > primary > None."""
+    if contact_id:
+        return get_object_or_404(Contact, pk=contact_id, lead=lead)
+    return lead.contacts.filter(is_primary=True).first()
+
+
+def _default_draft_recipients(contact: Contact | None, lead: Lead) -> list[str]:
+    """Default recipient list based on resolved contact, then lead."""
+    if contact and contact.email:
+        return [contact.email]
+    if lead.email:
+        return [lead.email]
+    return []
 
 
 def create_email_draft(data: EmailDraftIn) -> EmailDraft:
@@ -566,16 +731,18 @@ def create_email_draft(data: EmailDraftIn) -> EmailDraft:
         EmailDraft record
 
     Raises:
-        Http404: If lead or template not found
+        Http404: If lead, template, or contact not found
     """
     lead = get_object_or_404(Lead, pk=data.lead_id)
     template = get_object_or_404(EmailTemplate, pk=data.template_id) if data.template_id else None
+    contact = _resolve_draft_contact(lead, data.contact_id)
 
     return EmailDraft.objects.create(
         lead=lead,
+        contact=contact,
         template=template,
         from_email=data.from_email or settings.DEFAULT_FROM_EMAIL,
-        to=data.to or ([lead.email] if lead.email else []),
+        to=data.to or _default_draft_recipients(contact, lead),
         bcc=data.bcc,
         subject=data.subject,
         body=data.body,
@@ -593,12 +760,13 @@ def update_email_draft(draft: EmailDraft, data: EmailDraftIn) -> EmailDraft:
         Updated EmailDraft record
 
     Raises:
-        Http404: If lead or template not found
+        Http404: If lead, template, or contact not found
     """
     draft.lead = get_object_or_404(Lead, pk=data.lead_id)
     draft.template = get_object_or_404(EmailTemplate, pk=data.template_id) if data.template_id else None
+    draft.contact = _resolve_draft_contact(draft.lead, data.contact_id)
     draft.from_email = data.from_email or settings.DEFAULT_FROM_EMAIL
-    draft.to = data.to or ([draft.lead.email] if draft.lead.email else [])
+    draft.to = data.to or _default_draft_recipients(draft.contact, draft.lead)
     draft.bcc = data.bcc
     draft.subject = data.subject
     draft.body = data.body
@@ -617,11 +785,16 @@ def patch_email_draft(draft: EmailDraft, data: EmailDraftPatch) -> EmailDraft:
         Updated EmailDraft record
 
     Raises:
-        Http404: If template not found
+        Http404: If template or contact not found
     """
     for field, value in data.model_dump(exclude_unset=True).items():
         if field == "template_id":
             draft.template = get_object_or_404(EmailTemplate, pk=value) if value else None
+        elif field == "contact_id":
+            if value is None:
+                draft.contact = None
+            else:
+                draft.contact = get_object_or_404(Contact, pk=value, lead=draft.lead)
         else:
             setattr(draft, field, value)
     draft.save()
@@ -657,6 +830,7 @@ def send_email_draft(draft: EmailDraft, user: User | None = None) -> EmailSent:
         bcc=draft.bcc or None,
         template=draft.template,
         user=user,
+        contact=draft.contact,
     )
 
     # Delete the draft after successful send
@@ -665,7 +839,7 @@ def send_email_draft(draft: EmailDraft, user: User | None = None) -> EmailSent:
     return email_sent
 
 
-def save_email_as_draft(
+def save_email_as_draft(  # noqa: PLR0913
     lead: Lead,
     subject: str,
     body: str,
@@ -674,6 +848,7 @@ def save_email_as_draft(
     template: EmailTemplate | None = None,
     draft_id: int | None = None,
     user: User | None = None,
+    contact: Contact | None = None,
 ) -> EmailDraft:
     """Save email form data as a draft.
 
@@ -689,6 +864,7 @@ def save_email_as_draft(
         template: Optional EmailTemplate used
         draft_id: Optional ID of existing draft to update
         user: Optional User (for resolving from_email via Gmail connection)
+        contact: Optional Contact this draft targets (defaults to lead's primary contact)
 
     Returns:
         EmailDraft record (created or updated)
@@ -698,10 +874,13 @@ def save_email_as_draft(
     """
     from_email = _resolve_from_email(_get_gmail_connection(user))
 
+    resolved_contact = contact if contact is not None else lead.contacts.filter(is_primary=True).first()
+
     if draft_id:
         # Validate draft exists AND belongs to this lead
         draft = get_object_or_404(EmailDraft, pk=draft_id, lead=lead)
         draft.template = template
+        draft.contact = resolved_contact
         draft.from_email = from_email
         draft.to = to
         draft.bcc = bcc or []
@@ -712,6 +891,7 @@ def save_email_as_draft(
 
     return EmailDraft.objects.create(
         lead=lead,
+        contact=resolved_contact,
         template=template,
         from_email=from_email,
         to=to,

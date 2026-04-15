@@ -8,7 +8,18 @@ from django.db.models import Q
 from ninja import FilterLookup, FilterSchema, ModelSchema, Schema
 from pydantic import Field
 
-from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import (
+    Action,
+    City,
+    Contact,
+    EmailDraft,
+    EmailSent,
+    EmailTemplate,
+    Lead,
+    LeadType,
+    ResearchJob,
+    Tag,
+)
 
 
 # --- Output Schemas ---
@@ -60,12 +71,42 @@ class ActionSchema(ModelSchema):
         return obj.lead_id
 
 
+class ContactSchema(ModelSchema):
+    """Contact output schema."""
+
+    lead_id: int
+
+    class Meta:
+        model = Contact
+        fields = [
+            "id",
+            "name",
+            "role",
+            "email",
+            "phone",
+            "telegram",
+            "instagram",
+            "website",
+            "notes",
+            "is_primary",
+            "created_at",
+            "updated_at",
+        ]
+
+    @staticmethod
+    def resolve_lead_id(obj: Contact) -> int:
+        """Resolve lead_id from the foreign key."""
+        return obj.lead_id
+
+
 class LeadSchema(ModelSchema):
     """Lead output schema."""
 
     city: CitySchema | None = None
     lead_type: LeadTypeSchema | None = None
     tags: list[TagSchema] = []
+    contacts: list[ContactSchema] = []
+    primary_contact: ContactSchema | None = None
 
     class Meta:
         model = Lead
@@ -92,6 +133,19 @@ class LeadSchema(ModelSchema):
     def resolve_tags(obj: Lead) -> list[Tag]:
         """Resolve tags."""
         return list(obj.tags.all())
+
+    @staticmethod
+    def resolve_contacts(obj: Lead) -> list[Contact]:
+        """Resolve contacts (primary first)."""
+        return list(obj.contacts.all())
+
+    @staticmethod
+    def resolve_primary_contact(obj: Lead) -> Contact | None:
+        """Resolve the primary contact, if any."""
+        for c in obj.contacts.all():
+            if c.is_primary:
+                return c
+        return None
 
 
 class ResearchJobSchema(ModelSchema):
@@ -271,6 +325,35 @@ class LeadPatch(Schema):
     value: Decimal | None = None
 
 
+class ContactIn(Schema):
+    """Contact create input schema."""
+
+    lead_id: int = Field(..., description="ID of the lead this contact belongs to")
+    name: str = Field(..., description="Person name or label (e.g., 'Alice Booker', 'Primary')")
+    role: str = Field(default="", description="Role at the organization (e.g., 'booker')")
+    email: str = Field(default="", description="Contact email")
+    phone: str = Field(default="", description="Contact phone")
+    telegram: str = Field(default="", description="Telegram username or link")
+    instagram: str = Field(default="", description="Instagram handle")
+    website: str = Field(default="", description="Website URL")
+    notes: str = Field(default="", description="Additional notes")
+    is_primary: bool = Field(default=False, description="Mark this contact as the primary one for the lead")
+
+
+class ContactPatch(Schema):
+    """Contact partial update schema."""
+
+    name: str | None = None
+    role: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    telegram: str | None = None
+    instagram: str | None = None
+    website: str | None = None
+    notes: str | None = None
+    is_primary: bool | None = None
+
+
 class ActionIn(Schema):
     """Action create input schema.
 
@@ -320,9 +403,12 @@ class EmailDraftIn(Schema):
     """EmailDraft create/update input schema."""
 
     lead_id: int = Field(..., description="ID of the lead this draft is for")
+    contact_id: int | None = Field(
+        default=None, description="Contact this draft targets (defaults to the lead's primary contact)"
+    )
     template_id: int | None = Field(default=None, description="Template ID used (optional)")
     from_email: str | None = Field(default=None, description="Sender email (defaults to DEFAULT_FROM_EMAIL)")
-    to: list[str] | None = Field(default=None, description="Recipients (defaults to lead's email)")
+    to: list[str] | None = Field(default=None, description="Recipients (defaults to primary contact's email)")
     bcc: list[str] = Field(default_factory=list, description="BCC recipients")
     subject: str = Field(..., description="Email subject")
     body: str = Field(..., description="Email body")
@@ -331,6 +417,7 @@ class EmailDraftIn(Schema):
 class EmailDraftPatch(Schema):
     """EmailDraft partial update schema."""
 
+    contact_id: int | None = None
     template_id: int | None = None
     from_email: str | None = None
     to: list[str] | None = None
@@ -342,10 +429,15 @@ class EmailDraftPatch(Schema):
 class SendEmailIn(Schema):
     """Input schema for sending an email to a lead."""
 
+    contact_id: int | None = Field(
+        default=None, description="Contact to email (defaults to the lead's primary contact)"
+    )
     template_id: int | None = Field(default=None, description="Template ID to use (optional)")
     subject: str | None = Field(default=None, description="Email subject (required if no template)")
     body: str | None = Field(default=None, description="Email body (required if no template)")
-    to: list[str] | None = Field(default=None, description="Override recipient(s), defaults to lead's email")
+    to: list[str] | None = Field(
+        default=None, description="Override recipient(s), defaults to the primary contact's email"
+    )
     bcc: list[str] = Field(default_factory=list, description="BCC recipients")
     send_in_background: bool = Field(default=False, description="Send via Celery background task")
 
@@ -383,6 +475,13 @@ class CityFilterSchema(FilterSchema):
     """City filter schema."""
 
     country: t.Annotated[str | None, FilterLookup(q="country__icontains")] = None
+
+
+class ContactFilterSchema(FilterSchema):
+    """Contact filter schema."""
+
+    lead_id: t.Annotated[int | None, FilterLookup(q="lead_id")] = None
+    is_primary: bool | None = None
 
 
 class ActionFilterSchema(FilterSchema):

@@ -13,7 +13,7 @@ from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from simple_history.admin import SimpleHistoryAdmin
 from solo.admin import SingletonModelAdmin
-from unfold.admin import ModelAdmin, TabularInline
+from unfold.admin import ModelAdmin, StackedInline, TabularInline
 from unfold.contrib.filters.admin import DropdownFilter, RangeDateFilter
 from unfold.decorators import action
 from unfold.widgets import UnfoldAdminSingleDateWidget
@@ -68,7 +68,7 @@ class CityByCountryFilter(DropdownFilter):  # type: ignore[misc]
 
 
 class HasContactFieldFilter(admin.SimpleListFilter):
-    """Base filter for checking if a contact field has a value."""
+    """Base filter for checking if any of the lead's contacts has a value for a field."""
 
     field_name = ""  # Override in subclasses
 
@@ -80,12 +80,26 @@ class HasContactFieldFilter(admin.SimpleListFilter):
         ]
 
     def queryset(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> QuerySet[t.Any]:
-        """Filter queryset based on whether field has a value."""
-        if self.value() == "yes":
-            return queryset.exclude(**{f"{self.field_name}__exact": ""})
-        if self.value() == "no":
-            return queryset.filter(**{f"{self.field_name}__exact": ""})
-        return queryset
+        """Filter leads by whether any contact (or the legacy Lead column) has the field populated.
+
+        Uses an EXISTS subquery on Contact rather than a multi-valued reverse-FK join +
+        exclude/filter, because Django's multi-valued exclude evaluates per-row and would
+        misclassify leads that have some contacts with the field filled and others without.
+        The legacy Lead.* column is OR'd in for the Phase 2/3 dual-write window; Phase 4
+        drops it when the columns are removed.
+        """
+        from django.db.models import Exists, OuterRef, Q
+
+        value = self.value()
+        if value not in ("yes", "no"):
+            return queryset
+
+        has_contact_value = Exists(models.Contact.objects.filter(lead=OuterRef("pk"), **{f"{self.field_name}__gt": ""}))
+        has_legacy_value = Q(**{f"{self.field_name}__gt": ""})
+        combined = has_contact_value | has_legacy_value
+        if value == "yes":
+            return queryset.filter(combined)
+        return queryset.filter(~combined)
 
 
 class HasEmailFilter(HasContactFieldFilter):
@@ -118,6 +132,70 @@ class HasTelegramFilter(HasContactFieldFilter):
     title = "has telegram"
     parameter_name = "has_telegram"
     field_name = "telegram"
+
+
+def _render_contact_block(contact: "models.Contact", send_url: str) -> str:
+    """Render one contact as a vertical stack: header line + method lines.
+
+    Used by LeadAdmin.display_contacts to show all methods of all contacts in one
+    list-view cell. Each method is its own line so multiple contacts read clearly.
+    """
+    name = contact.name or "Contact"
+    header = format_html("<strong>{}</strong>", name)
+    if contact.is_primary:
+        header = format_html('{} <span style="color:#10b981; font-size:0.75em;">★ primary</span>', header)
+    if contact.role:
+        header = format_html('{} <span style="color:#666; font-size:0.85em;">({})</span>', header, contact.role)
+
+    parts: list[str] = [format_html('<div style="font-size: 0.85em;">{}</div>', header)]
+
+    if contact.email:
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">📧 <a href="{}" onclick="event.stopPropagation()">{}</a></div>',
+                send_url,
+                contact.email,
+            )
+        )
+    if contact.phone:
+        parts.append(format_html('<div style="font-size: 0.8em;">📞 {}</div>', contact.phone))
+    if contact.telegram:
+        tg_url = (
+            contact.telegram if contact.telegram.startswith("http") else f"https://t.me/{contact.telegram.lstrip('@')}"
+        )
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">📱 '
+                '<a href="{}" target="_blank" onclick="event.stopPropagation()">{}</a></div>',
+                tg_url,
+                contact.telegram,
+            )
+        )
+    if contact.instagram:
+        ig = contact.instagram.lstrip("@")
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">📷 '
+                '<a href="https://instagram.com/{}" target="_blank" '
+                'onclick="event.stopPropagation()">@{}</a></div>',
+                ig,
+                ig,
+            )
+        )
+    if contact.website:
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">🌐 '
+                '<a href="{}" target="_blank" onclick="event.stopPropagation()">{}</a></div>',
+                contact.website,
+                contact.website,
+            )
+        )
+
+    return format_html(
+        '<div style="border-left: 2px solid #e5e7eb; padding-left: 6px;">{}</div>',
+        mark_safe("".join(parts)),
+    )
 
 
 class CityLinkMixin:
@@ -227,6 +305,36 @@ class TagAdmin(ModelAdmin):  # type: ignore[misc]
         return obj._lead_count  # type: ignore[attr-defined, no-any-return]
 
 
+@admin.register(models.Contact)
+class ContactAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
+    """Admin for Contact model (Phase 1: verification only)."""
+
+    list_display = ["name", "lead", "role", "is_primary", "email", "phone"]
+    list_filter = ["is_primary"]
+    search_fields = ["name", "role", "email", "phone", "telegram", "instagram", "website", "lead__name"]
+    autocomplete_fields = ["lead"]
+    ordering = ["lead__name", "-is_primary", "name"]
+
+
+class ContactInline(StackedInline):  # type: ignore[misc]
+    """Inline for contacts on Lead admin (per-person contact details)."""
+
+    model = models.Contact
+    extra = 0
+    fields = [
+        "name",
+        "role",
+        "is_primary",
+        "email",
+        "phone",
+        "telegram",
+        "instagram",
+        "website",
+        "notes",
+    ]
+    ordering = ["-is_primary", "name"]
+
+
 class ActionInline(TabularInline):  # type: ignore[misc]
     """Inline for actions on Lead admin."""
 
@@ -319,12 +427,11 @@ class SendEmailForm(forms.Form):
 class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin):  # type: ignore[misc]
     """Admin for Lead model."""
 
-    inlines = [ActionInline]
+    inlines = [ContactInline, ActionInline]
     list_display = [
         "display_name_with_notes",
         "display_company_type",
-        "display_email",
-        "display_socials",
+        "display_contacts",
         "city_link",
         "display_status",
         "display_temperature",
@@ -346,7 +453,16 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         HasTelegramFilter,
         ("created_at", RangeDateFilter),
     ]
-    search_fields = ["name", "email", "company", "notes", "telegram", "instagram", "website"]
+    search_fields = [
+        "name",
+        "company",
+        "notes",
+        "contacts__email",
+        "contacts__phone",
+        "contacts__telegram",
+        "contacts__instagram",
+        "contacts__website",
+    ]
     autocomplete_fields = ["city", "lead_type"]
     filter_horizontal = ["tags"]
     readonly_fields = ["created_at", "updated_at"]
@@ -365,9 +481,12 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
     ]
     actions_submit_line = ["log_contact", "mark_contacted", "mark_converted", "mark_lost"]
 
+    # NOTE: the legacy "Contact" fieldset (email/phone/telegram/instagram/website)
+    # has been removed in Phase 3. Contact info is now managed via the ContactInline.
+    # The columns still exist on Lead and are dual-written by the service layer
+    # until Phase 4 drops them.
     fieldsets = (
         (None, {"fields": ("name", "company", "lead_type", "city")}),
-        ("Contact", {"fields": ("email", "phone", "telegram", "instagram", "website")}),
         ("Lead Info", {"fields": ("source", "status", "temperature", "tags", "value")}),
         ("Follow-up", {"fields": ("last_contact",)}),
         ("Notes", {"fields": ("notes",)}),
@@ -424,7 +543,9 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
                 if result:
                     return result
         else:
-            initial: dict[str, t.Any] = {"to": lead.email} if lead.email else {}
+            primary_contact = lead.contacts.filter(is_primary=True).first()
+            default_to = (primary_contact.email if primary_contact and primary_contact.email else lead.email) or ""
+            initial: dict[str, t.Any] = {"to": default_to} if default_to else {}
 
             # Check for back_url in session first (preserved across save-draft redirects)
             session_back_url = request.session.pop("send_email_back_url", None)
@@ -714,6 +835,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         )
         return qs.select_related("city", "lead_type").prefetch_related(
             "tags",
+            "contacts",
             Prefetch("actions", queryset=pending_actions, to_attr="pending_actions"),
         )
 
@@ -740,40 +862,15 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             parts.append(f"<span style='color: #666; font-size: 0.85em;'>{obj.lead_type}</span>")
         return mark_safe("<br>".join(parts)) if parts else "-"
 
-    @admin.display(description="Email")
-    def display_email(self, obj: models.Lead) -> str:
-        """Display email with link to send email view."""
-        if not obj.email:
+    @admin.display(description="Contacts")
+    def display_contacts(self, obj: models.Lead) -> str:
+        """Stack each contact's methods vertically with name/role headers."""
+        contacts = list(obj.contacts.all())
+        if not contacts:
             return "-"
         send_url = reverse("admin:leads_lead_send_email", args=[obj.id])
-        return format_html(
-            '<a href="{}" onclick="event.stopPropagation()" title="Send email to {}">{}</a>',
-            send_url,
-            obj.email,
-            obj.email,
-        )
-
-    @admin.display(description="Links")
-    def display_socials(self, obj: models.Lead) -> str:
-        """Display social links as icons."""
-        links = []
-        if obj.telegram:
-            tg_url = obj.telegram if obj.telegram.startswith("http") else f"https://t.me/{obj.telegram.lstrip('@')}"
-            links.append(
-                f'<a href="{tg_url}" target="_blank" title="{obj.telegram}" onclick="event.stopPropagation()">📱</a>'
-            )
-        if obj.instagram:
-            ig_handle = obj.instagram.lstrip("@")
-            links.append(
-                f'<a href="https://instagram.com/{ig_handle}" target="_blank" title="@{ig_handle}" '
-                f'onclick="event.stopPropagation()">📷</a>'
-            )
-        if obj.website:
-            links.append(
-                f'<a href="{obj.website}" target="_blank" title="{obj.website}" '
-                f'onclick="event.stopPropagation()">🌐</a>'
-            )
-        return mark_safe(" ".join(links)) if links else "-"
+        blocks = [_render_contact_block(c, send_url) for c in contacts]
+        return mark_safe('<div style="display: flex; flex-direction: column; gap: 6px;">' + "".join(blocks) + "</div>")
 
     @admin.display(description="Status")
     def display_status(self, obj: models.Lead) -> str:

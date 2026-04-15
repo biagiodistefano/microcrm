@@ -9,7 +9,18 @@ from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseS
 from ninja_extra.searching import Searching, searching
 
 from leads import service
-from leads.models import Action, City, EmailDraft, EmailSent, EmailTemplate, Lead, LeadType, ResearchJob, Tag
+from leads.models import (
+    Action,
+    City,
+    Contact,
+    EmailDraft,
+    EmailSent,
+    EmailTemplate,
+    Lead,
+    LeadType,
+    ResearchJob,
+    Tag,
+)
 from leads.schema import (
     ActionFilterSchema,
     ActionIn,
@@ -18,6 +29,10 @@ from leads.schema import (
     CityFilterSchema,
     CityIn,
     CitySchema,
+    ContactFilterSchema,
+    ContactIn,
+    ContactPatch,
+    ContactSchema,
     EmailDraftFilterSchema,
     EmailDraftIn,
     EmailDraftPatch,
@@ -49,11 +64,23 @@ class LeadController(ControllerBase):
 
     def get_queryset(self) -> QuerySet[Lead]:
         """Get base queryset."""
-        return Lead.objects.select_related("city", "lead_type").prefetch_related("tags")
+        return Lead.objects.select_related("city", "lead_type").prefetch_related("tags", "contacts")
 
     @route.get("/", response=PaginatedResponseSchema[LeadSchema])
     @paginate(PageNumberPaginationExtra, page_size=20)
-    @searching(Searching, search_fields=["name", "email", "company", "notes", "telegram", "instagram", "website"])
+    @searching(
+        Searching,
+        search_fields=[
+            "name",
+            "company",
+            "notes",
+            "contacts__email",
+            "contacts__telegram",
+            "contacts__instagram",
+            "contacts__website",
+            "contacts__phone",
+        ],
+    )
     def list_leads(
         self,
         filters: LeadFilterSchema = Query(...),  # type: ignore[type-arg]
@@ -316,6 +343,68 @@ class ActionController(ControllerBase):
         action = get_object_or_404(Action, id=action_id)
         action.delete()
         return 204, None
+
+
+@api_controller("/contacts", tags=["Contacts"])
+class ContactController(ControllerBase):
+    """Contact CRUD controller for per-lead contacts."""
+
+    @route.get("/", response=PaginatedResponseSchema[ContactSchema])
+    @paginate(PageNumberPaginationExtra, page_size=50)
+    @searching(Searching, search_fields=["name", "role", "email", "phone", "telegram", "instagram", "website"])
+    def list_contacts(
+        self,
+        filters: ContactFilterSchema = Query(...),  # type: ignore[type-arg]
+    ) -> QuerySet[Contact]:
+        """List contacts with filtering, searching, and pagination.
+
+        Filter options:
+        - lead_id: Filter by lead ID
+        - is_primary: Filter to only primary / non-primary contacts
+        """
+        return filters.filter(Contact.objects.select_related("lead").all())
+
+    @route.get("/{contact_id}", response=ContactSchema)
+    def get_contact(self, contact_id: int) -> Contact:
+        """Get a single contact by ID."""
+        return get_object_or_404(Contact, id=contact_id)
+
+    @route.post("/", response={201: ContactSchema})
+    def create_contact(self, data: ContactIn) -> tuple[int, Contact]:
+        """Create a new contact for a lead.
+
+        If `is_primary=true`, any existing primary contact on the lead is
+        demoted to non-primary atomically.
+        """
+        return 201, service.create_contact(data)
+
+    @route.put("/{contact_id}", response=ContactSchema)
+    def update_contact(self, contact_id: int, data: ContactIn) -> Contact:
+        """Update a contact (full replacement)."""
+        contact = get_object_or_404(Contact, id=contact_id)
+        return service.update_contact(contact, data)
+
+    @route.patch("/{contact_id}", response=ContactSchema)
+    def patch_contact(self, contact_id: int, data: ContactPatch) -> Contact:
+        """Partially update a contact."""
+        contact = get_object_or_404(Contact, id=contact_id)
+        return service.patch_contact(contact, data)
+
+    @route.delete("/{contact_id}", response={204: None})
+    def delete_contact(self, contact_id: int) -> tuple[int, None]:
+        """Delete a contact."""
+        contact = get_object_or_404(Contact, id=contact_id)
+        contact.delete()
+        return 204, None
+
+    @route.post("/{contact_id}/set-primary", response=ContactSchema)
+    def set_primary(self, contact_id: int) -> Contact:
+        """Mark this contact as primary for its lead.
+
+        Demotes any existing primary contact on the same lead atomically.
+        """
+        contact = get_object_or_404(Contact, id=contact_id)
+        return service.set_primary_contact(contact)
 
 
 @api_controller("/research-jobs", tags=["Research"])

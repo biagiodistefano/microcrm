@@ -254,33 +254,49 @@ class TestLeadAdminDisplayMethods:
         result = lead_admin.display_company_type(lead)
         assert result == "-"
 
-    def test_display_email_with_email(self, lead_admin: LeadAdmin, lead: models.Lead) -> None:
-        result = lead_admin.display_email(lead)
+    def test_display_contacts_with_primary(self, lead_admin: LeadAdmin, lead: models.Lead) -> None:
+        models.Contact.objects.create(
+            lead=lead,
+            name="Alice",
+            role="booker",
+            email="alice@example.com",
+            telegram="@alice",
+            is_primary=True,
+        )
+        result = lead_admin.display_contacts(lead)
+        assert "Alice" in result
+        assert "★ primary" in result
+        assert "(booker)" in result
+        assert "alice@example.com" in result
+        assert "t.me/alice" in result
         assert f"/admin/leads/lead/{lead.id}/send-email/" in result
-        assert lead.email in result
-        assert "Send email to" in result
 
-    def test_display_email_without_email(self, lead_admin: LeadAdmin) -> None:
-        lead = models.Lead(name="No email", email="")
-        result = lead_admin.display_email(lead)
+    def test_display_contacts_stacks_multiple(self, lead_admin: LeadAdmin, lead: models.Lead) -> None:
+        models.Contact.objects.create(lead=lead, name="Alice", email="a@x.com", is_primary=True)
+        models.Contact.objects.create(lead=lead, name="Bob", email="b@x.com", is_primary=False)
+        result = lead_admin.display_contacts(lead)
+        assert "Alice" in result
+        assert "Bob" in result
+        assert "a@x.com" in result
+        assert "b@x.com" in result
+
+    def test_display_contacts_none(self, lead_admin: LeadAdmin) -> None:
+        lead = models.Lead.objects.create(name="No contacts")
+        result = lead_admin.display_contacts(lead)
         assert result == "-"
 
-    def test_display_socials_all(self, lead_admin: LeadAdmin) -> None:
-        lead = models.Lead(
-            name="Social Lead",
+    def test_display_contacts_socials_only(self, lead_admin: LeadAdmin, lead: models.Lead) -> None:
+        models.Contact.objects.create(
+            lead=lead,
+            name="Socials",
             telegram="@test",
             instagram="test_ig",
             website="https://example.com",
         )
-        result = lead_admin.display_socials(lead)
+        result = lead_admin.display_contacts(lead)
         assert "t.me/test" in result
         assert "instagram.com/test_ig" in result
         assert "https://example.com" in result
-
-    def test_display_socials_none(self, lead_admin: LeadAdmin) -> None:
-        lead = models.Lead(name="No socials")
-        result = lead_admin.display_socials(lead)
-        assert result == "-"
 
     def test_display_status(self, lead_admin: LeadAdmin, lead: models.Lead) -> None:
         lead.status = models.Lead.Status.CONTACTED

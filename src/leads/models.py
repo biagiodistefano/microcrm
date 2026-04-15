@@ -127,6 +127,49 @@ class Lead(models.Model):
         return self.name
 
 
+class Contact(models.Model):
+    """Contact model: a person/endpoint attached to a Lead."""
+
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="contacts")
+    name = models.CharField(max_length=255, help_text="Person name or label (e.g., 'Primary', 'Booker')")
+    role = models.CharField(max_length=100, blank=True, help_text="Role at the organization (e.g., 'booker')")
+
+    email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=50, blank=True)
+    telegram = models.CharField(max_length=255, blank=True, help_text="Telegram username or link")
+    instagram = models.CharField(max_length=255, blank=True, help_text="Instagram handle")
+    website = models.URLField(blank=True)
+
+    notes = models.TextField(blank=True)
+    is_primary = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = HistoricalRecords()
+
+    class Meta:
+        ordering = ["-is_primary", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["lead"],
+                condition=models.Q(is_primary=True),
+                name="leads_contact_unique_primary_per_lead",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["email"], name="leads_contact_email"),
+            models.Index(fields=["phone"], name="leads_contact_phone"),
+            models.Index(fields=["instagram"], name="leads_contact_instagram"),
+            models.Index(fields=["telegram"], name="leads_contact_telegram"),
+            models.Index(fields=["website"], name="leads_contact_website"),
+        ]
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        return f"{self.name} ({self.lead.name})"
+
+
 class Action(models.Model):
     """Action model for lead follow-up tasks."""
 
@@ -247,6 +290,14 @@ class EmailSent(models.Model):
         FAILED = "failed", "Failed"
 
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="emails_sent")
+    contact = models.ForeignKey(
+        "Contact",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="emails_sent",
+        help_text="Contact this email was addressed to (if known)",
+    )
     template = models.ForeignKey(
         EmailTemplate, on_delete=models.SET_NULL, null=True, blank=True, related_name="emails_sent"
     )
@@ -290,6 +341,14 @@ class EmailDraft(models.Model):
         Lead,
         on_delete=models.CASCADE,
         related_name="email_drafts",
+    )
+    contact = models.ForeignKey(
+        "Contact",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="email_drafts",
+        help_text="Contact this draft is addressed to (if known)",
     )
     template = models.ForeignKey(
         EmailTemplate,

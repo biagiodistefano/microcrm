@@ -209,8 +209,6 @@
         {% if lead.company %}<p><strong>Company:</strong> {{ lead.company }}</p>{% endif %}
         {% if lead.lead_type %}<p><strong>Type:</strong> {{ lead.lead_type }}</p>{% endif %}
         {% if lead.city %}<p><strong>City:</strong> {{ lead.city }}</p>{% endif %}
-        {% if lead.email %}<p><strong>Email:</strong> {{ lead.email }}</p>{% endif %}
-        {% if lead.phone %}<p><strong>Phone:</strong> {{ lead.phone }}</p>{% endif %}
         {% if lead.tags.all %}
         <p><strong>Tags:</strong>
             {% for tag in lead.tags.all %}
@@ -218,22 +216,30 @@
             {% endfor %}
         </p>
         {% endif %}
-        {% if lead.telegram or lead.instagram or lead.website %}
-        <p><strong>Links:</strong>
-            {% if lead.telegram %}
-                {% if "http" in lead.telegram %}
-                <a href="{{ lead.telegram }}" target="_blank" title="{{ lead.telegram }}" style="margin-right: 0.75rem;">📱 Telegram</a>
-                {% else %}
-                <a href="https://t.me/{{ lead.telegram|cut:'@' }}" target="_blank" title="{{ lead.telegram }}" style="margin-right: 0.75rem;">📱 Telegram</a>
+        {% if lead.contacts.all %}
+        <div style="margin-top: 0.75rem;">
+            <strong>Contacts:</strong>
+            {% for contact in lead.contacts.all %}
+            <div style="border-left: 2px solid #e5e7eb; padding: 0.25rem 0.5rem; margin: 0.25rem 0;">
+                <div>
+                    <strong>{{ contact.name }}</strong>
+                    {% if contact.is_primary %}<span style="color: #10b981; font-size: 0.75rem;">★ primary</span>{% endif %}
+                    {% if contact.role %}<span style="color: #666; font-size: 0.85rem;">({{ contact.role }})</span>{% endif %}
+                </div>
+                {% if contact.email %}<div style="font-size: 0.85rem;">📧 {{ contact.email }}</div>{% endif %}
+                {% if contact.phone %}<div style="font-size: 0.85rem;">📞 {{ contact.phone }}</div>{% endif %}
+                {% if contact.telegram %}
+                    {% if "http" in contact.telegram %}
+                    <div style="font-size: 0.85rem;">📱 <a href="{{ contact.telegram }}" target="_blank">{{ contact.telegram }}</a></div>
+                    {% else %}
+                    <div style="font-size: 0.85rem;">📱 <a href="https://t.me/{{ contact.telegram|cut:'@' }}" target="_blank">{{ contact.telegram }}</a></div>
+                    {% endif %}
                 {% endif %}
-            {% endif %}
-            {% if lead.instagram %}
-                <a href="https://instagram.com/{{ lead.instagram|cut:'@' }}" target="_blank" title="@{{ lead.instagram|cut:'@' }}" style="margin-right: 0.75rem;">📷 Instagram</a>
-            {% endif %}
-            {% if lead.website %}
-                <a href="{{ lead.website }}" target="_blank" title="{{ lead.website }}">🌐 Website</a>
-            {% endif %}
-        </p>
+                {% if contact.instagram %}<div style="font-size: 0.85rem;">📷 <a href="https://instagram.com/{{ contact.instagram|cut:'@' }}" target="_blank">@{{ contact.instagram|cut:'@' }}</a></div>{% endif %}
+                {% if contact.website %}<div style="font-size: 0.85rem;">🌐 <a href="{{ contact.website }}" target="_blank">{{ contact.website }}</a></div>{% endif %}
+            </div>
+            {% endfor %}
+        </div>
         {% endif %}
         {% if lead.notes %}
         <div class="notes-section">

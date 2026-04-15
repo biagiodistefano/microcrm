@@ -12,7 +12,7 @@ from google import genai
 from ninja.errors import HttpError
 from pydantic import BaseModel
 
-from leads.models import City, Lead, LeadType, ResearchJob, ResearchPromptConfig, Tag
+from leads.models import City, Contact, Lead, LeadType, ResearchJob, ResearchPromptConfig, Tag
 
 logger = logging.getLogger(__name__)
 
@@ -385,50 +385,93 @@ def _parse_research_result(text_output: str) -> ResearchResult:
         raise ValueError(f"Could not parse research result after trying all strategies: {e}") from e
 
 
+CONTACT_METHOD_FIELDS: tuple[str, ...] = ("email", "phone", "instagram", "telegram", "website")
+
+
+_TEMP_MAP = {
+    Temperature.cold: Lead.Temperature.COLD,
+    Temperature.warm: Lead.Temperature.WARM,
+    Temperature.hot: Lead.Temperature.HOT,
+}
+
+
+def _resolve_lead_type(name: str) -> LeadType | None:
+    """Resolve a lead type by name via the service layer, or None if empty."""
+    if not name:
+        return None
+    from leads.service import get_or_create_lead_type
+
+    return get_or_create_lead_type(name)
+
+
+def _merge_lead_fields(lead: Lead, data: ResearchLead, lead_type: LeadType | None) -> None:
+    """Fill blanks on the existing lead from research data (dual-write to Lead.*)."""
+    for field in ("company", "notes", *CONTACT_METHOD_FIELDS):
+        if not getattr(lead, field) and getattr(data, field):
+            setattr(lead, field, getattr(data, field))
+    if not lead.lead_type and lead_type:
+        lead.lead_type = lead_type
+    lead.save()
+
+
+def _merge_contact_fields(contact: Contact, data: ResearchLead) -> None:
+    """Fill blanks on the matched contact from research data."""
+    for field in CONTACT_METHOD_FIELDS:
+        if not getattr(contact, field) and getattr(data, field):
+            setattr(contact, field, getattr(data, field))
+    contact.save()
+
+
+def _create_lead_with_primary(data: ResearchLead, city: City, lead_type: LeadType | None) -> Lead:
+    """Create a fresh lead + its primary contact mirroring the contact fields."""
+    lead = Lead.objects.create(
+        name=data.name,
+        company=data.company,
+        email=data.email,
+        phone=data.phone,
+        instagram=data.instagram,
+        telegram=data.telegram,
+        website=data.website,
+        notes=data.notes,
+        city=city,
+        lead_type=lead_type,
+        temperature=_TEMP_MAP.get(data.temperature, Lead.Temperature.COLD),
+        source="Gemini Deep Research",
+    )
+    Contact.objects.create(
+        lead=lead,
+        name="Primary",
+        is_primary=True,
+        email=data.email,
+        phone=data.phone,
+        telegram=data.telegram,
+        instagram=data.instagram,
+        website=data.website,
+    )
+    return lead
+
+
 def _create_lead_from_research(data: ResearchLead, city: City) -> Lead | None:
-    """Create or update a lead from research data (fill blanks only)."""
-    # Try to find existing lead
-    lead = _find_existing_lead(data, city)
+    """Create or update a lead from research data.
 
-    # Get or create lead type
-    lead_type = None
-    if data.lead_type:
-        lead_type, _ = LeadType.objects.get_or_create(name__iexact=data.lead_type, defaults={"name": data.lead_type})
-
-    # Map temperature
-    temp_map = {
-        Temperature.cold: Lead.Temperature.COLD,
-        Temperature.warm: Lead.Temperature.WARM,
-        Temperature.hot: Lead.Temperature.HOT,
-    }
-    temperature = temp_map.get(data.temperature, Lead.Temperature.COLD)
+    Dedup + merge behavior:
+    - If a lead is found by matching contact method (any of email/phone/ig/tg/web),
+      we fill blanks on the lead AND on the matched Contact.
+    - If a lead is found by name+city but the incoming contact method is new,
+      we add a NEW non-primary Contact to capture it (multi-contact merge).
+    """
+    matched_contact, lead = _find_existing_lead_with_contact(data, city)
+    lead_type = _resolve_lead_type(data.lead_type)
 
     if lead:
-        # Merge: fill blanks only
-        for field in ("company", "email", "phone", "instagram", "telegram", "website", "notes"):
-            if not getattr(lead, field) and getattr(data, field):
-                setattr(lead, field, getattr(data, field))
-        if not lead.lead_type and lead_type:
-            lead.lead_type = lead_type
-        lead.save()
+        _merge_lead_fields(lead, data, lead_type)
+        if matched_contact:
+            _merge_contact_fields(matched_contact, data)
+        else:
+            _attach_secondary_contact(lead, data)
     else:
-        # Create new lead
-        lead = Lead.objects.create(
-            name=data.name,
-            company=data.company,
-            email=data.email,
-            phone=data.phone,
-            instagram=data.instagram,
-            telegram=data.telegram,
-            website=data.website,
-            notes=data.notes,
-            city=city,
-            lead_type=lead_type,
-            temperature=temperature,
-            source="Gemini Deep Research",
-        )
+        lead = _create_lead_with_primary(data, city, lead_type)
 
-    # Add tags (additive)
     for tag_name in data.tags:
         tag, _ = Tag.objects.get_or_create(name__iexact=tag_name, defaults={"name": tag_name})
         lead.tags.add(tag)
@@ -436,19 +479,74 @@ def _create_lead_from_research(data: ResearchLead, city: City) -> Lead | None:
     return lead
 
 
-def _find_existing_lead(data: ResearchLead, city: City) -> Lead | None:
-    """Find existing lead by email, phone, instagram, telegram, website, or name+city."""
-    # Check unique contact fields for existing leads
-    contact_fields = ["email", "phone", "instagram", "telegram", "website"]
-    for field in contact_fields:
-        value = getattr(data, field)
-        if value:
-            lead = Lead.objects.filter(**{f"{field}__iexact": value}).first()
-            if lead:
-                return lead
+def _attach_secondary_contact(lead: Lead, data: ResearchLead) -> None:
+    """Attach a new non-primary Contact to the lead, OR merge into the primary instead.
 
-    # Name + city match as fallback
-    return Lead.objects.filter(name__iexact=data.name, city=city).first()
+    We merge into the primary when it already shares a contact method with the incoming
+    data. This avoids creating a duplicate Contact when dedup hit via the legacy Lead.*
+    fallback (which fires during the dual-write window on leads created outside the
+    service layer) — the primary Contact typically already carries the same method, so a
+    separate secondary would be redundant. A genuinely new method still gets a new Contact
+    (Q6-A: name+city match with a NEW contact method attaches a secondary).
+    """
+    if not any(getattr(data, f) for f in CONTACT_METHOD_FIELDS):
+        return
+
+    primary = lead.contacts.filter(is_primary=True).first()
+    if primary and _primary_shares_any_method(primary, data):
+        _merge_contact_fields(primary, data)
+        return
+
+    Contact.objects.create(
+        lead=lead,
+        name=data.name or "Contact",
+        is_primary=False,
+        email=data.email,
+        phone=data.phone,
+        telegram=data.telegram,
+        instagram=data.instagram,
+        website=data.website,
+    )
+
+
+def _primary_shares_any_method(primary: Contact, data: ResearchLead) -> bool:
+    """True if the primary Contact already has a matching value for any contact method."""
+    for field in CONTACT_METHOD_FIELDS:
+        incoming = (getattr(data, field) or "").strip().lower()
+        existing = (getattr(primary, field) or "").strip().lower()
+        if incoming and existing and incoming == existing:
+            return True
+    return False
+
+
+def _find_existing_lead_with_contact(data: ResearchLead, city: City) -> tuple[Contact | None, Lead | None]:
+    """Find an existing lead by Contact match, falling back to name+city.
+
+    Returns:
+        Tuple of (matched_contact, lead). matched_contact is the Contact whose
+        method matched, or None if only name+city matched (caller should decide
+        whether to add a secondary Contact).
+    """
+    for field in CONTACT_METHOD_FIELDS:
+        value = getattr(data, field)
+        if not value:
+            continue
+        contact = Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value}).first()
+        if contact:
+            return contact, contact.lead
+        # Dual-write fallback: also check legacy Lead.* columns until Phase 4.
+        lead_match = Lead.objects.filter(**{f"{field}__iexact": value}).first()
+        if lead_match:
+            return None, lead_match
+
+    lead = Lead.objects.filter(name__iexact=data.name, city=city).first()
+    return None, lead
+
+
+def _find_existing_lead(data: ResearchLead, city: City) -> Lead | None:
+    """Find existing lead by contact method or name+city (thin wrapper for callers)."""
+    _, lead = _find_existing_lead_with_contact(data, city)
+    return lead
 
 
 # --- Email Tasks ---
@@ -463,6 +561,7 @@ def send_email_task(
     bcc: list[str] | None = None,
     template_id: int | None = None,
     user_id: int | None = None,
+    contact_id: int | None = None,
 ) -> dict[str, t.Any]:
     """Send an email to a lead in the background.
 
@@ -474,6 +573,7 @@ def send_email_task(
         bcc: Optional list of BCC email addresses
         template_id: Optional EmailTemplate ID (for reference)
         user_id: Optional User ID (for Gmail OAuth credential lookup)
+        contact_id: Optional Contact ID (for EmailSent.contact reference)
 
     Returns:
         Dict with email_sent_id and status
@@ -486,6 +586,7 @@ def send_email_task(
     lead = Lead.objects.get(id=lead_id)
     template = EmailTemplate.objects.get(id=template_id) if template_id else None
     user = User.objects.filter(id=user_id).first() if user_id else None
+    contact = Contact.objects.filter(id=contact_id, lead=lead).first() if contact_id else None
 
     try:
         email_sent = send_email_to_lead(
@@ -496,6 +597,7 @@ def send_email_task(
             bcc=bcc,
             template=template,
             user=user,
+            contact=contact,
         )
         return {"email_sent_id": email_sent.id, "status": "sent"}
     except ValueError as e:
