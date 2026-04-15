@@ -366,19 +366,32 @@ def leads_import(
     rprint(f"\n[bold]Done![/bold] Created: {success}, Failed: {failed}")
 
 
-def _send_email_dry_run(
+def _resolve_default_to(lead: dict, contact_id: int | None) -> str:
+    """Resolve the default 'to' address for dry-run preview."""
+    if contact_id:
+        for c in lead.get("contacts", []):
+            if c.get("id") == contact_id:
+                return c.get("email") or "N/A"
+    primary = lead.get("primary_contact") or {}
+    return primary.get("email") or lead.get("email") or "N/A"
+
+
+def _send_email_dry_run(  # noqa: PLR0913
     lead_id: int,
     template_id: int | None,
     subject: str | None,
     body: str | None,
     to: list[str],
     bcc: list[str],
+    contact_id: int | None,
 ) -> None:
     """Show what email would be sent without actually sending."""
     rprint("[yellow]DRY-RUN MODE[/yellow] - Email will NOT be sent. Use --send to actually send.\n")
     lead = api.get(f"/leads/{lead_id}")
     rprint(f"[bold]Lead:[/bold] {lead['name']} (#{lead['id']})")
-    rprint(f"[bold]To:[/bold] {', '.join(to) if to else lead.get('email', 'N/A')}")
+    if contact_id:
+        rprint(f"[bold]Contact:[/bold] #{contact_id}")
+    rprint(f"[bold]To:[/bold] {', '.join(to) if to else _resolve_default_to(lead, contact_id)}")
     if bcc:
         rprint(f"[bold]BCC:[/bold] {', '.join(bcc)}")
     if template_id:
@@ -391,7 +404,7 @@ def _send_email_dry_run(
         rprint(f"[bold]Body:[/bold]\n{body}")
 
 
-def _send_email_execute(
+def _send_email_execute(  # noqa: PLR0913
     lead_id: int,
     template_id: int | None,
     subject: str | None,
@@ -400,6 +413,7 @@ def _send_email_execute(
     bcc: list[str],
     background: bool,
     raw: bool,
+    contact_id: int | None,
 ) -> None:
     """Actually send the email via API."""
     data: dict[str, t.Any] = {"send_in_background": background}
@@ -413,6 +427,8 @@ def _send_email_execute(
         data["to"] = to
     if bcc:
         data["bcc"] = bcc
+    if contact_id:
+        data["contact_id"] = contact_id
 
     result = api.post(f"/leads/{lead_id}/send-email", data)
     if raw:
@@ -422,13 +438,16 @@ def _send_email_execute(
 
 
 @leads_app.command("send-email")
-def leads_send_email(
+def leads_send_email(  # noqa: PLR0913
     lead_id: int = typer.Argument(..., help="Lead ID"),
     template_id: int | None = typer.Option(None, "--template", "-t", help="Email template ID"),
     subject: str | None = typer.Option(None, "--subject", "-s", help="Email subject (if no template)"),
     body: str | None = typer.Option(None, "--body", "-b", help="Email body (if no template)"),
     to: list[str] = typer.Option([], "--to", help="Override recipient (can specify multiple)"),
     bcc: list[str] = typer.Option([], "--bcc", help="BCC recipients (can specify multiple)"),
+    contact_id: int | None = typer.Option(
+        None, "--contact-id", "-c", help="Contact to email (defaults to lead's primary contact)"
+    ),
     background: bool = typer.Option(False, "--background", help="Send via background task"),
     send: bool = typer.Option(False, "--send", help="Actually send the email (default is dry-run)"),
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
@@ -444,9 +463,9 @@ def leads_send_email(
 
     try:
         if send:
-            _send_email_execute(lead_id, template_id, subject, body, to, bcc, background, raw)
+            _send_email_execute(lead_id, template_id, subject, body, to, bcc, background, raw, contact_id)
         else:
-            _send_email_dry_run(lead_id, template_id, subject, body, to, bcc)
+            _send_email_dry_run(lead_id, template_id, subject, body, to, bcc, contact_id)
     except httpx.HTTPStatusError as e:
         handle_error(e)
 
@@ -600,6 +619,161 @@ def tags_list(
                 output_table(result, ["id", "name"], title="Tags")
             else:
                 rprint("[yellow]No tags found[/yellow]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+# --- Contacts Commands ---
+contacts_app = typer.Typer(help="Manage per-lead contacts", no_args_is_help=True)
+app.add_typer(contacts_app, name="contacts")
+
+
+@contacts_app.command("list")
+def contacts_list(
+    lead_id: int | None = typer.Option(None, "--lead", "-l", help="Filter by lead ID"),
+    is_primary: bool | None = typer.Option(None, "--primary/--non-primary", help="Filter by primary status"),
+    page: int = typer.Option(1, "--page", "-p", help="Page number"),
+    page_size: int = typer.Option(50, "--page-size", "-s", help="Items per page"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """List contacts."""
+    try:
+        params: dict[str, t.Any] = {"page": page, "page_size": page_size}
+        if lead_id is not None:
+            params["lead_id"] = lead_id
+        if is_primary is not None:
+            params["is_primary"] = is_primary
+        result = api.get("/contacts/", params)
+        if raw:
+            output_json(result, raw=True)
+        else:
+            items = result.get("results", []) if isinstance(result, dict) else result
+            if items:
+                output_table(
+                    items,
+                    ["id", "lead_id", "name", "role", "is_primary", "email", "phone"],
+                    title="Contacts",
+                )
+            else:
+                rprint("[yellow]No contacts found[/yellow]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@contacts_app.command("get")
+def contacts_get(
+    contact_id: int = typer.Argument(..., help="Contact ID"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Get a single contact."""
+    try:
+        result = api.get(f"/contacts/{contact_id}")
+        output_json(result, raw=raw)
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@contacts_app.command("create")
+def contacts_create(  # noqa: PLR0913
+    lead_id: int = typer.Option(..., "--lead", "-l", help="Lead ID this contact belongs to"),
+    name: str = typer.Option(..., "--name", "-n", help="Person name or label"),
+    role: str = typer.Option("", "--role", help="Role (e.g., 'booker')"),
+    email: str = typer.Option("", "--email"),
+    phone: str = typer.Option("", "--phone"),
+    telegram: str = typer.Option("", "--telegram"),
+    instagram: str = typer.Option("", "--instagram"),
+    website: str = typer.Option("", "--website"),
+    notes: str = typer.Option("", "--notes"),
+    is_primary: bool = typer.Option(False, "--primary", help="Mark this contact as primary"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Create a new contact for a lead."""
+    try:
+        data = {
+            "lead_id": lead_id,
+            "name": name,
+            "role": role,
+            "email": email,
+            "phone": phone,
+            "telegram": telegram,
+            "instagram": instagram,
+            "website": website,
+            "notes": notes,
+            "is_primary": is_primary,
+        }
+        result = api.post("/contacts/", data)
+        output_json(result, raw=raw)
+        if not raw:
+            rprint(f"[green]Created contact #{result['id']}[/green]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@contacts_app.command("update")
+def contacts_update(  # noqa: PLR0913
+    contact_id: int = typer.Argument(..., help="Contact ID"),
+    name: str | None = typer.Option(None, "--name", "-n"),
+    role: str | None = typer.Option(None, "--role"),
+    email: str | None = typer.Option(None, "--email"),
+    phone: str | None = typer.Option(None, "--phone"),
+    telegram: str | None = typer.Option(None, "--telegram"),
+    instagram: str | None = typer.Option(None, "--instagram"),
+    website: str | None = typer.Option(None, "--website"),
+    notes: str | None = typer.Option(None, "--notes"),
+    is_primary: bool | None = typer.Option(None, "--primary/--non-primary"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Patch a contact (only provided fields are updated)."""
+    try:
+        data = {
+            k: v
+            for k, v in {
+                "name": name,
+                "role": role,
+                "email": email,
+                "phone": phone,
+                "telegram": telegram,
+                "instagram": instagram,
+                "website": website,
+                "notes": notes,
+                "is_primary": is_primary,
+            }.items()
+            if v is not None
+        }
+        result = api.patch(f"/contacts/{contact_id}", data)
+        output_json(result, raw=raw)
+        if not raw:
+            rprint(f"[green]Updated contact #{contact_id}[/green]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@contacts_app.command("delete")
+def contacts_delete(
+    contact_id: int = typer.Argument(..., help="Contact ID"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Delete a contact."""
+    if not force and not typer.confirm(f"Delete contact #{contact_id}?"):
+        raise typer.Abort()
+    try:
+        api.delete(f"/contacts/{contact_id}")
+        rprint(f"[green]Deleted contact #{contact_id}[/green]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@contacts_app.command("set-primary")
+def contacts_set_primary(
+    contact_id: int = typer.Argument(..., help="Contact ID"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Mark a contact as primary for its lead."""
+    try:
+        result = api.post(f"/contacts/{contact_id}/set-primary", {})
+        output_json(result, raw=raw)
+        if not raw:
+            rprint(f"[green]Set contact #{contact_id} as primary[/green]")
     except httpx.HTTPStatusError as e:
         handle_error(e)
 

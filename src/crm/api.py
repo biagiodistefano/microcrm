@@ -9,6 +9,7 @@ from ninja_extra import NinjaExtraAPI
 from leads.controllers import (
     ActionController,
     CityController,
+    ContactController,
     EmailDraftController,
     EmailSentController,
     EmailTemplateController,
@@ -66,6 +67,7 @@ def health(request: HttpRequest) -> HealthResponse:
 
 api.register_controllers(
     LeadController,
+    ContactController,
     ActionController,
     CityController,
     LeadTypeController,

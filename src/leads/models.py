@@ -290,6 +290,14 @@ class EmailSent(models.Model):
         FAILED = "failed", "Failed"
 
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="emails_sent")
+    contact = models.ForeignKey(
+        "Contact",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="emails_sent",
+        help_text="Contact this email was addressed to (if known)",
+    )
     template = models.ForeignKey(
         EmailTemplate, on_delete=models.SET_NULL, null=True, blank=True, related_name="emails_sent"
     )
@@ -333,6 +341,14 @@ class EmailDraft(models.Model):
         Lead,
         on_delete=models.CASCADE,
         related_name="email_drafts",
+    )
+    contact = models.ForeignKey(
+        "Contact",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="email_drafts",
+        help_text="Contact this draft is addressed to (if known)",
     )
     template = models.ForeignKey(
         EmailTemplate,
