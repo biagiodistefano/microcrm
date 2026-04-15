@@ -227,6 +227,17 @@ class TagAdmin(ModelAdmin):  # type: ignore[misc]
         return obj._lead_count  # type: ignore[attr-defined, no-any-return]
 
 
+@admin.register(models.Contact)
+class ContactAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
+    """Admin for Contact model (Phase 1: verification only)."""
+
+    list_display = ["name", "lead", "role", "is_primary", "email", "phone"]
+    list_filter = ["is_primary"]
+    search_fields = ["name", "role", "email", "phone", "telegram", "instagram", "website", "lead__name"]
+    autocomplete_fields = ["lead"]
+    ordering = ["lead__name", "-is_primary", "name"]
+
+
 class ActionInline(TabularInline):  # type: ignore[misc]
     """Inline for actions on Lead admin."""
 
