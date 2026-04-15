@@ -396,10 +396,12 @@ _TEMP_MAP = {
 
 
 def _resolve_lead_type(name: str) -> LeadType | None:
+    """Resolve a lead type by name via the service layer, or None if empty."""
     if not name:
         return None
-    lt, _ = LeadType.objects.get_or_create(name__iexact=name, defaults={"name": name})
-    return lt
+    from leads.service import get_or_create_lead_type
+
+    return get_or_create_lead_type(name)
 
 
 def _merge_lead_fields(lead: Lead, data: ResearchLead, lead_type: LeadType | None) -> None:
@@ -478,9 +480,23 @@ def _create_lead_from_research(data: ResearchLead, city: City) -> Lead | None:
 
 
 def _attach_secondary_contact(lead: Lead, data: ResearchLead) -> None:
-    """Attach a new non-primary Contact to the lead if any contact method is present."""
+    """Attach a new non-primary Contact to the lead, OR merge into the primary instead.
+
+    We merge into the primary when it already shares a contact method with the incoming
+    data. This avoids creating a duplicate Contact when dedup hit via the legacy Lead.*
+    fallback (which fires during the dual-write window on leads created outside the
+    service layer) — the primary Contact typically already carries the same method, so a
+    separate secondary would be redundant. A genuinely new method still gets a new Contact
+    (Q6-A: name+city match with a NEW contact method attaches a secondary).
+    """
     if not any(getattr(data, f) for f in CONTACT_METHOD_FIELDS):
         return
+
+    primary = lead.contacts.filter(is_primary=True).first()
+    if primary and _primary_shares_any_method(primary, data):
+        _merge_contact_fields(primary, data)
+        return
+
     Contact.objects.create(
         lead=lead,
         name=data.name or "Contact",
@@ -491,6 +507,16 @@ def _attach_secondary_contact(lead: Lead, data: ResearchLead) -> None:
         instagram=data.instagram,
         website=data.website,
     )
+
+
+def _primary_shares_any_method(primary: Contact, data: ResearchLead) -> bool:
+    """True if the primary Contact already has a matching value for any contact method."""
+    for field in CONTACT_METHOD_FIELDS:
+        incoming = (getattr(data, field) or "").strip().lower()
+        existing = (getattr(primary, field) or "").strip().lower()
+        if incoming and existing and incoming == existing:
+            return True
+    return False
 
 
 def _find_existing_lead_with_contact(data: ResearchLead, city: City) -> tuple[Contact | None, Lead | None]:

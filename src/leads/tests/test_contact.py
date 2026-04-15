@@ -155,6 +155,75 @@ def test_research_namecity_match_with_new_email_creates_secondary_contact(city: 
 
 
 @pytest.mark.django_db
+def test_research_legacy_lead_match_does_not_duplicate_primary_contact(city: City) -> None:
+    """When dedup hits the legacy Lead.email fallback and the primary already has that
+    email (backfilled), we merge into the primary instead of creating a duplicate secondary.
+    """
+    lead = Lead.objects.create(name="DupGuard", city=city, email="dup@x.com")
+    primary = Contact.objects.create(lead=lead, name="Primary", email="dup@x.com", is_primary=True)
+
+    # The Contact lookup misses first (no phone); then the legacy Lead.email lookup hits.
+    data = ResearchLead(name="DupGuard", email="dup@x.com", phone="+42")
+    _create_lead_from_research(data, city)
+
+    contacts = list(lead.contacts.all())
+    assert len(contacts) == 1, "should not create a duplicate Contact when legacy fallback matches"
+    primary.refresh_from_db()
+    assert primary.phone == "+42"
+
+
+@pytest.mark.django_db
+def test_has_email_filter_multi_contact_mixed(lead: Lead) -> None:
+    """HasEmailFilter must not misclassify a lead that has one contact with email and
+    another without — Django's multi-valued exclude evaluates per-row, so the old Q
+    approach would let this through on the "no" branch. Exists subquery fixes it.
+    """
+    from django.test import RequestFactory
+
+    from leads.admin import HasEmailFilter, LeadAdmin
+
+    # Clear any backfill-era Contact
+    lead.contacts.all().delete()
+    Contact.objects.create(lead=lead, name="Empty", email="", is_primary=True)
+    Contact.objects.create(lead=lead, name="With Email", email="real@x.com")
+
+    factory = RequestFactory()
+    from django.contrib.admin.sites import AdminSite
+
+    admin_instance = LeadAdmin(Lead, AdminSite())
+
+    req_yes = factory.get("/admin/", {"has_email": "yes"})
+    f_yes = HasEmailFilter(req_yes, req_yes.GET.copy(), Lead, admin_instance)
+    assert lead in f_yes.queryset(req_yes, Lead.objects.all())
+
+    req_no = factory.get("/admin/", {"has_email": "no"})
+    f_no = HasEmailFilter(req_no, req_no.GET.copy(), Lead, admin_instance)
+    assert lead not in f_no.queryset(req_no, Lead.objects.all())
+
+
+@pytest.mark.django_db
+def test_display_contacts_escapes_injected_html(lead: Lead) -> None:
+    """Contact fields containing HTML must be escaped in the admin list-view cell."""
+    from django.contrib.admin.sites import AdminSite
+
+    from leads.admin import LeadAdmin
+
+    Contact.objects.create(
+        lead=lead,
+        name="<script>alert(1)</script>",
+        role="<b>boss</b>",
+        phone="<img src=x>",
+        is_primary=True,
+    )
+    admin_instance = LeadAdmin(Lead, AdminSite())
+    out = admin_instance.display_contacts(lead)
+    assert "<script>alert(1)</script>" not in out
+    assert "&lt;script&gt;" in out
+    assert "<b>boss</b>" not in out
+    assert "&lt;b&gt;boss&lt;/b&gt;" in out
+
+
+@pytest.mark.django_db
 def test_research_merge_fills_blanks_on_matched_contact(city: City) -> None:
     """Matching by Contact email fills blanks on that Contact, not just the Lead."""
     lead = Lead.objects.create(name="Merge", city=city, email="m@x.com")

@@ -80,22 +80,26 @@ class HasContactFieldFilter(admin.SimpleListFilter):
         ]
 
     def queryset(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> QuerySet[t.Any]:
-        """Filter leads by whether any contact has the field populated.
+        """Filter leads by whether any contact (or the legacy Lead column) has the field populated.
 
-        During the Phase 2/3 dual-write window we OR with the legacy Lead.* column
-        so old rows without a backfilled Contact are still classified correctly.
-        Phase 4 removes the Lead.* fallback when the columns are dropped.
+        Uses an EXISTS subquery on Contact rather than a multi-valued reverse-FK join +
+        exclude/filter, because Django's multi-valued exclude evaluates per-row and would
+        misclassify leads that have some contacts with the field filled and others without.
+        The legacy Lead.* column is OR'd in for the Phase 2/3 dual-write window; Phase 4
+        drops it when the columns are removed.
         """
-        from django.db.models import Q
+        from django.db.models import Exists, OuterRef, Q
 
-        contact_lookup = f"contacts__{self.field_name}"
-        legacy_lookup = self.field_name
-        has_value = Q(**{f"{contact_lookup}__gt": ""}) | Q(**{f"{legacy_lookup}__gt": ""})
-        if self.value() == "yes":
-            return queryset.filter(has_value).distinct()
-        if self.value() == "no":
-            return queryset.exclude(has_value).distinct()
-        return queryset
+        value = self.value()
+        if value not in ("yes", "no"):
+            return queryset
+
+        has_contact_value = Exists(models.Contact.objects.filter(lead=OuterRef("pk"), **{f"{self.field_name}__gt": ""}))
+        has_legacy_value = Q(**{f"{self.field_name}__gt": ""})
+        combined = has_contact_value | has_legacy_value
+        if value == "yes":
+            return queryset.filter(combined)
+        return queryset.filter(~combined)
 
 
 class HasEmailFilter(HasContactFieldFilter):
@@ -136,47 +140,62 @@ def _render_contact_block(contact: "models.Contact", send_url: str) -> str:
     Used by LeadAdmin.display_contacts to show all methods of all contacts in one
     list-view cell. Each method is its own line so multiple contacts read clearly.
     """
-    header_bits: list[str] = []
     name = contact.name or "Contact"
+    header = format_html("<strong>{}</strong>", name)
     if contact.is_primary:
-        header_bits.append(f'<strong>{name}</strong> <span style="color:#10b981; font-size:0.75em;">★ primary</span>')
-    else:
-        header_bits.append(f"<strong>{name}</strong>")
+        header = format_html('{} <span style="color:#10b981; font-size:0.75em;">★ primary</span>', header)
     if contact.role:
-        header_bits.append(f'<span style="color:#666; font-size:0.85em;">({contact.role})</span>')
+        header = format_html('{} <span style="color:#666; font-size:0.85em;">({})</span>', header, contact.role)
 
-    lines: list[str] = ['<div style="font-size: 0.85em;">' + " ".join(header_bits) + "</div>"]
+    parts: list[str] = [format_html('<div style="font-size: 0.85em;">{}</div>', header)]
 
     if contact.email:
-        lines.append(
-            f'<div style="font-size: 0.8em;">📧 '
-            f'<a href="{send_url}" onclick="event.stopPropagation()">{contact.email}</a></div>'
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">📧 <a href="{}" onclick="event.stopPropagation()">{}</a></div>',
+                send_url,
+                contact.email,
+            )
         )
     if contact.phone:
-        lines.append(f'<div style="font-size: 0.8em;">📞 {contact.phone}</div>')
+        parts.append(format_html('<div style="font-size: 0.8em;">📞 {}</div>', contact.phone))
     if contact.telegram:
         tg_url = (
             contact.telegram if contact.telegram.startswith("http") else f"https://t.me/{contact.telegram.lstrip('@')}"
         )
-        lines.append(
-            f'<div style="font-size: 0.8em;">📱 '
-            f'<a href="{tg_url}" target="_blank" onclick="event.stopPropagation()">{contact.telegram}</a></div>'
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">📱 '
+                '<a href="{}" target="_blank" onclick="event.stopPropagation()">{}</a></div>',
+                tg_url,
+                contact.telegram,
+            )
         )
     if contact.instagram:
         ig = contact.instagram.lstrip("@")
-        lines.append(
-            f'<div style="font-size: 0.8em;">📷 '
-            f'<a href="https://instagram.com/{ig}" target="_blank" '
-            f'onclick="event.stopPropagation()">@{ig}</a></div>'
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">📷 '
+                '<a href="https://instagram.com/{}" target="_blank" '
+                'onclick="event.stopPropagation()">@{}</a></div>',
+                ig,
+                ig,
+            )
         )
     if contact.website:
-        lines.append(
-            f'<div style="font-size: 0.8em;">🌐 '
-            f'<a href="{contact.website}" target="_blank" '
-            f'onclick="event.stopPropagation()">{contact.website}</a></div>'
+        parts.append(
+            format_html(
+                '<div style="font-size: 0.8em;">🌐 '
+                '<a href="{}" target="_blank" onclick="event.stopPropagation()">{}</a></div>',
+                contact.website,
+                contact.website,
+            )
         )
 
-    return '<div style="border-left: 2px solid #e5e7eb; padding-left: 6px;">' + "".join(lines) + "</div>"
+    return format_html(
+        '<div style="border-left: 2px solid #e5e7eb; padding-left: 6px;">{}</div>',
+        mark_safe("".join(parts)),
+    )
 
 
 class CityLinkMixin:
