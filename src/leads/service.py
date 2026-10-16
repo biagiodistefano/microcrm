@@ -1583,6 +1583,27 @@ def _contact_keys(contact: Contact) -> set[tuple[str, str]]:
     return keys
 
 
+def _normal(field: str, value: str) -> str:
+    """Normalise a contact field value for comparison."""
+    value = value.strip().lower()
+    if field == "phone":
+        return "".join(ch for ch in value if ch.isdigit())
+    if field == "telegram":
+        return re.sub(r"^(https?://)?(www\.)?(t\.me|telegram\.me)/", "", value).strip("/").lstrip("@")
+    if field == "instagram":
+        return value.lstrip("@")
+    return value
+
+
+def _contacts_conflict(kept: Contact, other: Contact) -> bool:
+    """True when both contacts have a non-empty value for a field and the normalised values differ."""
+    for field in ("name", "role", "email", "phone", "telegram", "instagram", "website", "notes"):
+        a, b = _normal(field, getattr(kept, field)), _normal(field, getattr(other, field))
+        if a and b and a != b:
+            return True
+    return False
+
+
 def _absorb_contact(kept: Contact, duplicate: Contact) -> None:
     """Fill blanks on ``kept`` from ``duplicate`` and repoint emails/drafts that referenced the duplicate."""
     changed = False
@@ -1607,7 +1628,7 @@ def _move_contacts(primary: Lead, others: t.Sequence[Lead]) -> None:
         for contact in list(other.contacts.order_by("-is_primary", "pk")):
             keys = _contact_keys(contact)
             twin = next((c for c in existing if keys & _contact_keys(c)), None) if keys else None
-            if twin is not None:
+            if twin is not None and not _contacts_conflict(twin, contact):
                 _absorb_contact(twin, contact)
                 continue
             if contact.is_primary and has_primary:

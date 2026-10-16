@@ -242,8 +242,8 @@ class TestMovesAndFks:
         primary = make("P")
         keep = Contact.objects.create(lead=primary, name="Primary", email="Same@X.org", is_primary=True)
         other = make("O")
-        dup_email = Contact.objects.create(lead=other, name="Dup", email="same@x.org", phone="123", is_primary=True)
-        dup_ig = Contact.objects.create(lead=other, name="IG", instagram="@Club")
+        dup_email = Contact.objects.create(lead=other, name="Primary", email="same@x.org", phone="123", is_primary=True)
+        dup_ig = Contact.objects.create(lead=other, name="IG existing", instagram="@Club")
         Contact.objects.create(lead=primary, name="IG existing", instagram="club")
         fresh = Contact.objects.create(lead=other, name="Fresh", email="new@x.org")
         draft = EmailDraft.objects.create(lead=other, subject="s", body="b", to=["x@y.co"], contact=dup_email)
@@ -275,7 +275,7 @@ class TestMovesAndFks:
         primary = make("P")
         a, b = make("A", age_days=2), make("B", age_days=1)
         Contact.objects.create(lead=a, name="x", email="dup@x.org")
-        Contact.objects.create(lead=b, name="y", email="DUP@x.org")
+        Contact.objects.create(lead=b, name="x", email="DUP@x.org")
         assert service.merge_leads(primary, [a, b]).contacts.count() == 1
 
 
@@ -594,8 +594,8 @@ class TestExtraDedupAndPrimary:
         primary = make("P")
         Contact.objects.create(lead=primary, name="K", phone="+49 151 234 5678", telegram="@club")
         other = make("O")
-        Contact.objects.create(lead=other, name="d1", phone="0049-151-234-5678"[2:].replace("49-", "+49 ", 1))
-        Contact.objects.create(lead=other, name="d2", telegram="https://t.me/Club")
+        Contact.objects.create(lead=other, name="K", phone="0049-151-234-5678"[2:].replace("49-", "+49 ", 1))
+        Contact.objects.create(lead=other, name="K", telegram="https://t.me/Club")
         Contact.objects.create(lead=other, name="short", phone="12345")
         Contact.objects.create(lead=other, name="short2", phone="12345")
         merged = service.merge_leads(primary, [other])
@@ -618,3 +618,24 @@ def test_tag_pill_is_escaped(admin_client: Client) -> None:
     html = admin_client.get(reverse("admin:leads_lead_changelist")).content.decode()
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+
+
+def test_shared_phone_different_person_is_not_absorbed() -> None:
+    primary = make("P")
+    venue = Contact.objects.create(lead=primary, name="Venue", email="info@a.de", phone="+49301234567", is_primary=True)
+    other = make("O")
+    booker = Contact.objects.create(
+        lead=other, name="Booker", email="booking@b.de", phone="+49 30 1234567", instagram="bookerig", is_primary=True
+    )
+    sent = EmailSent.objects.create(
+        lead=other, contact=booker, from_email="a@b.co", to=["booking@b.de"], subject="s", body="b"
+    )
+    merged = service.merge_leads(primary, [other])
+    venue.refresh_from_db()
+    booker.refresh_from_db()
+    sent.refresh_from_db()
+    assert merged.contacts.count() == 2
+    assert booker.lead == merged and booker.email == "booking@b.de" and booker.instagram == "bookerig"
+    assert not booker.is_primary and venue.is_primary
+    assert venue.instagram == "" and venue.email == "info@a.de"
+    assert sent.contact == booker and sent.lead == merged
