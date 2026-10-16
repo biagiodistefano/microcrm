@@ -390,7 +390,7 @@
         // Helper: build signature block with separator
         function getSignatureBlock() {
             if (!signatureHtml) return '';
-            return '<p><br></p><p>--</p>' + signatureHtml;
+            return '<p><br></p><p>--</p><div data-revel-signature>' + signatureHtml + '</div>';
         }
 
         // Load existing body content into Quill

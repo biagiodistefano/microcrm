@@ -617,22 +617,6 @@ class OutreachMessagePatch(Schema):
     batch: str | None = None
 
 
-class SendEmailIn(Schema):
-    """Input schema for sending an email to a lead."""
-
-    contact_id: int | None = Field(
-        default=None, description="Contact to email (defaults to the lead's primary contact)"
-    )
-    template_id: int | None = Field(default=None, description="Template ID to use (optional)")
-    subject: str | None = Field(default=None, description="Email subject (required if no template)")
-    body: str | None = Field(default=None, description="Email body (required if no template)")
-    to: list[str] | None = Field(
-        default=None, description="Override recipient(s), defaults to the primary contact's email"
-    )
-    bcc: list[str] = Field(default_factory=list, description="BCC recipients")
-    send_in_background: bool = Field(default=False, description="Send via Celery background task")
-
-
 class LeadTagsIn(Schema):
     """Bulk tag add/remove input."""
 
@@ -753,18 +737,10 @@ class OutreachMessageFilterSchema(FilterSchema):
     lead_id: t.Annotated[int | None, FilterLookup(q="lead_id")] = None
 
 
-class SendEmailResponse(Schema):
-    """Response for send email action."""
-
-    email_id: int
-    status: str
-    message: str = ""
-
-
 class DraftSendIn(Schema):
     """Batch send request."""
 
-    draft_ids: list[int] = Field(min_length=1, max_length=50)
+    draft_ids: list[int] = Field(min_length=1, max_length=10)
 
 
 class DraftSendResultSchema(Schema):

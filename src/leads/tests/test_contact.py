@@ -7,8 +7,8 @@ from django.db import IntegrityError, transaction
 from django.test import Client
 
 from leads import service
-from leads.models import City, Contact, EmailTemplate, Lead, LeadType
-from leads.schema import ContactIn, ContactPatch, LeadIn, LeadPatch, SendEmailIn
+from leads.models import City, Contact, Lead, LeadType
+from leads.schema import ContactIn, ContactPatch, LeadIn, LeadPatch
 from leads.tasks import ResearchLead, _create_lead_from_research, _find_existing_lead
 
 # -----------------------------------------------------------------------------
@@ -287,40 +287,6 @@ def test_contact_controller_crud_flow(api_client: Client, lead: Lead) -> None:
     resp = api_client.delete(f"/api/contacts/{contact_id}")
     assert resp.status_code == 204
     assert not Contact.objects.filter(pk=contact_id).exists()
-
-
-# -----------------------------------------------------------------------------
-# Send-email contact_id override
-# -----------------------------------------------------------------------------
-
-
-@pytest.mark.django_db
-def test_send_email_uses_primary_contact_email_by_default(lead: Lead, email_template: EmailTemplate) -> None:
-    """When 'to' is omitted, recipient defaults to the primary contact's email."""
-    Contact.objects.create(lead=lead, name="Primary", email="primary@x.com", is_primary=True)
-    Contact.objects.create(lead=lead, name="Other", email="other@x.com")
-
-    result = service.send_email_to_lead_api(lead, SendEmailIn(template_id=email_template.pk))
-    from leads.models import EmailSent
-
-    sent = EmailSent.objects.get(pk=result["email_id"])
-    assert sent.to == ["primary@x.com"]
-    assert sent.contact is not None
-    assert sent.contact.email == "primary@x.com"
-
-
-@pytest.mark.django_db
-def test_send_email_with_explicit_contact_id(lead: Lead, email_template: EmailTemplate) -> None:
-    """Passing contact_id routes to that contact's email and records it on EmailSent."""
-    Contact.objects.create(lead=lead, name="Primary", email="primary@x.com", is_primary=True)
-    other = Contact.objects.create(lead=lead, name="Other", email="other@x.com")
-
-    result = service.send_email_to_lead_api(lead, SendEmailIn(template_id=email_template.pk, contact_id=other.pk))
-    from leads.models import EmailSent
-
-    sent = EmailSent.objects.get(pk=result["email_id"])
-    assert sent.to == ["other@x.com"]
-    assert sent.contact_id == other.pk
 
 
 # -----------------------------------------------------------------------------

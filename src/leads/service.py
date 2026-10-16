@@ -47,7 +47,6 @@ from leads.schema import (
     OutreachMessageIn,
     OutreachMessagePatch,
     ResearchJobIn,
-    SendEmailIn,
 )
 
 CONTACT_FIELDS: tuple[str, ...] = ("email", "phone", "telegram", "instagram", "website")
@@ -59,7 +58,9 @@ MERGED_IDENTITY_FIELDS: tuple[str, ...] = LEAD_ONLY_MATCH_FIELDS
 LEAD_FILL_FIELDS: tuple[str, ...] = ("company", "notes", "source", "external_ref", *LEAD_MATCH_FIELDS)
 FOLLOW_UP_DAYS = 4
 SIGNATURE_SEPARATOR = "<p><br></p><p>--</p>"
-MAX_SEND_BATCH = 50
+SIGNATURE_MARKER = "data-revel-signature"
+MAX_SEND_BATCH = 10
+STALE_PENDING_MINUTES = 15
 
 logger = logging.getLogger(__name__)
 
@@ -814,19 +815,22 @@ def _plain(html: str) -> str:
 
 
 def append_signature(body: str, user: User | None) -> str:
-    """Append the user's EmailSignature to an outgoing HTML body (``<p>--</p>`` separator, as the admin editor does).
+    """Append the user's EmailSignature to an outgoing HTML body, wrapped in a ``data-revel-signature`` marker.
 
-    No-op without a user, when the user has no (or an empty) signature, or when the body already carries it
-    (the admin editor pre-fills the signature client-side, so this stays idempotent).
+    No-op without a user or with an empty signature. Idempotent: skipped when the marker is already in the
+    body (the admin editor pre-fills the same marked block); legacy bodies without the marker fall back to
+    comparing the signature's text with tags and whitespace stripped.
     """
     if not isinstance(user, User):
         return body
     signature = EmailSignature.objects.filter(user=user).values_list("body", flat=True).first()
     if not signature or not signature.strip():
         return body
+    if SIGNATURE_MARKER in body:
+        return body
     if _plain(signature) and _plain(signature) in _plain(body):
         return body
-    return f"{body}{SIGNATURE_SEPARATOR}{signature}"
+    return f"{body}{SIGNATURE_SEPARATOR}<div {SIGNATURE_MARKER}>{signature}</div>"
 
 
 def send_email_to_lead(  # noqa: PLR0913
@@ -937,99 +941,6 @@ def patch_email_template(template: EmailTemplate, data: EmailTemplatePatch) -> E
         setattr(template, field, value)
     template.save()
     return template
-
-
-def _resolve_send_contact(lead: Lead, contact_id: int | None) -> Contact | None:
-    """Resolve the contact to use when sending: explicit id > primary > None."""
-    if contact_id:
-        try:
-            return Contact.objects.get(id=contact_id, lead=lead)
-        except Contact.DoesNotExist:
-            raise HttpError(404, f"Contact with id {contact_id} not found for this lead")
-    return lead.contacts.filter(is_primary=True).first()
-
-
-def _resolve_send_subject_body(
-    lead: Lead, data: SendEmailIn, contact: Contact | None
-) -> tuple[EmailTemplate | None, str, str]:
-    """Resolve the (template, subject, body) tuple for an outgoing email."""
-    if data.template_id:
-        try:
-            template = EmailTemplate.objects.get(id=data.template_id)
-        except EmailTemplate.DoesNotExist:
-            raise HttpError(404, f"Template with id {data.template_id} not found")
-        subject, body = render_email_template(template, lead, contact=contact)
-        return template, subject, body
-    if data.subject and data.body:
-        return None, data.subject, data.body
-    raise HttpError(400, "Either template_id or both subject and body are required")
-
-
-def _resolve_send_recipients(explicit_to: list[str] | None, contact: Contact | None, lead: Lead) -> list[str]:
-    """Determine recipient list: explicit > contact email > lead email."""
-    if explicit_to:
-        return explicit_to
-    if contact and contact.email:
-        return [contact.email]
-    if lead.email:
-        return [lead.email]
-    raise HttpError(400, "No recipient email address (lead has no contact email and 'to' not provided)")
-
-
-def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
-    """Send an email to a lead via API.
-
-    This is the API wrapper that handles template rendering and background sending.
-
-    Args:
-        lead: The Lead to send email to
-        data: SendEmailIn with template_id or subject/body
-
-    Returns:
-        Dict with email_id, status, and message
-
-    Raises:
-        HttpError: 400 if validation fails
-    """
-    from leads.tasks import send_email_task
-
-    refuse_if_do_not_contact(lead)
-    contact = _resolve_send_contact(lead, data.contact_id)
-    template, subject, body = _resolve_send_subject_body(lead, data, contact)
-    to = _resolve_send_recipients(data.to, contact, lead)
-    bcc = data.bcc or []
-
-    # Send in background or synchronously
-    if data.send_in_background:
-        send_email_task.delay(
-            lead_id=lead.id,
-            subject=subject,
-            body=body,
-            to=to,
-            bcc=bcc,
-            template_id=template.id if template else None,
-            contact_id=contact.id if contact else None,
-        )
-        return {
-            "email_id": 0,  # Not yet created
-            "status": EmailSent.Status.PENDING,
-            "message": "Email queued for background sending",
-        }
-    else:
-        email_sent = send_email_to_lead(
-            lead=lead,
-            subject=subject,
-            body=body,
-            to=to,
-            bcc=bcc,
-            template=template,
-            contact=contact,
-        )
-        return {
-            "email_id": email_sent.id,
-            "status": email_sent.status,
-            "message": "Email sent successfully",
-        }
 
 
 # --- Email Draft Functions ---
@@ -1774,9 +1685,11 @@ def already_contacted_reasons(lead: Lead) -> list[str]:
 
 
 def sends_today(user: User) -> int:
-    """Emails this user sent (successfully) since local midnight."""
+    """Emails this user has sent or has in flight (pending) since local midnight."""
     start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
-    return EmailSent.objects.filter(sent_by=user, status=EmailSent.Status.SENT, sent_at__gte=start).count()
+    return EmailSent.objects.filter(
+        sent_by=user, status__in=[EmailSent.Status.PENDING, EmailSent.Status.SENT], created_at__gte=start
+    ).count()
 
 
 def draft_send_refusals(draft: EmailDraft, user: User) -> list[str]:
@@ -1798,6 +1711,15 @@ def draft_send_refusals(draft: EmailDraft, user: User) -> list[str]:
     if placeholders:
         reasons.append(f"unreplaced placeholders: {', '.join(placeholders)}")
     return reasons
+
+
+def is_stale_pending(email_sent: EmailSent) -> bool:
+    """A PENDING send older than STALE_PENDING_MINUTES: the outcome is unknown (check Gmail's Sent folder).
+
+    It still blocks resending to the lead until someone resolves it.
+    """
+    age = timezone.now() - email_sent.created_at
+    return email_sent.status == EmailSent.Status.PENDING and age > timedelta(minutes=STALE_PENDING_MINUTES)
 
 
 @dataclasses.dataclass
@@ -1827,36 +1749,84 @@ def _apply_sent_effects(lead: Lead, email_sent: EmailSent) -> None:
     )
 
 
-def send_draft_as_user(draft_id: int, user: User) -> DraftSendResult:
-    """Send one assigned draft as ``user`` (their Gmail, their signature) if every safety rule passes.
+def _reserve_send(draft_id: int, user: User, result: DraftSendResult) -> tuple[EmailDraft, EmailSent] | None:
+    """Phase A (short transaction): re-check every rule under locks and record a PENDING EmailSent.
 
-    Never partially sends: all checks run first (under a lock on the lead, so a concurrent send cannot double
-    up); a Gmail failure leaves the draft in place and is reported as a reason (a failed EmailSent is kept).
-    On success: EmailSent recorded, draft deleted, lead -> contacted with last_contact today, and a
-    "Follow up email" action due in 4 days.
+    Locks the user's GmailConnection (serialises their daily-limit check) and the lead. The PENDING row counts as
+    "already contacted" and towards the daily limit, so a retry or concurrent send is refused until it resolves.
     """
-    result = DraftSendResult(draft_id=draft_id)
-    limit = int(settings.EMAIL_SEND_DAILY_LIMIT_PER_USER)
     with transaction.atomic():
+        connection = GmailConnection.objects.select_for_update().filter(user=user).first()
         draft = EmailDraft.objects.select_related("lead", "assigned_to").filter(pk=draft_id).first()
         if draft is None:
             result.reasons.append("draft not found")
-            return result
-        lead = Lead.objects.select_for_update().get(pk=draft.lead_id)
-        draft.lead = lead
+            return None
+        draft.lead = Lead.objects.select_for_update().get(pk=draft.lead_id)
         reasons = draft_send_refusals(draft, user)
-        if sends_today(user) >= limit:
-            reasons.append(f"daily send limit reached ({limit} per user per day)")
+        if connection is not None and sends_today(user) >= int(settings.EMAIL_SEND_DAILY_LIMIT_PER_USER):
+            reasons.append(f"daily send limit reached ({settings.EMAIL_SEND_DAILY_LIMIT_PER_USER} per user per day)")
         if reasons:
             result.reasons = reasons
-            return result
-        try:
-            email_sent = send_email_draft(draft, user=user)
-        except Exception as e:  # noqa: BLE001 - reported to the caller; the failed EmailSent row is kept
-            logger.warning("Token send of draft %s failed: %s", draft_id, e)
-            result.reasons.append(f"send failed: {e}")
-            return result
-        _apply_sent_effects(lead, email_sent)
+            return None
+        email_sent = EmailSent.objects.create(
+            lead=draft.lead,
+            contact=draft.contact,
+            template=draft.template,
+            from_email=_resolve_from_email(_get_gmail_connection(user)),
+            to=draft.to,
+            bcc=draft.bcc or [],
+            subject=draft.subject,
+            body=append_signature(draft.body, user),
+            status=EmailSent.Status.PENDING,
+            sent_by=user,
+        )
+        return draft, email_sent
+
+
+def send_draft_as_user(draft_id: int, user: User) -> DraftSendResult:
+    """Send one assigned draft as ``user`` (their Gmail, their signature) if every safety rule passes.
+
+    Three steps so a Gmail call never runs inside a transaction and a retry can never double-send:
+    (A) reserve: re-check the rules under locks and commit a PENDING EmailSent; (B) call Gmail with no
+    transaction open; (C) commit the outcome: SENT plus lead updates, follow-up action and draft deletion, or
+    FAILED with the error (the draft stays and a FAILED row does not block a retry). If the process dies
+    between B and C the row stays PENDING, which keeps blocking resends until someone checks Gmail's Sent folder.
+    """
+    from leads.gmail import get_gmail_credentials, send_email_via_gmail
+
+    result = DraftSendResult(draft_id=draft_id)
+    reserved = _reserve_send(draft_id, user, result)
+    if reserved is None:
+        return result
+    draft, email_sent = reserved
+
+    try:
+        connection = _get_gmail_connection(user)
+        if connection is None:
+            raise ValueError("Gmail account not connected")
+        credentials = get_gmail_credentials(connection)
+        send_email_via_gmail(
+            credentials,
+            email_sent.from_email,
+            email_sent.to,
+            email_sent.subject,
+            email_sent.body,
+            email_sent.bcc or None,
+        )
+    except Exception as e:  # noqa: BLE001 - reported to the caller
+        logger.warning("Token send of draft %s failed: %s", draft_id, e)
+        email_sent.status = EmailSent.Status.FAILED
+        email_sent.error_message = str(e)
+        email_sent.save(update_fields=["status", "error_message"])
+        result.reasons.append(f"send failed: {e}")
+        return result
+
+    with transaction.atomic():
+        email_sent.status = EmailSent.Status.SENT
+        email_sent.sent_at = timezone.now()
+        email_sent.save(update_fields=["status", "sent_at"])
+        EmailDraft.objects.filter(pk=draft.pk).delete()
+        _apply_sent_effects(Lead.objects.select_for_update().get(pk=draft.lead_id), email_sent)
     result.sent = True
     result.email_sent_id = email_sent.pk
     return result
@@ -1864,7 +1834,4 @@ def send_draft_as_user(draft_id: int, user: User) -> DraftSendResult:
 
 def send_drafts_as_user(draft_ids: list[int], user: User) -> list[DraftSendResult]:
     """Send several drafts as ``user``; each is judged independently (order preserved, duplicates collapsed)."""
-    results: list[DraftSendResult] = []
-    for draft_id in dict.fromkeys(draft_ids):
-        results.append(send_draft_as_user(draft_id, user))
-    return results
+    return [send_draft_as_user(draft_id, user) for draft_id in dict.fromkeys(draft_ids)]

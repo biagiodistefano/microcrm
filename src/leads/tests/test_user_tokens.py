@@ -43,14 +43,16 @@ def prod_auth(settings: t.Any) -> None:
 
 @pytest.fixture
 def me() -> User:
-    user = User.objects.create_user("biagio", email="biagio@letsrevel.io", password="x", first_name="Biagio")
+    user = User.objects.create_user(
+        "biagio", email="biagio@letsrevel.io", password="x", first_name="Biagio", is_staff=True
+    )
     GmailConnection.objects.create(user=user, email="biagio@letsrevel.io", refresh_token="r")
     return user
 
 
 @pytest.fixture
 def other() -> User:
-    return User.objects.create_user("weronika", email="weronika@letsrevel.io", password="x")
+    return User.objects.create_user("weronika", email="weronika@letsrevel.io", password="x", is_staff=True)
 
 
 @pytest.fixture
@@ -94,26 +96,26 @@ def test_only_hash_is_stored(me: User) -> None:
 
 
 def test_bearer_authenticates_and_stamps_last_used(prod_auth: None, api_client: Client, token: str) -> None:
-    assert api_client.get("/api/tags/").status_code == 401
-    r = api_client.get("/api/tags/", **bearer(token))
+    assert api_client.get("/api/leads/").status_code == 401
+    r = api_client.get("/api/leads/", **bearer(token))
     assert r.status_code == 200
     assert UserApiToken.objects.get().last_used_at is not None
 
 
 def test_bad_or_revoked_token_rejected(prod_auth: None, api_client: Client, me: User, token: str) -> None:
-    assert api_client.get("/api/tags/", **bearer("mcrm_nope")).status_code == 401
+    assert api_client.get("/api/leads/", **bearer("mcrm_nope")).status_code == 401
     UserApiToken.objects.get().revoke()
-    assert api_client.get("/api/tags/", **bearer(token)).status_code == 401
+    assert api_client.get("/api/leads/", **bearer(token)).status_code == 401
 
 
 def test_inactive_user_token_rejected(prod_auth: None, api_client: Client, me: User, token: str) -> None:
     User.objects.filter(pk=me.pk).update(is_active=False)
-    assert api_client.get("/api/tags/", **bearer(token)).status_code == 401
+    assert api_client.get("/api/leads/", **bearer(token)).status_code == 401
 
 
 def test_shared_api_key_still_works(prod_auth: None, api_client: Client) -> None:
-    assert api_client.get("/api/tags/", HTTP_X_API_KEY="shared-key").status_code == 200
-    assert api_client.get("/api/tags/", HTTP_X_API_KEY="wrong").status_code == 401
+    assert api_client.get("/api/leads/", HTTP_X_API_KEY="shared-key").status_code == 200
+    assert api_client.get("/api/leads/", HTTP_X_API_KEY="wrong").status_code == 401
 
 
 def test_api_key_alone_gets_403_on_send(prod_auth: None, api_client: Client, me: User, lead: Lead) -> None:
@@ -149,10 +151,10 @@ def _admin_request(user: User) -> t.Any:
 
 def test_admin_create_shows_plaintext_once_and_scopes(me: User, other: User) -> None:
     madmin = UserApiTokenAdmin(UserApiToken, django_admin.site)
+    me.is_staff = False
     req = _admin_request(me)
     assert madmin.has_add_permission(req) is False  # not staff
-    User.objects.filter(pk__in=[me.pk, other.pk]).update(is_staff=True)
-    me.refresh_from_db()
+    me.is_staff = True
     req = _admin_request(me)
     assert madmin.has_add_permission(req)
     obj = UserApiToken(name="laptop")
@@ -197,7 +199,7 @@ def test_send_single_success(
     gmail.assert_called_once()
     _, from_email, to, subject, body, _bcc = gmail.call_args.args
     assert from_email == "Biagio <biagio@letsrevel.io>" and to == ["org@example.com"] and subject == "Hello"
-    assert body == "<p>Hi there</p><p><br></p><p>--</p><b>Biagio</b>"
+    assert body == "<p>Hi there</p><p><br></p><p>--</p><div data-revel-signature><b>Biagio</b></div>"
 
     sent = EmailSent.objects.get()
     assert sent.pk == data["email_sent_id"] and sent.status == EmailSent.Status.SENT and sent.sent_by == me
@@ -253,7 +255,7 @@ def test_signature_noop_without_signature_or_user(me: User) -> None:
 def test_admin_send_path_appends_signature_too(me: User, lead: Lead, gmail: MagicMock) -> None:
     EmailSignature.objects.create(user=me, body="<i>sig</i>")
     service.send_email_to_lead(lead, "S", "<p>b</p>", ["org@example.com"], user=me)
-    assert gmail.call_args.args[4] == "<p>b</p><p><br></p><p>--</p><i>sig</i>"
+    assert gmail.call_args.args[4] == "<p>b</p><p><br></p><p>--</p><div data-revel-signature><i>sig</i></div>"
 
 
 # --- sending: refusals ---
@@ -276,11 +278,11 @@ def test_refuse_unassigned(me: User, lead: Lead, gmail: MagicMock) -> None:
     _refused(me, make_draft(lead, None), gmail, "not assigned to you")
 
 
-def test_single_endpoint_other_users_draft_is_403(
+def test_single_endpoint_other_users_draft_is_404(
     prod_auth: None, api_client: Client, other: User, token: str, lead: Lead
 ) -> None:
     draft = make_draft(lead, other)
-    assert api_client.post(f"/api/email-drafts/{draft.pk}/send", **bearer(token)).status_code == 403
+    assert api_client.post(f"/api/email-drafts/{draft.pk}/send", **bearer(token)).status_code == 404
     assert api_client.post("/api/email-drafts/99999/send", **bearer(token)).status_code == 404
 
 
@@ -394,7 +396,7 @@ def test_daily_limit_is_per_user_and_per_day(settings: t.Any, me: User, other: U
         lead=Lead.objects.create(name="Old"), from_email="a@b.c", to=["x@y.z"], subject="s", body="b",
         status="sent", sent_by=me, sent_at=timezone.now() - timedelta(days=1, hours=1),
     )  # fmt: skip
-    assert old.pk
+    EmailSent.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=1, hours=1))
     assert service.send_draft_as_user(make_draft(Lead.objects.create(name="A"), me).pk, me).sent  # yesterday ignored
     assert not service.send_draft_as_user(make_draft(Lead.objects.create(name="B"), me).pk, me).sent
     assert service.send_draft_as_user(make_draft(Lead.objects.create(name="C"), other).pk, other).sent
@@ -443,3 +445,219 @@ def test_contact_check_reasons(api_client: Client, lead: Lead) -> None:
 
 def test_contact_check_404(api_client: Client) -> None:
     assert api_client.get("/api/messages/99999/contact-check").status_code == 404
+
+
+# --- review round: scope, staff, PENDING flow, non-atomic, marker, batch cap ---
+
+
+def test_send_email_endpoint_removed(prod_auth: None, api_client: Client, token: str, lead: Lead) -> None:
+    body = {"subject": "s", "body": "b", "to": ["x@y.z"]}
+    for headers in ({"HTTP_X_API_KEY": "shared-key"}, bearer(token)):
+        r = api_client.post(f"/api/leads/{lead.pk}/send-email", body, content_type=JSON, **headers)
+        assert r.status_code in (403, 404, 405)
+
+
+def test_no_other_api_send_path() -> None:
+    from crm.api import api
+
+    senders = sorted(p for p in api.get_openapi_schema()["paths"] if "send" in p)
+    assert senders == ["/api/email-drafts/send", "/api/email-drafts/{draft_id}/send"]
+
+
+def test_non_staff_token_fails(prod_auth: None, api_client: Client, me: User, token: str) -> None:
+    assert api_client.get("/api/leads/", **bearer(token)).status_code == 200
+    User.objects.filter(pk=me.pk).update(is_staff=False)
+    assert api_client.get("/api/leads/", **bearer(token)).status_code == 401
+    lead = Lead.objects.create(name="Z")
+    assert api_client.delete(f"/api/leads/{lead.pk}", **bearer(token)).status_code == 401
+    assert Lead.objects.filter(pk=lead.pk).exists()
+
+
+def test_token_scope(prod_auth: None, api_client: Client, token: str, lead: Lead) -> None:
+    h = bearer(token)
+    for path in ("/api/leads/", f"/api/leads/{lead.pk}", "/api/email-drafts/", "/api/messages/"):
+        assert api_client.get(path, **h).status_code == 200, path
+    for method, path in (
+        ("get", "/api/tags/"),
+        ("get", "/api/email-templates/"),
+        ("get", "/api/emails-sent/"),
+        ("delete", f"/api/leads/{lead.pk}"),
+        ("patch", f"/api/leads/{lead.pk}"),
+        ("post", "/api/leads/"),
+        ("post", "/api/leads/merge"),
+        ("post", "/api/email-drafts/"),
+        ("delete", "/api/email-drafts/1"),
+        ("post", "/api/messages/"),
+        ("post", "/api/messages/1/skip"),
+        ("post", "/api/cities/"),
+    ):
+        r = getattr(api_client, method)(path, **h)
+        assert r.status_code == 403, (method, path, r.status_code)
+        assert "use the API key" in r.json()["detail"]
+    assert Lead.objects.filter(pk=lead.pk).exists()
+
+
+def test_scope_allows_contact_check_and_mark_sent(prod_auth: None, api_client: Client, token: str, lead: Lead) -> None:
+    msg = make_msg(lead)
+    assert api_client.get(f"/api/messages/{msg.pk}/contact-check", **bearer(token)).status_code == 200
+    assert api_client.post(f"/api/messages/{msg.pk}/mark-sent", **bearer(token)).status_code == 200
+
+
+def test_api_key_still_unrestricted(prod_auth: None, api_client: Client, lead: Lead) -> None:
+    assert api_client.delete(f"/api/leads/{lead.pk}", HTTP_X_API_KEY="shared-key").status_code == 204
+
+
+def test_pending_row_created_before_gmail_and_blocks_retry(me: User, lead: Lead) -> None:
+    draft = make_draft(lead, me)
+    seen: dict[str, t.Any] = {}
+
+    def fake_send(*args: t.Any, **kw: t.Any) -> None:
+        from django.db import connection
+
+        seen["in_atomic"] = connection.in_atomic_block
+        row = EmailSent.objects.get()
+        seen["status"] = row.status
+        # a concurrent/retried send for the same lead is refused while this one is in flight
+        seen["retry"] = service.send_draft_as_user(draft.pk, me)
+
+    with patch("leads.gmail.get_gmail_credentials"), patch("leads.gmail.send_email_via_gmail", side_effect=fake_send):
+        result = service.send_draft_as_user(draft.pk, me)
+    assert result.sent
+    assert seen["status"] == EmailSent.Status.PENDING
+    assert not seen["retry"].sent and any("email was already sent" in r for r in seen["retry"].reasons)
+    assert EmailSent.objects.get().status == EmailSent.Status.SENT
+
+
+def test_stale_pending_still_blocks_and_is_flagged(me: User, lead: Lead, gmail: MagicMock) -> None:
+    row = EmailSent.objects.create(
+        lead=lead, from_email="a@b.c", to=["x@y.z"], subject="s", body="b", status="pending", sent_by=me
+    )
+    assert not service.is_stale_pending(row)
+    EmailSent.objects.filter(pk=row.pk).update(created_at=timezone.now() - timedelta(minutes=16))
+    row.refresh_from_db()
+    assert service.is_stale_pending(row)
+    madmin: t.Any = django_admin.site._registry[EmailSent]
+    assert "outcome unknown" in str(madmin.display_status(row))
+    assert not service.send_draft_as_user(make_draft(lead, me).pk, me).sent
+    gmail.assert_not_called()
+
+
+def test_phase_c_failure_leaves_pending_and_blocks_resend(me: User, lead: Lead) -> None:
+    draft = make_draft(lead, me)
+    with (
+        patch("leads.gmail.get_gmail_credentials"),
+        patch("leads.gmail.send_email_via_gmail") as send,
+        patch.object(service, "_apply_sent_effects", side_effect=RuntimeError("db hiccup")),
+    ):
+        with pytest.raises(RuntimeError):
+            service.send_draft_as_user(draft.pk, me)
+        assert send.call_count == 1
+        assert EmailSent.objects.get().status == EmailSent.Status.PENDING
+        assert EmailDraft.objects.filter(pk=draft.pk).exists()
+        assert not service.send_draft_as_user(draft.pk, me).sent
+        assert send.call_count == 1  # no double send
+
+
+@pytest.mark.django_db(transaction=True)
+def test_batch_failure_midway_does_not_double_send_on_retry(prod_auth: None, me: User, token: str) -> None:
+    from django.db import connection
+
+    ids = [make_draft(Lead.objects.create(name=f"L{i}"), me).pk for i in range(2)]
+    calls = {"n": 0}
+    real = service._apply_sent_effects
+
+    def flaky(lead: Lead, es: EmailSent) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("worker died")
+        real(lead, es)
+
+    c = Client(raise_request_exception=False)
+    old = connection.settings_dict["ATOMIC_REQUESTS"]
+    connection.settings_dict["ATOMIC_REQUESTS"] = True  # as in production
+    try:
+        with (
+            patch("leads.gmail.get_gmail_credentials"),
+            patch("leads.gmail.send_email_via_gmail") as send,
+            patch.object(service, "_apply_sent_effects", flaky),
+        ):
+            r = c.post("/api/email-drafts/send", {"draft_ids": ids}, content_type=JSON, **bearer(token))
+            assert r.status_code == 500 and send.call_count == 2
+            assert EmailSent.objects.filter(status="sent").count() == 1  # first one's commit survived
+            r = c.post("/api/email-drafts/send", {"draft_ids": ids}, content_type=JSON, **bearer(token))
+            assert r.status_code == 200
+            assert send.call_count == 2  # nothing re-sent
+    finally:
+        connection.settings_dict["ATOMIC_REQUESTS"] = old
+
+
+def test_non_atomic_middleware_marks_only_send_views() -> None:
+    from crm.middleware import NonAtomicSendMiddleware
+
+    mw = NonAtomicSendMiddleware(MagicMock())
+    for path, flagged in (
+        ("/api/email-drafts/send", True),
+        ("/api/email-drafts/12/send", True),
+        ("/api/email-drafts/", False),
+        ("/api/leads/", False),
+    ):
+        req = RequestFactory().post(path)
+
+        def view(request: t.Any) -> t.Any: ...
+
+        mw.process_view(req, view, (), {})
+        assert hasattr(view, "_non_atomic_requests") is flagged, path
+
+
+def test_daily_limit_counts_pending(settings: t.Any, me: User, gmail: MagicMock) -> None:
+    settings.EMAIL_SEND_DAILY_LIMIT_PER_USER = 1
+    EmailSent.objects.create(
+        lead=Lead.objects.create(name="P"), from_email="a@b.c", to=["x@y.z"], subject="s", body="b",
+        status="pending", sent_by=me,
+    )  # fmt: skip
+    result = service.send_draft_as_user(make_draft(Lead.objects.create(name="A"), me).pk, me)
+    assert not result.sent and "daily send limit" in result.reasons[0]
+
+
+def test_send_slot_lock_is_taken_on_gmail_connection(me: User, lead: Lead, gmail: MagicMock) -> None:
+    from django.db.models.query import QuerySet
+
+    locked: list[str] = []
+    real = QuerySet.select_for_update
+
+    def spy(self: t.Any, *a: t.Any, **k: t.Any) -> t.Any:
+        locked.append(self.model.__name__)
+        return real(self, *a, **k)
+
+    with patch.object(QuerySet, "select_for_update", spy):
+        assert service.send_draft_as_user(make_draft(lead, me).pk, me).sent
+    assert locked.index("GmailConnection") < locked.index("Lead")
+
+
+def test_batch_capped_at_10(prod_auth: None, api_client: Client, token: str) -> None:
+    r = api_client.post("/api/email-drafts/send", {"draft_ids": list(range(1, 12))}, content_type=JSON, **bearer(token))
+    assert r.status_code == 422
+    r = api_client.post("/api/email-drafts/send", {"draft_ids": list(range(1, 11))}, content_type=JSON, **bearer(token))
+    assert r.status_code == 200
+
+
+def test_signature_marker_prevents_duplicate_even_if_edited(me: User) -> None:
+    EmailSignature.objects.create(user=me, body="<p>Weronika &amp; team<br>+49 123</p>")
+    prefilled = "<p>Hi</p><p><br></p><p>--</p><div data-revel-signature><p>Weronika (edited) +49</p></div>"
+    assert service.append_signature(prefilled, me) == prefilled
+    first = service.append_signature("<p>Hi</p>", me)
+    assert "<div data-revel-signature>" in first
+    assert service.append_signature(first, me) == first
+
+
+def test_signature_image_only_marker(me: User) -> None:
+    EmailSignature.objects.create(user=me, body='<p><img src="https://x/logo.png"></p>')
+    once = service.append_signature("<p>Hi</p>", me)
+    assert service.append_signature(once, me) == once
+
+
+def test_admin_editor_prefill_uses_marker() -> None:
+    from pathlib import Path
+
+    tpl = Path(__file__).parents[2] / "templates/admin/leads/lead/send_email.html"
+    assert "data-revel-signature" in tpl.read_text()

@@ -67,8 +67,6 @@ from leads.schema import (
     ResearchJobFilterSchema,
     ResearchJobIn,
     ResearchJobSchema,
-    SendEmailIn,
-    SendEmailResponse,
     TagSchema,
 )
 
@@ -270,24 +268,6 @@ class LeadController(ControllerBase):
         lead = get_object_or_404(Lead, id=lead_id)
         lead.delete()
         return 204, None
-
-    @route.post("/{lead_id}/send-email", response={201: SendEmailResponse})
-    def send_email(self, lead_id: int, data: SendEmailIn) -> tuple[int, SendEmailResponse]:
-        """Send an email to a lead.
-
-        Either provide a template_id to use a pre-defined template, or provide
-        subject and body directly. If using a template, placeholders like
-        {lead.name} and {lead.city} are automatically replaced.
-
-        The email is sent to the lead's email address by default, but you can
-        override this with the `to` field.
-
-        Set `send_in_background=true` to queue the email via Celery instead of
-        sending synchronously.
-        """
-        lead = get_object_or_404(Lead, id=lead_id)
-        result = service.send_email_to_lead_api(lead, data)
-        return 201, SendEmailResponse(**result)
 
     @route.get("/{lead_id}/emails", response=list[EmailSentSchema])
     def list_lead_emails(self, lead_id: int) -> QuerySet[EmailSent]:
@@ -687,7 +667,7 @@ class EmailDraftController(ControllerBase):
 
     @route.post("/send", response=DraftSendBatchOut)
     def send_drafts(self, data: DraftSendIn) -> DraftSendBatchOut:
-        """Send several drafts as the token's user (personal API token required; the shared X-API-Key gets 403).
+        """Send up to 10 drafts as the token's user (personal API token required; the shared X-API-Key gets 403).
 
         Each draft is judged independently and never partially sent. A draft is refused (with `reasons`) when it
         is not assigned to the token's user, the lead is do-not-contact or already contacted (an email or DM was
@@ -743,13 +723,11 @@ class EmailDraftController(ControllerBase):
     def send_draft(self, draft_id: int) -> tuple[int, DraftSendResultSchema]:
         """Send one draft as the token's user (personal API token required; the shared X-API-Key gets 403).
 
-        200 when sent; 409 with `reasons` when refused (nothing is sent); 404 if the draft does not exist;
-        403 if it is not assigned to the token's user. Same rules as the batch form.
+        200 when sent; 409 with `reasons` when refused (nothing is sent); 404 if the draft does not exist or
+        is not assigned to the token's user. Same rules as the batch form.
         """
         user = require_request_user(self.context.request if self.context else None)
-        draft = get_object_or_404(EmailDraft, pk=draft_id)
-        if draft.assigned_to_id != user.pk:
-            raise HttpError(403, "Draft is not assigned to you")
+        get_object_or_404(EmailDraft, pk=draft_id, assigned_to=user)  # someone else's draft looks like a missing one
         result = service.send_draft_as_user(draft_id, user)
         return (200 if result.sent else 409), DraftSendResultSchema(**vars(result))
 

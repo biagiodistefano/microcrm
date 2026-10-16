@@ -1643,11 +1643,14 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
             models.EmailSent.Status.FAILED: "#ef4444",  # red
         }
         color = colors.get(obj.status, "#666")
+        label = obj.get_status_display()
+        if lead_service.is_stale_pending(obj):
+            label = "Pending: send outcome unknown, check Gmail Sent"
         return format_html(
             '<span style="background: {}; color: white; padding: 2px 8px; '
             'border-radius: 4px; font-size: 0.8em;">{}</span>',
             color,
-            obj.get_status_display(),
+            label,
         )
 
     @admin.display(description="To")

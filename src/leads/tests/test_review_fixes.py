@@ -145,10 +145,6 @@ def test_all_send_paths_refuse_dnc(lead: Lead, rep: User, api_client: Client) ->
     gmail.assert_not_called()
     assert api_client.post(f"/api/email-drafts/{draft.pk}/send").status_code == 403  # shared key cannot send
     assert api_client.post(f"/api/messages/{msg.pk}/mark-sent").status_code == 400
-    r = api_client.post(
-        f"/api/leads/{lead.pk}/send-email", {"subject": "s", "body": "b"}, content_type="application/json"
-    )
-    assert r.status_code == 400
     assert not models.EmailSent.objects.exists()
 
 

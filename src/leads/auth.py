@@ -1,5 +1,6 @@
 """Personal API token authentication (``Authorization: Bearer <token>``)."""
 
+import re
 import typing as t
 
 from django.contrib.auth.models import User
@@ -10,9 +11,23 @@ from ninja.security import HttpBearer
 
 from leads.models import UserApiToken
 
+# What a personal token may call (method, path regex). Everything else needs the shared X-API-Key.
+TOKEN_ALLOWED: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/api/email-drafts/(send|\d+/send)/?$")),
+    ("GET", re.compile(r"^/api/email-drafts(/\d+)?/?$")),
+    ("GET", re.compile(r"^/api/messages(/\d+(/contact-check)?)?/?$")),
+    ("POST", re.compile(r"^/api/messages/\d+/mark-sent/?$")),
+    ("GET", re.compile(r"^/api/leads(/.*)?$")),
+)
+
+
+def token_may_call(method: str, path: str) -> bool:
+    """Whether a personal token is allowed to call this endpoint."""
+    return any(method == m and pattern.match(path) for m, pattern in TOKEN_ALLOWED)
+
 
 class BearerTokenAuth(HttpBearer):
-    """Authenticate as the owner of a non-revoked personal API token.
+    """Authenticate as the (active, staff) owner of a non-revoked personal API token, for allow-listed endpoints only.
 
     ``request.auth`` becomes the ``User``. Requests without a valid bearer token fall through to the next
     authenticator (the shared ``X-API-Key``).
@@ -27,6 +42,10 @@ class BearerTokenAuth(HttpBearer):
         )
         if row is None:
             return None
+        if not row.user.is_staff:
+            return None
+        if not token_may_call(request.method or "", request.path):
+            raise HttpError(403, "This endpoint is not available to personal tokens; use the API key for this endpoint")
         UserApiToken.objects.filter(pk=row.pk).update(last_used_at=timezone.now())
         return row.user
 
