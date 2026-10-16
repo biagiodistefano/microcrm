@@ -186,7 +186,7 @@ EOF
 # Start services
 start_services() {
     echo ""
-    echo -e "${BLUE}Pulling and starting production services...${NC}"
+    echo -e "${BLUE}Building and starting production services...${NC}"
     echo ""
     echo -e "This will start:"
     echo -e "  ${CYAN}- Caddy${NC}    (reverse proxy + HTTPS)"
@@ -202,7 +202,7 @@ start_services() {
     # Load DOMAIN from .env.prod for display
     source "$ENV_FILE"
 
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d
+    $COMPOSE_CMD -f "$COMPOSE_FILE" up --build -d
 
     echo ""
     echo -e "${GREEN}Production deployment complete!${NC}"
@@ -248,9 +248,9 @@ show_status() {
 
 # Update (pull latest and restart)
 update_services() {
-    echo -e "${BLUE}Updating MicroCRM (same path as the automatic deploy)...${NC}"
-    git fetch origin main
-    ./scripts/deploy.sh "$(git rev-parse origin/main)"
+    echo -e "${BLUE}Updating MicroCRM...${NC}"
+    git pull
+    $COMPOSE_CMD -f "$COMPOSE_FILE" up --build -d
     echo -e "${GREEN}Update complete!${NC}"
 }
 
@@ -273,7 +273,7 @@ main_menu() {
     echo "  3) Restart"
     echo "  4) View logs"
     echo "  5) Status"
-    echo "  6) Update (scripts/deploy.sh: backup, pull image, health check)"
+    echo "  6) Update (git pull + rebuild)"
     echo "  7) Backup database"
     echo "  8) Reconfigure"
     echo "  9) Exit"
