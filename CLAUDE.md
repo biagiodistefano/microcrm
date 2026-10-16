@@ -252,7 +252,8 @@ python cli.py jobs list --status completed
 - **Send phases**: reserve (locks the user's GmailConnection + lead, commits a PENDING EmailSent) -> Gmail call outside
   any transaction -> commit SENT + lead updates, or FAILED. The draft-send views are exempted from ATOMIC_REQUESTS by
   `crm.middleware.NonAtomicSendMiddleware`. A PENDING row blocks resends; older than 15 min the admin shows
-  "send outcome unknown, check Gmail Sent".
+  "send outcome unknown, check Gmail Sent"; superusers resolve PENDING rows via the Sent Emails actions "Mark sent
+  (confirmed in Gmail)" / "Mark failed". Admin sends refuse while the lead has a PENDING row.
 
 ## Architecture
 
