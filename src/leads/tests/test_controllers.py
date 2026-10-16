@@ -809,87 +809,12 @@ class TestEmailSentGetEndpoint:
 # --- Lead Email Endpoints ---
 
 
-class TestLeadSendEmailEndpoint:
-    @patch("leads.service.EmailMessage")
-    def test_send_email_with_template(
-        self, mock_email_class: MagicMock, api_client: Client, lead: Lead, email_template: EmailTemplate
-    ) -> None:
-        response = api_client.post(
-            f"/api/leads/{lead.id}/send-email",
-            data={"template_id": email_template.id},
-            content_type="application/json",
+class TestLeadSendEmailEndpointRemoved:
+    def test_send_email_endpoint_is_gone(self, api_client: Client, lead: Lead) -> None:
+        r = api_client.post(
+            f"/api/leads/{lead.id}/send-email", {"subject": "s", "body": "b"}, content_type="application/json"
         )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["status"] == EmailSent.Status.SENT
-        assert data["email_id"] > 0
-        mock_email_class.return_value.send.assert_called_once()
-
-    @patch("leads.service.EmailMessage")
-    def test_send_email_with_custom_content(self, mock_email_class: MagicMock, api_client: Client, lead: Lead) -> None:
-        response = api_client.post(
-            f"/api/leads/{lead.id}/send-email",
-            data={
-                "subject": "Custom Subject",
-                "body": "Custom Body",
-            },
-            content_type="application/json",
-        )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["status"] == EmailSent.Status.SENT
-
-    @patch("leads.tasks.send_email_task")
-    def test_send_email_in_background(
-        self, mock_task: MagicMock, api_client: Client, lead: Lead, email_template: EmailTemplate
-    ) -> None:
-        response = api_client.post(
-            f"/api/leads/{lead.id}/send-email",
-            data={
-                "template_id": email_template.id,
-                "send_in_background": True,
-            },
-            content_type="application/json",
-        )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["status"] == EmailSent.Status.PENDING
-        assert data["email_id"] == 0  # Not yet created
-        mock_task.delay.assert_called_once()
-
-    def test_send_email_no_content(self, api_client: Client, lead: Lead) -> None:
-        response = api_client.post(
-            f"/api/leads/{lead.id}/send-email",
-            data={},
-            content_type="application/json",
-        )
-        assert response.status_code == 400  # Either template_id or subject/body required
-
-    def test_send_email_template_not_found(self, api_client: Client, lead: Lead) -> None:
-        response = api_client.post(
-            f"/api/leads/{lead.id}/send-email",
-            data={"template_id": 99999},
-            content_type="application/json",
-        )
-        assert response.status_code == 404
-
-    def test_send_email_lead_not_found(self, api_client: Client) -> None:
-        response = api_client.post(
-            "/api/leads/99999/send-email",
-            data={"subject": "Test", "body": "Test"},
-            content_type="application/json",
-        )
-        assert response.status_code == 404
-
-    def test_send_email_no_recipient(self, api_client: Client) -> None:
-        # Create a lead without email
-        lead = Lead.objects.create(name="No Email Lead")
-        response = api_client.post(
-            f"/api/leads/{lead.id}/send-email",
-            data={"subject": "Test", "body": "Test"},
-            content_type="application/json",
-        )
-        assert response.status_code == 400  # No recipient
+        assert r.status_code in (404, 405)
 
 
 class TestLeadEmailsListEndpoint:
@@ -1100,36 +1025,14 @@ class TestEmailDraftDeleteEndpoint:
 
 
 class TestEmailDraftSendEndpoint:
-    @patch("leads.service.EmailMessage")
-    def test_send_draft(self, mock_email_class: MagicMock, api_client: Client, email_draft: EmailDraft) -> None:
-        draft_id = email_draft.id
-        lead_id = email_draft.lead_id
+    def test_shared_api_key_cannot_send(self, api_client: Client, email_draft: EmailDraft) -> None:
+        response = api_client.post(f"/api/email-drafts/{email_draft.id}/send")
+        assert response.status_code == 403
+        assert "personal API token" in response.json()["detail"]
+        assert EmailDraft.objects.filter(id=email_draft.id).exists()
 
-        response = api_client.post(f"/api/email-drafts/{draft_id}/send")
-        assert response.status_code == 201
-        data = response.json()
-        assert data["lead_id"] == lead_id
-        assert data["status"] == EmailSent.Status.SENT
-        mock_email_class.return_value.send.assert_called_once()
-
-        # Draft should be deleted
-        assert not EmailDraft.objects.filter(id=draft_id).exists()
-        # EmailSent should be created
-        assert EmailSent.objects.filter(lead_id=lead_id).exists()
-
-    def test_send_draft_not_found(self, api_client: Client) -> None:
-        response = api_client.post("/api/email-drafts/99999/send")
-        assert response.status_code == 404
-
-    def test_send_draft_with_placeholders_fails(self, api_client: Client, lead: Lead) -> None:
-        draft = EmailDraft.objects.create(
-            lead=lead,
-            subject="Hello {name}",
-            body="Body",
-            to=["test@example.com"],
-            bcc=[],
+    def test_shared_api_key_cannot_batch_send(self, api_client: Client, email_draft: EmailDraft) -> None:
+        response = api_client.post(
+            "/api/email-drafts/send", {"draft_ids": [email_draft.id]}, content_type="application/json"
         )
-        response = api_client.post(f"/api/email-drafts/{draft.id}/send")
-        assert response.status_code == 400  # Validation error
-        # Draft should NOT be deleted
-        assert EmailDraft.objects.filter(id=draft.id).exists()
+        assert response.status_code == 403

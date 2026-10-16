@@ -16,6 +16,7 @@ from rich.table import Table
 
 # --- Configuration ---
 API_KEY: str = config("API_KEY", default="dev-api-key")
+API_TOKEN: str = config("CRM_TOKEN", default="")  # personal API token (needed to send drafts)
 BASE_URL: str = config("CRM_BASE_URL", default="http://localhost:8000/api")
 
 console = Console()
@@ -34,7 +35,7 @@ class APIClient:
     def _get_client(self) -> httpx.Client:
         return httpx.Client(
             base_url=self.base_url,
-            headers={"X-API-Key": self.api_key},
+            headers={"X-API-Key": self.api_key, **({"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {})},
             timeout=30.0,
         )
 
@@ -456,110 +457,6 @@ def leads_import(
             failed += 1
 
     rprint(f"\n[bold]Done![/bold] Created: {success}, Failed: {failed}")
-
-
-def _resolve_default_to(lead: dict, contact_id: int | None) -> str:
-    """Resolve the default 'to' address for dry-run preview."""
-    if contact_id:
-        for c in lead.get("contacts", []):
-            if c.get("id") == contact_id:
-                return c.get("email") or "N/A"
-    primary = lead.get("primary_contact") or {}
-    return primary.get("email") or lead.get("email") or "N/A"
-
-
-def _send_email_dry_run(  # noqa: PLR0913
-    lead_id: int,
-    template_id: int | None,
-    subject: str | None,
-    body: str | None,
-    to: list[str],
-    bcc: list[str],
-    contact_id: int | None,
-) -> None:
-    """Show what email would be sent without actually sending."""
-    rprint("[yellow]DRY-RUN MODE[/yellow] - Email will NOT be sent. Use --send to actually send.\n")
-    lead = api.get(f"/leads/{lead_id}")
-    rprint(f"[bold]Lead:[/bold] {lead['name']} (#{lead['id']})")
-    if contact_id:
-        rprint(f"[bold]Contact:[/bold] #{contact_id}")
-    rprint(f"[bold]To:[/bold] {', '.join(to) if to else _resolve_default_to(lead, contact_id)}")
-    if bcc:
-        rprint(f"[bold]BCC:[/bold] {', '.join(bcc)}")
-    if template_id:
-        template = api.get(f"/email-templates/{template_id}")
-        rprint(f"[bold]Template:[/bold] {template['name']} (#{template['id']})")
-        rprint(f"[bold]Subject:[/bold] {template['subject']}")
-        rprint(f"[bold]Body:[/bold]\n{template['body']}")
-    else:
-        rprint(f"[bold]Subject:[/bold] {subject}")
-        rprint(f"[bold]Body:[/bold]\n{body}")
-
-
-def _send_email_execute(  # noqa: PLR0913
-    lead_id: int,
-    template_id: int | None,
-    subject: str | None,
-    body: str | None,
-    to: list[str],
-    bcc: list[str],
-    background: bool,
-    raw: bool,
-    contact_id: int | None,
-) -> None:
-    """Actually send the email via API."""
-    data: dict[str, t.Any] = {"send_in_background": background}
-    if template_id:
-        data["template_id"] = template_id
-    if subject:
-        data["subject"] = subject
-    if body:
-        data["body"] = body
-    if to:
-        data["to"] = to
-    if bcc:
-        data["bcc"] = bcc
-    if contact_id:
-        data["contact_id"] = contact_id
-
-    result = api.post(f"/leads/{lead_id}/send-email", data)
-    if raw:
-        output_json(result, raw=True)
-    else:
-        rprint(f"[green]Email sent![/green] ID: {result['email_id']}, Status: {result['status']}")
-
-
-@leads_app.command("send-email")
-def leads_send_email(  # noqa: PLR0913
-    lead_id: int = typer.Argument(..., help="Lead ID"),
-    template_id: int | None = typer.Option(None, "--template", "-t", help="Email template ID"),
-    subject: str | None = typer.Option(None, "--subject", "-s", help="Email subject (if no template)"),
-    body: str | None = typer.Option(None, "--body", "-b", help="Email body (if no template)"),
-    to: list[str] = typer.Option([], "--to", help="Override recipient (can specify multiple)"),
-    bcc: list[str] = typer.Option([], "--bcc", help="BCC recipients (can specify multiple)"),
-    contact_id: int | None = typer.Option(
-        None, "--contact-id", "-c", help="Contact to email (defaults to lead's primary contact)"
-    ),
-    background: bool = typer.Option(False, "--background", help="Send via background task"),
-    send: bool = typer.Option(False, "--send", help="Actually send the email (default is dry-run)"),
-    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
-) -> None:
-    """Send an email to a lead.
-
-    By default runs in DRY-RUN mode and shows what would be sent.
-    Use --send to actually send the email.
-    """
-    if template_id is None and (subject is None or body is None):
-        rprint("[red]Either --template or both --subject and --body are required[/red]")
-        raise typer.Exit(1)
-
-    try:
-        if send:
-            _send_email_execute(lead_id, template_id, subject, body, to, bcc, background, raw, contact_id)
-        else:
-            _send_email_dry_run(lead_id, template_id, subject, body, to, bcc, contact_id)
-    except httpx.HTTPStatusError as e:
-        handle_error(e)
 
 
 @leads_app.command("emails")
@@ -1444,25 +1341,32 @@ def drafts_delete(
 
 @drafts_app.command("send")
 def drafts_send(
-    draft_id: int = typer.Argument(..., help="Draft ID"),
+    draft_ids: list[int] = typer.Argument(..., help="Draft ID(s); at most 10 per call"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
 ) -> None:
-    """Send an email draft.
+    """Send assigned email drafts from YOUR Gmail with YOUR signature (needs CRM_TOKEN).
 
-    This will send the email, create an EmailSent record, update the lead's
-    last_contact date, and delete the draft.
+    Only drafts assigned to the token's user are sent; each draft is checked independently (do-not-contact,
+    already contacted, humanized, Gmail connected, daily limit) and refusals are listed with their reasons.
     """
+    if not API_TOKEN:
+        rprint("[red]Sending needs a personal API token: set CRM_TOKEN (create one in the admin: API Tokens)[/red]")
+        raise typer.Exit(1)
     if not force:
-        confirm = typer.confirm(f"Send draft #{draft_id}?")
+        confirm = typer.confirm(f"Send draft(s) {', '.join(f'#{i}' for i in draft_ids)}?")
         if not confirm:
             raise typer.Abort()
     try:
-        result = api.post(f"/email-drafts/{draft_id}/send")
+        result = api.post("/email-drafts/send", {"draft_ids": draft_ids})
         if raw:
             output_json(result, raw=True)
-        else:
-            rprint(f"[green]Draft sent successfully! Email ID: #{result['id']}[/green]")
+            return
+        for item in result["results"]:
+            if item["sent"]:
+                rprint(f"[green]Draft #{item['draft_id']} sent (email #{item['email_sent_id']})[/green]")
+            else:
+                rprint(f"[red]Draft #{item['draft_id']} NOT sent:[/red] {'; '.join(item['reasons'])}")
     except httpx.HTTPStatusError as e:
         handle_error(e)
 

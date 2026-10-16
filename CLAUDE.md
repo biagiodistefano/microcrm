@@ -110,9 +110,6 @@ leads update    LEAD_ID [--name] [--email] [--phone] [--company] [--type]
 leads delete    LEAD_ID [--force]
 leads merge     PRIMARY OTHER... [--force] [--raw]   (merge duplicates into PRIMARY; preview unless --force)
 leads import    FILE [--dry-run]
-leads send-email LEAD_ID [--template] [--subject] [--body] [--to] [--bcc]
-                [--background] [--send] [--raw]
-                NOTE: Runs in DRY-RUN mode by default. Use --send to actually send.
 leads emails    LEAD_ID [--raw]
 ```
 
@@ -190,7 +187,7 @@ drafts get      DRAFT_ID [--raw]
 drafts create   --lead --subject --body [--template] [--to] [--bcc] [--raw]
 drafts update   DRAFT_ID [--subject] [--body] [--template] [--to] [--bcc] [--raw]
 drafts delete   DRAFT_ID [--force]
-drafts send     DRAFT_ID [--raw]
+drafts send     DRAFT_ID... [--force] [--raw]   (needs CRM_TOKEN; max 10; only your assigned drafts)
 ```
 
 ### Common Options
@@ -211,12 +208,6 @@ python cli.py leads create --name "Test Venue" --city Berlin --country Germany -
 # Import leads from JSON file
 python cli.py leads import leads.json
 
-# Preview email (dry-run, safe)
-python cli.py leads send-email 123 --template 2
-
-# Actually send email
-python cli.py leads send-email 123 --template 2 --send
-
 # Start research for a city
 python cli.py cities research 11
 
@@ -236,6 +227,33 @@ python cli.py jobs list --status completed
   DMs/drafts/emails, deletes the others; any do-not-contact lead makes the result do-not-contact. Max 20 leads.
 - Marking a lead do-not-contact skips its draft DMs, deletes its unsent email drafts (history is kept), and blocks
   every send path. An assigned email draft can only be sent by its assignee or a superuser, from their own Gmail.
+
+- **Personal API tokens** (`UserApiToken`; admin: "API Tokens", staff create/revoke their own, plaintext shown once,
+  only the sha256 is stored): send `Authorization: Bearer <token>` to authenticate as that user (`request.auth` is the
+  `User`; use `leads.auth.get_request_user` / `require_request_user`). `X-API-Key` keeps working for everything else.
+  The CLI reads the token from `CRM_TOKEN`. Tokens only work for staff users and only on: draft send endpoints,
+  `GET` leads/email-drafts/messages, `POST /messages/{id}/mark-sent`, `GET /messages/{id}/contact-check`; anything
+  else falls through to the `X-API-Key` (the CLI sends both headers), so a token alone gets 401 there. There is no `leads/{id}/send-email` endpoint any more: the
+  only API send path is the token draft-send flow.
+- **Sending drafts needs a personal token** (shared `X-API-Key` alone gets 403): `POST /email-drafts/{id}/send` and
+  `POST /email-drafts/send` `{draft_ids}` (max 10) send only drafts assigned to the token's user, from their Gmail, via
+  `service.send_draft_as_user`. Per-draft refusals (reported as `reasons`, nothing sent): not assigned, do-not-contact,
+  already contacted (`service.already_contacted_reasons`: non-failed EmailSent, sent DM, lead status beyond
+  new/qualified, last_contact set), not humanized, no active Gmail, placeholders, daily limit
+  (`EMAIL_SEND_DAILY_LIMIT_PER_USER`, default 50). Success: lead new/qualified -> contacted, last_contact today,
+  "Follow up email" action +4 days, draft deleted. `GET /messages/{id}/contact-check` uses the same rules;
+  `POST /messages/{id}/mark-sent` with a token records `sent_by`.
+- **Signature**: `send_email_to_lead` (so admin sends, draft sends and the token API alike) appends the sending
+  user's `EmailSignature` after `<p><br></p><p>--</p>`; idempotent (skipped when the body already contains the
+  signature text, e.g. the admin editor pre-filled it). The block is wrapped in `<div data-revel-signature>`. The admin editor no longer pre-fills the
+  signature (a note says it is added when sending).
+- **A FAILED send may still have been delivered** (Gmail can accept a message and the response be lost, or a later
+  step fail). Check Gmail's Sent folder before retrying a failed or unknown send.
+- **Send phases**: reserve (locks the user's GmailConnection + lead, commits a PENDING EmailSent) -> Gmail call outside
+  any transaction -> commit SENT + lead updates, or FAILED. The draft-send views are exempted from ATOMIC_REQUESTS by
+  `crm.middleware.NonAtomicSendMiddleware`. A PENDING row blocks resends; older than 15 min the admin shows
+  "send outcome unknown, check Gmail Sent"; superusers resolve PENDING rows via the Sent Emails actions "Mark sent
+  (confirmed in Gmail)" / "Mark failed". Admin sends refuse while the lead has a PENDING row.
 
 ## Architecture
 

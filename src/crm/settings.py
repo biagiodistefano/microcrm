@@ -72,6 +72,7 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "simple_history.middleware.HistoryRequestMiddleware",
+    "crm.middleware.NonAtomicSendMiddleware",
 ]
 
 ROOT_URLCONF = "crm.urls"
@@ -136,6 +137,8 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # API
 API_KEY = config("API_KEY", default="dev-api-key")
+# Max emails one user may send per day through the token-authenticated draft send API
+EMAIL_SEND_DAILY_LIMIT_PER_USER = config("EMAIL_SEND_DAILY_LIMIT_PER_USER", cast=int, default=50)
 
 # Redis & Celery
 REDIS_HOST = config("REDIS_HOST", default="localhost")
@@ -272,6 +275,11 @@ UNFOLD = {
                         "title": "Signatures",
                         "icon": "signature",
                         "link": reverse_lazy("admin:leads_emailsignature_changelist"),
+                    },
+                    {
+                        "title": "API Tokens",
+                        "icon": "key",
+                        "link": reverse_lazy("admin:leads_userapitoken_changelist"),
                     },
                 ],
             },

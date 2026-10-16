@@ -9,6 +9,7 @@ from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseS
 from ninja_extra.searching import Searching, searching
 
 from leads import service
+from leads.auth import get_request_user, require_request_user
 from leads.models import (
     Action,
     City,
@@ -30,10 +31,14 @@ from leads.schema import (
     CityFilterSchema,
     CityIn,
     CitySchema,
+    ContactCheckOut,
     ContactFilterSchema,
     ContactIn,
     ContactPatch,
     ContactSchema,
+    DraftSendBatchOut,
+    DraftSendIn,
+    DraftSendResultSchema,
     EmailDraftFilterSchema,
     EmailDraftIn,
     EmailDraftPatch,
@@ -62,8 +67,6 @@ from leads.schema import (
     ResearchJobFilterSchema,
     ResearchJobIn,
     ResearchJobSchema,
-    SendEmailIn,
-    SendEmailResponse,
     TagSchema,
 )
 
@@ -265,24 +268,6 @@ class LeadController(ControllerBase):
         lead = get_object_or_404(Lead, id=lead_id)
         lead.delete()
         return 204, None
-
-    @route.post("/{lead_id}/send-email", response={201: SendEmailResponse})
-    def send_email(self, lead_id: int, data: SendEmailIn) -> tuple[int, SendEmailResponse]:
-        """Send an email to a lead.
-
-        Either provide a template_id to use a pre-defined template, or provide
-        subject and body directly. If using a template, placeholders like
-        {lead.name} and {lead.city} are automatically replaced.
-
-        The email is sent to the lead's email address by default, but you can
-        override this with the `to` field.
-
-        Set `send_in_background=true` to queue the email via Celery instead of
-        sending synchronously.
-        """
-        lead = get_object_or_404(Lead, id=lead_id)
-        result = service.send_email_to_lead_api(lead, data)
-        return 201, SendEmailResponse(**result)
 
     @route.get("/{lead_id}/emails", response=list[EmailSentSchema])
     def list_lead_emails(self, lead_id: int) -> QuerySet[EmailSent]:
@@ -680,6 +665,25 @@ class EmailDraftController(ControllerBase):
         """
         return filters.filter(EmailDraft.objects.select_related("lead", "template", "assigned_to").all())
 
+    @route.post("/send", response=DraftSendBatchOut)
+    def send_drafts(self, data: DraftSendIn) -> DraftSendBatchOut:
+        """Send up to 10 drafts as the token's user (personal API token required; the shared X-API-Key gets 403).
+
+        Each draft is judged independently and never partially sent. A draft is refused (with `reasons`) when it
+        is not assigned to the token's user, the lead is do-not-contact or already contacted (an email or DM was
+        sent, status beyond `qualified`, or last_contact set), it is not humanized, the user has no active Gmail
+        connection, or the per-user daily limit is reached. Sent drafts go out from the user's Gmail with their
+        signature appended.
+        """
+        user = require_request_user(self.context.request if self.context else None)
+        results = service.send_drafts_as_user(data.draft_ids, user)
+        sent = sum(1 for r in results if r.sent)
+        return DraftSendBatchOut(
+            sent=sent,
+            refused=len(results) - sent,
+            results=[DraftSendResultSchema(**vars(r)) for r in results],
+        )
+
     @route.get("/{draft_id}", response=EmailDraftSchema)
     def get_draft(self, draft_id: int) -> EmailDraft:
         """Get a single email draft by ID."""
@@ -715,24 +719,17 @@ class EmailDraftController(ControllerBase):
         draft.delete()
         return 204, None
 
-    @route.post("/{draft_id}/send", response={201: EmailSentSchema})
-    def send_draft(self, draft_id: int) -> tuple[int, EmailSent]:
-        """Send an email draft.
+    @route.post("/{draft_id}/send", response={200: DraftSendResultSchema, 409: DraftSendResultSchema})
+    def send_draft(self, draft_id: int) -> tuple[int, DraftSendResultSchema]:
+        """Send one draft as the token's user (personal API token required; the shared X-API-Key gets 403).
 
-        This will:
-        1. Validate no unreplaced placeholders remain
-        2. Send the email
-        3. Create an EmailSent record
-        4. Update the lead's last_contact date
-        5. Delete the draft
-
-        Returns the EmailSent record on success.
+        200 when sent; 409 with `reasons` when refused (nothing is sent); 404 if the draft does not exist or
+        is not assigned to the token's user. Same rules as the batch form.
         """
-        draft = get_object_or_404(EmailDraft, pk=draft_id)
-        try:
-            return 201, service.send_email_draft(draft)
-        except ValueError as e:
-            raise HttpError(400, str(e))
+        user = require_request_user(self.context.request if self.context else None)
+        get_object_or_404(EmailDraft, pk=draft_id, assigned_to=user)  # someone else's draft looks like a missing one
+        result = service.send_draft_as_user(draft_id, user)
+        return (200 if result.sent else 409), DraftSendResultSchema(**vars(result))
 
 
 @api_controller("/messages", tags=["Outreach Messages"])
@@ -811,10 +808,20 @@ class OutreachMessageController(ControllerBase):
         """Record that the message was sent by hand.
 
         Sets sent_at, updates the lead's last_contact, moves a `new` lead to `contacted` and creates a
-        follow-up action due in 4 days. Idempotent.
+        follow-up action due in 4 days. Idempotent. With a personal API token, `sent_by` is that user.
         """
         message = get_object_or_404(self.get_queryset(), id=message_id)
-        return service.mark_message_sent(message)
+        return service.mark_message_sent(message, user=get_request_user(self.context.request if self.context else None))
+
+    @route.get("/{message_id}/contact-check", response=ContactCheckOut)
+    def contact_check(self, message_id: int) -> ContactCheckOut:
+        """Has this message's lead already been contacted (email sent, DM sent, status beyond qualified, last_contact)?
+
+        The CLI calls this before sending a DM by hand.
+        """
+        message = get_object_or_404(self.get_queryset(), id=message_id)
+        reasons = service.already_contacted_reasons(message.lead)
+        return ContactCheckOut(already_contacted=bool(reasons), reasons=reasons)
 
     @route.post("/{message_id}/skip", response=OutreachMessageSchema)
     def skip(self, message_id: int) -> OutreachMessage:

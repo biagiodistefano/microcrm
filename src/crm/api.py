@@ -6,6 +6,7 @@ from ninja import Schema
 from ninja.security import APIKeyHeader
 from ninja_extra import NinjaExtraAPI
 
+from leads.auth import BearerTokenAuth
 from leads.controllers import (
     ActionController,
     CityController,
@@ -49,7 +50,7 @@ api = NinjaExtraAPI(
     title="MicroCRM API",
     version=settings.VERSION,
     docs_url="/docs",
-    auth=ApiKeyAuth(),
+    auth=[BearerTokenAuth(), ApiKeyAuth()],
     servers=_servers or None,
 )
 

@@ -617,22 +617,6 @@ class OutreachMessagePatch(Schema):
     batch: str | None = None
 
 
-class SendEmailIn(Schema):
-    """Input schema for sending an email to a lead."""
-
-    contact_id: int | None = Field(
-        default=None, description="Contact to email (defaults to the lead's primary contact)"
-    )
-    template_id: int | None = Field(default=None, description="Template ID to use (optional)")
-    subject: str | None = Field(default=None, description="Email subject (required if no template)")
-    body: str | None = Field(default=None, description="Email body (required if no template)")
-    to: list[str] | None = Field(
-        default=None, description="Override recipient(s), defaults to the primary contact's email"
-    )
-    bcc: list[str] = Field(default_factory=list, description="BCC recipients")
-    send_in_background: bool = Field(default=False, description="Send via Celery background task")
-
-
 class LeadTagsIn(Schema):
     """Bulk tag add/remove input."""
 
@@ -753,9 +737,31 @@ class OutreachMessageFilterSchema(FilterSchema):
     lead_id: t.Annotated[int | None, FilterLookup(q="lead_id")] = None
 
 
-class SendEmailResponse(Schema):
-    """Response for send email action."""
+class DraftSendIn(Schema):
+    """Batch send request."""
 
-    email_id: int
-    status: str
-    message: str = ""
+    draft_ids: list[int] = Field(min_length=1, max_length=10)
+
+
+class DraftSendResultSchema(Schema):
+    """Outcome of sending one draft."""
+
+    draft_id: int
+    sent: bool
+    email_sent_id: int | None = None
+    reasons: list[str] = []
+
+
+class DraftSendBatchOut(Schema):
+    """Outcome of a batch send."""
+
+    sent: int
+    refused: int
+    results: list[DraftSendResultSchema]
+
+
+class ContactCheckOut(Schema):
+    """Whether a lead was already contacted, and why."""
+
+    already_contacted: bool
+    reasons: list[str]

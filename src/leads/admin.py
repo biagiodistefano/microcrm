@@ -5,6 +5,7 @@ from urllib.parse import urlencode, urlparse
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
+from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
 from django.contrib.auth.models import User
 from django.core.exceptions import PermissionDenied
 from django.db.models import Count, DateField, Q, QuerySet
@@ -814,16 +815,6 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         except models.GmailConnection.DoesNotExist:
             pass
 
-        # Get user's email signature
-        signature_html = ""
-        user_pk = getattr(request.user, "pk", None)
-        if user_pk is not None:
-            try:
-                sig = models.EmailSignature.objects.get(user_id=user_pk)
-                signature_html = sig.body
-            except (models.EmailSignature.DoesNotExist, TypeError, ValueError):
-                pass
-
         context = {
             **self.admin_site.each_context(request),
             "title": f"Send Email to {lead.name}",
@@ -835,7 +826,6 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             "templates_by_language": templates_by_language,
             "next_action": next_action_data,
             "back_url": back_url,
-            "signature_html": signature_html,
             "opts": self.model._meta,
             "has_view_permission": True,
         }
@@ -1610,6 +1600,59 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
     ]
     ordering = ["-created_at"]
     list_per_page = 25
+    actions = ["mark_sent_confirmed", "mark_failed"]
+
+    def get_actions(self, request: HttpRequest) -> t.Any:
+        """Resolving a pending send is superuser-only."""
+        actions = super().get_actions(request)
+        if not request.user.is_superuser:
+            actions.pop("mark_sent_confirmed", None)
+            actions.pop("mark_failed", None)
+        return actions
+
+    def _resolve_pending(
+        self, request: HttpRequest, queryset: QuerySet[models.EmailSent], action: str, title: str
+    ) -> HttpResponse | None:
+        """Confirm page, then apply ``action`` ("sent" or "failed") to the PENDING rows in the queryset."""
+        pending = list(queryset.filter(status=models.EmailSent.Status.PENDING).select_related("lead"))
+        if not pending:
+            self.message_user(request, "No pending emails selected.", messages.WARNING)
+            return None
+        if request.POST.get("confirm") != "yes":
+            return render(
+                request,
+                "admin/leads/emailsent/resolve_confirm.html",
+                {
+                    **self.admin_site.each_context(request),
+                    "title": title,
+                    "emails": pending,
+                    "action": action,
+                    "action_checkbox_name": ACTION_CHECKBOX_NAME,
+                    "selected": [e.pk for e in pending],
+                    "opts": self.model._meta,
+                },
+            )
+        for email in pending:
+            if action == "sent":
+                lead_service.finalize_sent(email)
+            else:
+                lead_service.mark_send_failed(email, f"Marked failed by {request.user}: not delivered per Gmail")
+        self.message_user(request, f"Marked {len(pending)} email(s) as {action}.", messages.SUCCESS)
+        return None
+
+    @admin.action(description="Mark sent (confirmed in Gmail)", permissions=["resolve"])
+    def mark_sent_confirmed(self, request: HttpRequest, queryset: QuerySet[models.EmailSent]) -> HttpResponse | None:
+        """Pending rows that Gmail's Sent folder shows as delivered: apply the normal send side effects."""
+        return self._resolve_pending(request, queryset, "sent", "Mark pending emails as sent")
+
+    @admin.action(description="Mark failed (not delivered)", permissions=["resolve"])
+    def mark_failed(self, request: HttpRequest, queryset: QuerySet[models.EmailSent]) -> HttpResponse | None:
+        """Pending rows that Gmail's Sent folder does not show: allow the lead to be emailed again."""
+        return self._resolve_pending(request, queryset, "failed", "Mark pending emails as failed")
+
+    def has_resolve_permission(self, request: HttpRequest) -> bool:
+        """Only superusers may resolve pending sends."""
+        return bool(request.user.is_superuser)
 
     fieldsets = (
         (None, {"fields": ("lead", "template", "status", "sent_by")}),
@@ -1643,11 +1686,14 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
             models.EmailSent.Status.FAILED: "#ef4444",  # red
         }
         color = colors.get(obj.status, "#666")
+        label = obj.get_status_display()
+        if lead_service.is_stale_pending(obj):
+            label = "Pending: send outcome unknown, check Gmail Sent"
         return format_html(
             '<span style="background: {}; color: white; padding: 2px 8px; '
             'border-radius: 4px; font-size: 0.8em;">{}</span>',
             color,
-            obj.get_status_display(),
+            label,
         )
 
     @admin.display(description="To")
@@ -1817,6 +1863,77 @@ class EmailSignatureAdmin(ModelAdmin):  # type: ignore[misc]
         (None, {"fields": ("user", "body")}),
         ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
     )
+
+
+@admin.register(models.UserApiToken)
+class UserApiTokenAdmin(ModelAdmin):  # type: ignore[misc]
+    """Personal API tokens: staff create/revoke their own (plaintext shown once); superusers see all."""
+
+    list_display = ["name", "user", "prefix", "created_at", "last_used_at", "status"]
+    list_filter = ["user"]
+    readonly_fields = ["user", "prefix", "created_at", "last_used_at", "revoked_at"]
+    actions = ["revoke_selected"]
+
+    def get_fields(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> list[str]:
+        """Only the name when creating; read-only details afterwards."""
+        if obj is None:
+            return ["name"]
+        return ["name", "user", "prefix", "created_at", "last_used_at", "revoked_at"]
+
+    def get_readonly_fields(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> list[str]:
+        """The name is only editable on creation."""
+        return [*self.readonly_fields, "name"] if obj is not None else []
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[models.UserApiToken]:
+        """Superusers see every token; everyone else only their own."""
+        qs: QuerySet[models.UserApiToken] = super().get_queryset(request).select_related("user")
+        return qs if request.user.is_superuser else qs.filter(user=t.cast(User, request.user))
+
+    def has_module_permission(self, request: HttpRequest) -> bool:
+        return bool(request.user.is_active and request.user.is_staff)
+
+    def has_view_permission(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> bool:
+        return bool(request.user.is_active and request.user.is_staff)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return bool(request.user.is_active and request.user.is_staff)
+
+    def has_change_permission(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> bool:
+        return False
+
+    @admin.display(description="Status")
+    def status(self, obj: models.UserApiToken) -> str:
+        return "active" if obj.is_active else "revoked"
+
+    def save_model(self, request: HttpRequest, obj: models.UserApiToken, form: forms.ModelForm, change: bool) -> None:  # type: ignore[type-arg]
+        """Issue a token for the requesting user and show the plaintext exactly once."""
+        if change:
+            return
+        row, plaintext = models.UserApiToken.issue(t.cast(User, request.user), obj.name)
+        obj.pk = row.pk
+        obj.user = row.user
+        obj.token_hash = row.token_hash
+        obj.prefix = row.prefix
+        obj.created_at = row.created_at
+        messages.warning(
+            request,
+            format_html(
+                "Your new API token (copy it now, it will not be shown again): <code>{}</code>",
+                plaintext,
+            ),
+        )
+
+    @admin.action(description="Revoke selected tokens")
+    def revoke_selected(self, request: HttpRequest, queryset: QuerySet[models.UserApiToken]) -> None:
+        """Revoke the selected tokens (own tokens only, unless superuser; the queryset is already scoped)."""
+        count = 0
+        for token in queryset.filter(revoked_at__isnull=True):
+            token.revoke()
+            count += 1
+        self.message_user(request, f"Revoked {count} token(s).", messages.SUCCESS)
 
 
 @admin.register(models.ResearchPromptConfig)

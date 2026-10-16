@@ -1,0 +1,23 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<div style="max-width: 48rem; padding: 1rem;">
+  <h2>{{ title }}</h2>
+  {% if action == "sent" %}
+  <p>Only do this if each email below shows in Gmail's <strong>Sent</strong> folder. The lead becomes
+  <em>contacted</em>, last contact is set to today, a follow-up action is created and any matching draft is removed.</p>
+  {% else %}
+  <p>Only do this if each email below does <strong>not</strong> show in Gmail's Sent folder. The lead can then be emailed again.</p>
+  {% endif %}
+  <ul>
+    {% for email in emails %}<li>#{{ email.pk }} to {{ email.lead.name }}: {{ email.subject }} (started {{ email.created_at }})</li>{% endfor %}
+  </ul>
+  <form method="post">
+    {% csrf_token %}
+    {% for pk in selected %}<input type="hidden" name="{{ action_checkbox_name }}" value="{{ pk }}">{% endfor %}
+    <input type="hidden" name="action" value="{% if action == "sent" %}mark_sent_confirmed{% else %}mark_failed{% endif %}">
+    <input type="hidden" name="confirm" value="yes">
+    <button type="submit" class="button">Confirm</button>
+    <a href="{% url 'admin:leads_emailsent_changelist' %}">Cancel</a>
+  </form>
+</div>
+{% endblock %}
