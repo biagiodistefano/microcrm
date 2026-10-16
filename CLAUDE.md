@@ -237,6 +237,22 @@ python cli.py jobs list --status completed
 - Marking a lead do-not-contact skips its draft DMs, deletes its unsent email drafts (history is kept), and blocks
   every send path. An assigned email draft can only be sent by its assignee or a superuser, from their own Gmail.
 
+- **Personal API tokens** (`UserApiToken`; admin: "API Tokens", staff create/revoke their own, plaintext shown once,
+  only the sha256 is stored): send `Authorization: Bearer <token>` to authenticate as that user (`request.auth` is the
+  `User`; use `leads.auth.get_request_user` / `require_request_user`). `X-API-Key` keeps working for everything else.
+  The CLI reads the token from `CRM_TOKEN`.
+- **Sending drafts needs a personal token** (shared `X-API-Key` alone gets 403): `POST /email-drafts/{id}/send` and
+  `POST /email-drafts/send` `{draft_ids}` send only drafts assigned to the token's user, from their Gmail, via
+  `service.send_draft_as_user`. Per-draft refusals (reported as `reasons`, nothing sent): not assigned, do-not-contact,
+  already contacted (`service.already_contacted_reasons`: non-failed EmailSent, sent DM, lead status beyond
+  new/qualified, last_contact set), not humanized, no active Gmail, placeholders, daily limit
+  (`EMAIL_SEND_DAILY_LIMIT_PER_USER`, default 50). Success: lead new/qualified -> contacted, last_contact today,
+  "Follow up email" action +4 days, draft deleted. `GET /messages/{id}/contact-check` uses the same rules;
+  `POST /messages/{id}/mark-sent` with a token records `sent_by`.
+- **Signature**: `send_email_to_lead` (so admin sends, draft sends and the token API alike) appends the sending
+  user's `EmailSignature` after `<p><br></p><p>--</p>`; idempotent (skipped when the body already contains the
+  signature text, e.g. the admin editor pre-filled it).
+
 ## Architecture
 
 ### Project Layout

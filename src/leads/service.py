@@ -1,5 +1,6 @@
 """Business logic for leads."""
 
+import dataclasses
 import logging
 import re
 import typing as t
@@ -21,6 +22,7 @@ from leads.models import (
     Contact,
     EmailDraft,
     EmailSent,
+    EmailSignature,
     EmailTemplate,
     GmailConnection,
     Lead,
@@ -56,6 +58,8 @@ MERGED_IDENTITY_FIELDS: tuple[str, ...] = LEAD_ONLY_MATCH_FIELDS
 # Fields filled on an existing lead only when currently blank
 LEAD_FILL_FIELDS: tuple[str, ...] = ("company", "notes", "source", "external_ref", *LEAD_MATCH_FIELDS)
 FOLLOW_UP_DAYS = 4
+SIGNATURE_SEPARATOR = "<p><br></p><p>--</p>"
+MAX_SEND_BATCH = 50
 
 logger = logging.getLogger(__name__)
 
@@ -804,6 +808,27 @@ def _send_via_smtp(
     email.send(fail_silently=False)
 
 
+def _plain(html: str) -> str:
+    """Tags stripped and whitespace removed, to compare HTML snippets regardless of re-serialisation."""
+    return re.sub(r"\s+|&nbsp;", "", re.sub(r"<[^>]+>", "", html))
+
+
+def append_signature(body: str, user: User | None) -> str:
+    """Append the user's EmailSignature to an outgoing HTML body (``<p>--</p>`` separator, as the admin editor does).
+
+    No-op without a user, when the user has no (or an empty) signature, or when the body already carries it
+    (the admin editor pre-fills the signature client-side, so this stays idempotent).
+    """
+    if not isinstance(user, User):
+        return body
+    signature = EmailSignature.objects.filter(user=user).values_list("body", flat=True).first()
+    if not signature or not signature.strip():
+        return body
+    if _plain(signature) and _plain(signature) in _plain(body):
+        return body
+    return f"{body}{SIGNATURE_SEPARATOR}{signature}"
+
+
 def send_email_to_lead(  # noqa: PLR0913
     lead: Lead,
     subject: str,
@@ -816,8 +841,8 @@ def send_email_to_lead(  # noqa: PLR0913
 ) -> EmailSent:
     """Send an email to a lead and log it.
 
-    If user is provided, requires an active Gmail connection — no SMTP fallback.
-    If user is None (API/CLI), sends via SMTP.
+    If user is provided, requires an active Gmail connection — no SMTP fallback — and appends that user's
+    EmailSignature to the body (see ``append_signature``; idempotent). If user is None, sends via SMTP unchanged.
 
     Args:
         lead: The Lead receiving the email
@@ -849,6 +874,8 @@ def send_email_to_lead(  # noqa: PLR0913
     # Require Gmail connection when sending as a user
     if user and isinstance(user, User) and not gmail_connection:
         raise ValueError("Gmail account not connected. Please connect your Gmail before sending emails.")
+
+    body = append_signature(body, user)
 
     from_email = _resolve_from_email(gmail_connection)
     bcc = bcc or []
@@ -1723,3 +1750,121 @@ def summarize_merge(leads: t.Sequence[Lead]) -> dict[int, dict[str, int]]:
         }
         for lead in leads
     }
+
+
+# --- "Already contacted" rules and token-authenticated draft sending ---
+
+
+def already_contacted_reasons(lead: Lead) -> list[str]:
+    """Why this lead must be treated as already contacted (empty list when it has not been).
+
+    Rules: any non-failed EmailSent; any OutreachMessage with status sent; lead status beyond new/qualified;
+    a last_contact date. Used by both the email-draft send gate and the DM contact check.
+    """
+    reasons: list[str] = []
+    if lead.emails_sent.exclude(status=EmailSent.Status.FAILED).exists():
+        reasons.append("an email was already sent to this lead")
+    if lead.messages.filter(status=OutreachMessage.Status.SENT).exists():
+        reasons.append("a DM was already sent to this lead")
+    if lead.status not in (Lead.Status.NEW, Lead.Status.QUALIFIED):
+        reasons.append(f"lead status is '{lead.status}'")
+    if lead.last_contact is not None:
+        reasons.append(f"lead was last contacted on {lead.last_contact.isoformat()}")
+    return reasons
+
+
+def sends_today(user: User) -> int:
+    """Emails this user sent (successfully) since local midnight."""
+    start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+    return EmailSent.objects.filter(sent_by=user, status=EmailSent.Status.SENT, sent_at__gte=start).count()
+
+
+def draft_send_refusals(draft: EmailDraft, user: User) -> list[str]:
+    """Reasons ``draft`` may not be sent by ``user`` through the token API (empty list when it may)."""
+    if draft.assigned_to_id != user.pk:
+        return ["draft is not assigned to you"]
+    reasons: list[str] = []
+    lead = draft.lead
+    if lead.do_not_contact:
+        reasons.append("lead is marked do not contact")
+    reasons.extend(already_contacted_reasons(lead))
+    if not draft.is_humanized:
+        reasons.append("draft is not humanized (humanized_hash missing or does not match subject + body)")
+    if _get_gmail_connection(user) is None:
+        reasons.append("you have no active Gmail connection")
+    if not draft.to:
+        reasons.append("draft has no recipients")
+    placeholders = validate_no_placeholders(draft.subject, draft.body)
+    if placeholders:
+        reasons.append(f"unreplaced placeholders: {', '.join(placeholders)}")
+    return reasons
+
+
+@dataclasses.dataclass
+class DraftSendResult:
+    """Outcome of one draft in a token-authenticated send."""
+
+    draft_id: int
+    sent: bool = False
+    email_sent_id: int | None = None
+    reasons: list[str] = dataclasses.field(default_factory=list)
+
+
+def _apply_sent_effects(lead: Lead, email_sent: EmailSent) -> None:
+    """Lead/action side effects of a first email, matching ``mark_message_sent`` semantics."""
+    today = timezone.localdate()
+    lead.last_contact = today
+    update_fields = ["last_contact", "updated_at"]
+    if lead.status in (Lead.Status.NEW, Lead.Status.QUALIFIED):
+        lead.status = Lead.Status.CONTACTED
+        update_fields.append("status")
+    lead.save(update_fields=update_fields)
+    Action.objects.create(
+        lead=lead,
+        name="Follow up email",
+        notes=f"Follow up on email #{email_sent.pk}",
+        due_date=today + timedelta(days=FOLLOW_UP_DAYS),
+    )
+
+
+def send_draft_as_user(draft_id: int, user: User) -> DraftSendResult:
+    """Send one assigned draft as ``user`` (their Gmail, their signature) if every safety rule passes.
+
+    Never partially sends: all checks run first (under a lock on the lead, so a concurrent send cannot double
+    up); a Gmail failure leaves the draft in place and is reported as a reason (a failed EmailSent is kept).
+    On success: EmailSent recorded, draft deleted, lead -> contacted with last_contact today, and a
+    "Follow up email" action due in 4 days.
+    """
+    result = DraftSendResult(draft_id=draft_id)
+    limit = int(settings.EMAIL_SEND_DAILY_LIMIT_PER_USER)
+    with transaction.atomic():
+        draft = EmailDraft.objects.select_related("lead", "assigned_to").filter(pk=draft_id).first()
+        if draft is None:
+            result.reasons.append("draft not found")
+            return result
+        lead = Lead.objects.select_for_update().get(pk=draft.lead_id)
+        draft.lead = lead
+        reasons = draft_send_refusals(draft, user)
+        if sends_today(user) >= limit:
+            reasons.append(f"daily send limit reached ({limit} per user per day)")
+        if reasons:
+            result.reasons = reasons
+            return result
+        try:
+            email_sent = send_email_draft(draft, user=user)
+        except Exception as e:  # noqa: BLE001 - reported to the caller; the failed EmailSent row is kept
+            logger.warning("Token send of draft %s failed: %s", draft_id, e)
+            result.reasons.append(f"send failed: {e}")
+            return result
+        _apply_sent_effects(lead, email_sent)
+    result.sent = True
+    result.email_sent_id = email_sent.pk
+    return result
+
+
+def send_drafts_as_user(draft_ids: list[int], user: User) -> list[DraftSendResult]:
+    """Send several drafts as ``user``; each is judged independently (order preserved, duplicates collapsed)."""
+    results: list[DraftSendResult] = []
+    for draft_id in dict.fromkeys(draft_ids):
+        results.append(send_draft_as_user(draft_id, user))
+    return results

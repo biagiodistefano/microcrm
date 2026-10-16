@@ -759,3 +759,33 @@ class SendEmailResponse(Schema):
     email_id: int
     status: str
     message: str = ""
+
+
+class DraftSendIn(Schema):
+    """Batch send request."""
+
+    draft_ids: list[int] = Field(min_length=1, max_length=50)
+
+
+class DraftSendResultSchema(Schema):
+    """Outcome of sending one draft."""
+
+    draft_id: int
+    sent: bool
+    email_sent_id: int | None = None
+    reasons: list[str] = []
+
+
+class DraftSendBatchOut(Schema):
+    """Outcome of a batch send."""
+
+    sent: int
+    refused: int
+    results: list[DraftSendResultSchema]
+
+
+class ContactCheckOut(Schema):
+    """Whether a lead was already contacted, and why."""
+
+    already_contacted: bool
+    reasons: list[str]

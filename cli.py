@@ -16,6 +16,7 @@ from rich.table import Table
 
 # --- Configuration ---
 API_KEY: str = config("API_KEY", default="dev-api-key")
+API_TOKEN: str = config("CRM_TOKEN", default="")  # personal API token (needed to send drafts)
 BASE_URL: str = config("CRM_BASE_URL", default="http://localhost:8000/api")
 
 console = Console()
@@ -34,7 +35,7 @@ class APIClient:
     def _get_client(self) -> httpx.Client:
         return httpx.Client(
             base_url=self.base_url,
-            headers={"X-API-Key": self.api_key},
+            headers={"X-API-Key": self.api_key, **({"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {})},
             timeout=30.0,
         )
 

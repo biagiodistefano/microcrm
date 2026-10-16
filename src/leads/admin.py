@@ -1819,6 +1819,77 @@ class EmailSignatureAdmin(ModelAdmin):  # type: ignore[misc]
     )
 
 
+@admin.register(models.UserApiToken)
+class UserApiTokenAdmin(ModelAdmin):  # type: ignore[misc]
+    """Personal API tokens: staff create/revoke their own (plaintext shown once); superusers see all."""
+
+    list_display = ["name", "user", "prefix", "created_at", "last_used_at", "status"]
+    list_filter = ["user"]
+    readonly_fields = ["user", "prefix", "created_at", "last_used_at", "revoked_at"]
+    actions = ["revoke_selected"]
+
+    def get_fields(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> list[str]:
+        """Only the name when creating; read-only details afterwards."""
+        if obj is None:
+            return ["name"]
+        return ["name", "user", "prefix", "created_at", "last_used_at", "revoked_at"]
+
+    def get_readonly_fields(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> list[str]:
+        """The name is only editable on creation."""
+        return [*self.readonly_fields, "name"] if obj is not None else []
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[models.UserApiToken]:
+        """Superusers see every token; everyone else only their own."""
+        qs: QuerySet[models.UserApiToken] = super().get_queryset(request).select_related("user")
+        return qs if request.user.is_superuser else qs.filter(user=t.cast(User, request.user))
+
+    def has_module_permission(self, request: HttpRequest) -> bool:
+        return bool(request.user.is_active and request.user.is_staff)
+
+    def has_view_permission(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> bool:
+        return bool(request.user.is_active and request.user.is_staff)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return bool(request.user.is_active and request.user.is_staff)
+
+    def has_change_permission(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj: models.UserApiToken | None = None) -> bool:
+        return False
+
+    @admin.display(description="Status")
+    def status(self, obj: models.UserApiToken) -> str:
+        return "active" if obj.is_active else "revoked"
+
+    def save_model(self, request: HttpRequest, obj: models.UserApiToken, form: forms.ModelForm, change: bool) -> None:  # type: ignore[type-arg]
+        """Issue a token for the requesting user and show the plaintext exactly once."""
+        if change:
+            return
+        row, plaintext = models.UserApiToken.issue(t.cast(User, request.user), obj.name)
+        obj.pk = row.pk
+        obj.user = row.user
+        obj.token_hash = row.token_hash
+        obj.prefix = row.prefix
+        obj.created_at = row.created_at
+        messages.warning(
+            request,
+            format_html(
+                "Your new API token (copy it now, it will not be shown again): <code>{}</code>",
+                plaintext,
+            ),
+        )
+
+    @admin.action(description="Revoke selected tokens")
+    def revoke_selected(self, request: HttpRequest, queryset: QuerySet[models.UserApiToken]) -> None:
+        """Revoke the selected tokens (own tokens only, unless superuser; the queryset is already scoped)."""
+        count = 0
+        for token in queryset.filter(revoked_at__isnull=True):
+            token.revoke()
+            count += 1
+        self.message_user(request, f"Revoked {count} token(s).", messages.SUCCESS)
+
+
 @admin.register(models.ResearchPromptConfig)
 class ResearchPromptConfigAdmin(SingletonModelAdmin, ModelAdmin):  # type: ignore[misc]
     """Admin for ResearchPromptConfig singleton."""

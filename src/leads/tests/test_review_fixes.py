@@ -45,6 +45,7 @@ def make_instances() -> dict[type, t.Any]:
         EmailDraft: EmailDraft.objects.create(lead=lead, subject="s", body="b", assigned_to=user),
         models.GmailConnection: models.GmailConnection.objects.create(user=user, email="u@x.io", refresh_token="t"),
         models.EmailSignature: models.EmailSignature.objects.create(user=user, body="sig"),
+        models.UserApiToken: models.UserApiToken.issue(user, "t")[0],
         models.ResearchPromptConfig: models.ResearchPromptConfig.get_solo(),
         models.ResearchJob: models.ResearchJob.objects.create(city=city),
         OutreachMessage: OutreachMessage.objects.create(lead=lead, channel="instagram", text="hi", assigned_to=user),
@@ -142,7 +143,7 @@ def test_all_send_paths_refuse_dnc(lead: Lead, rep: User, api_client: Client) ->
     with pytest.raises(HttpError), patch("leads.gmail.send_email_via_gmail") as gmail:
         service.send_email_draft(draft, rep)
     gmail.assert_not_called()
-    assert api_client.post(f"/api/email-drafts/{draft.pk}/send").status_code == 400
+    assert api_client.post(f"/api/email-drafts/{draft.pk}/send").status_code == 403  # shared key cannot send
     assert api_client.post(f"/api/messages/{msg.pk}/mark-sent").status_code == 400
     r = api_client.post(
         f"/api/leads/{lead.pk}/send-email", {"subject": "s", "body": "b"}, content_type="application/json"

@@ -1,10 +1,12 @@
 import hashlib
+import secrets
 import typing as t
 from urllib.parse import parse_qs, quote, urlparse
 
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import F
+from django.utils import timezone
 from encrypted_fields.fields import EncryptedTextField
 from simple_history.models import HistoricalRecords
 from solo.models import SingletonModel
@@ -657,3 +659,54 @@ class EmailSignature(models.Model):
     def __str__(self) -> str:
         """Return string representation."""
         return f"Signature for {self.user.get_full_name() or self.user.username}"
+
+
+class UserApiToken(models.Model):
+    """Personal API token that authenticates API requests as one user (``Authorization: Bearer <token>``).
+
+    Only the sha256 hash of the token is stored; the plaintext is shown once, at creation.
+    """
+
+    TOKEN_PREFIX = "mcrm_"
+
+    user = models.ForeignKey("auth.User", on_delete=models.CASCADE, related_name="api_tokens")
+    name = models.CharField(max_length=100, help_text="What this token is for (e.g. 'laptop CLI')")
+    token_hash = models.CharField(max_length=64, unique=True, editable=False, help_text="sha256 hex of the token")
+    prefix = models.CharField(max_length=12, editable=False, help_text="First characters of the token, to recognise it")
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "API Token"
+        verbose_name_plural = "API Tokens"
+
+    @staticmethod
+    def hash_token(token: str) -> str:
+        """Return the sha256 hex digest stored for a plaintext token."""
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    @classmethod
+    def issue(cls, user: t.Any, name: str) -> tuple["UserApiToken", str]:
+        """Create a token for ``user``; returns ``(row, plaintext)``. The plaintext is never stored."""
+        plaintext = f"{cls.TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+        row = cls.objects.create(
+            user=user, name=name, token_hash=cls.hash_token(plaintext), prefix=plaintext[: len(cls.TOKEN_PREFIX) + 4]
+        )
+        return row, plaintext
+
+    @property
+    def is_active(self) -> bool:
+        """True while the token has not been revoked."""
+        return self.revoked_at is None
+
+    def revoke(self) -> None:
+        """Revoke the token (idempotent)."""
+        if self.revoked_at is None:
+            self.revoked_at = timezone.now()
+            self.save(update_fields=["revoked_at"])
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        return f"{self.name} ({self.prefix}...)"
