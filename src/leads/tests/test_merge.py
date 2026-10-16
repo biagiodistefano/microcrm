@@ -527,3 +527,94 @@ class TestCli:
     def test_raw(self, fake: FakeApi) -> None:
         r = runner.invoke(cli.app, ["leads", "merge", "5", "6", "-f", "--raw"])
         assert json.loads(r.output) == {"id": 5, "name": "Merged"}
+
+
+class TestMergedIdentities:
+    def _upsert(self, **kwargs: t.Any) -> tuple[Lead, bool, str | None]:
+        from leads.schema import LeadUpsertIn
+
+        return service.upsert_lead(LeadUpsertIn(**kwargs))
+
+    def test_reupsert_of_merged_away_dnc_lead_resolves_to_primary(self) -> None:
+        a = make("Club", bluesky="a.bsky.social", facebook="clubA", external_ref="salesops:ig:club")
+        b = make(
+            "Club",
+            bluesky="b.bsky.social",
+            facebook="clubB",
+            whatsapp="+492",
+            external_ref="salesops:bsky:b",
+            do_not_contact=True,
+            do_not_contact_reason="no",
+        )
+        merged = service.merge_leads(a, [b])
+        assert merged.do_not_contact
+        assert merged.merged_external_refs == ["salesops:bsky:b"]
+        lead, created, on = self._upsert(name="Other name", external_ref="SalesOps:bsky:B")
+        assert (lead.pk, created, on) == (a.pk, False, "external_ref") and lead.do_not_contact
+        for field, value in (("bluesky", "B.bsky.social"), ("facebook", "clubB"), ("whatsapp", "+492")):
+            lead, created, on = self._upsert(name="Zzz", **{field: value})
+            assert (lead.pk, created, on) == (a.pk, False, field), field
+            assert lead.do_not_contact
+        assert Lead.objects.count() == 1
+
+    def test_notes_list_conflicting_values(self) -> None:
+        a = make("A", company="Club GmbH", source="s1", bluesky="a.bsky")
+        b = make("B", company="Club UG", source="s2", bluesky="b.bsky", external_ref="r-b")
+        a.external_ref = "r-a"
+        a.save()
+        merged = service.merge_leads(a, [b])
+        line = f"Merged from #{b.pk}: external_ref=r-b, bluesky=b.bsky, company=Club UG, source=s2"
+        assert line in merged.notes
+
+    def test_chain_merge_keeps_earlier_identities(self) -> None:
+        a, b, c = (
+            make("A", external_ref="a", bluesky="aa"),
+            make("B", external_ref="b", bluesky="bb"),
+            make("C", external_ref="c"),
+        )
+        b = service.merge_leads(b, [c])
+        merged = service.merge_leads(a, [b])
+        assert set(merged.merged_external_refs) == {"b", "c"}
+        assert merged.merged_identities == {"bluesky": ["bb"]} and merged.bluesky == "aa"
+
+    def test_adopted_external_ref_not_recorded_as_merged(self) -> None:
+        merged = service.merge_leads(make("P"), [make("O", external_ref="only")])
+        assert merged.external_ref == "only" and merged.merged_external_refs == []
+
+    def test_lead_level_contact_method_kept_as_contact(self) -> None:
+        a = make("A", email="a@x.org", website="https://a.example")
+        b = make("B", email="b@x.org", website="https://b.example")
+        merged = service.merge_leads(a, [b])
+        assert set(merged.contacts.values_list("email", flat=True)) >= {"b@x.org"}
+        assert merged.contacts.filter(website="https://b.example").exists()
+
+
+class TestExtraDedupAndPrimary:
+    def test_contact_dedup_on_phone_digits_and_telegram(self) -> None:
+        primary = make("P")
+        Contact.objects.create(lead=primary, name="K", phone="+49 151 234 5678", telegram="@club")
+        other = make("O")
+        Contact.objects.create(lead=other, name="d1", phone="0049-151-234-5678"[2:].replace("49-", "+49 ", 1))
+        Contact.objects.create(lead=other, name="d2", telegram="https://t.me/Club")
+        Contact.objects.create(lead=other, name="short", phone="12345")
+        Contact.objects.create(lead=other, name="short2", phone="12345")
+        merged = service.merge_leads(primary, [other])
+        assert sorted(merged.contacts.values_list("name", flat=True)) == ["K", "short", "short2"]
+
+    def test_default_primary_prefers_dnc_then_status_then_filled(self) -> None:
+        plain = make("Plain", age_days=50, status="converted")
+        dnc = make("Dnc", age_days=1, do_not_contact=True)
+        assert service.pick_default_primary([plain, dnc]) == dnc
+        rich = make("Rich", age_days=1, email="a@x.org", instagram="r", website="https://r.example")
+        poor = make("Poor", age_days=9)
+        assert service.pick_default_primary([poor, rich]) == rich
+        older = make("Older", age_days=99)
+        assert service.pick_default_primary([rich, older, poor]) == rich
+
+
+def test_tag_pill_is_escaped(admin_client: Client) -> None:
+    lead = make("X")
+    lead.tags.add(Tag.objects.create(name="<script>alert(1)</script>"))
+    html = admin_client.get(reverse("admin:leads_lead_changelist")).content.decode()
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html

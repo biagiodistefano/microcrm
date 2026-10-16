@@ -1155,18 +1155,21 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         tags = obj.tags.all()
         if not tags:
             return "-"
-        pills = []
+        parts = []
         for tag in tags:
-            pills.append(
-                f'<span style="background: #e5e7eb; color: #374151; padding: 1px 6px; '
-                f'border-radius: 9999px; font-size: 0.75em; margin-right: 2px;">{tag.name}</span>'
+            parts.append(
+                format_html(
+                    '<span style="background: #e5e7eb; color: #374151; padding: 1px 6px; '
+                    'border-radius: 9999px; font-size: 0.75em; margin-right: 2px;">{}</span>',
+                    tag.name,
+                )
             )
             if tag.name.lower().startswith(lead_service.REVIEW_GROUP_PREFIX):
                 url = f"{reverse('admin:leads_lead_changelist')}?{urlencode({'duplicate_group': tag.name})}"
-                pills.append(
+                parts.append(
                     format_html('<a href="{}" style="font-size: 0.75em; margin-right: 4px;">Open group</a>', url)
                 )
-        return mark_safe(" ".join(pills))
+        return format_html_join(" ", "{}", ((part,) for part in parts))
 
     @admin.display(description="Last Contact")
     def display_last_contact(self, obj: models.Lead) -> str:

@@ -52,6 +52,7 @@ CONTACT_FIELDS: tuple[str, ...] = ("email", "phone", "telegram", "instagram", "w
 # Lead-only identity fields (not mirrored on Contact) that also count as dedupe keys
 LEAD_ONLY_MATCH_FIELDS: tuple[str, ...] = ("bluesky", "facebook", "linkedin", "whatsapp")
 LEAD_MATCH_FIELDS: tuple[str, ...] = (*CONTACT_FIELDS, *LEAD_ONLY_MATCH_FIELDS)
+MERGED_IDENTITY_FIELDS: tuple[str, ...] = LEAD_ONLY_MATCH_FIELDS
 # Fields filled on an existing lead only when currently blank
 LEAD_FILL_FIELDS: tuple[str, ...] = ("company", "notes", "source", "external_ref", *LEAD_MATCH_FIELDS)
 FOLLOW_UP_DAYS = 4
@@ -286,6 +287,30 @@ def normalize_website(url: str) -> str:
     return f"{host}{path}"
 
 
+def _leads_with_merged_identity(field: str, value: str) -> list[Lead]:
+    """Leads that absorbed a merged-away lead owning ``value`` for ``field`` ("external_ref" or a handle field)."""
+    wanted = value.strip().lower()
+    found = []
+    for lead in (
+        Lead.objects.exclude(merged_external_refs=[])
+        if field == "external_ref"
+        else Lead.objects.exclude(merged_identities={})
+    ):
+        values = lead.merged_external_refs if field == "external_ref" else lead.merged_identities.get(field, [])
+        if wanted in (str(v).strip().lower() for v in values):
+            found.append(lead)
+    return found
+
+
+def _match_external_ref(ref: str) -> Lead | None:
+    """Lead owning ``ref`` directly, else one that absorbed a lead owning it through a merge (do-not-contact first)."""
+    lead = Lead.objects.filter(external_ref=ref).first()
+    if lead:
+        return lead
+    merged = _leads_with_merged_identity("external_ref", ref)
+    return next((x for x in merged if x.do_not_contact), merged[0] if merged else None)
+
+
 def _match_exact(field: str, value: str) -> tuple[Contact | None, Lead] | None:
     """Case-insensitive exact match on a strong identity key (Contact rows first, then Lead columns).
 
@@ -298,6 +323,8 @@ def _match_exact(field: str, value: str) -> tuple[Contact | None, Lead] | None:
             (c, c.lead) for c in Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value})
         ]
     candidates += [(None, lead) for lead in Lead.objects.filter(**{f"{field}__iexact": value})]
+    if field in MERGED_IDENTITY_FIELDS:
+        candidates += [(None, lead) for lead in _leads_with_merged_identity(field, value)]
     return next((c for c in candidates if c[1].do_not_contact), candidates[0] if candidates else None)
 
 
@@ -333,10 +360,9 @@ def find_existing_lead(data: LeadUpsertIn, city: City | None) -> tuple[Contact |
     def ok(lead: Lead) -> bool:
         return not (ref and lead.external_ref and lead.external_ref != ref)
 
-    if ref:
-        lead = Lead.objects.filter(external_ref=ref).first()
-        if lead:
-            return None, lead, "external_ref"
+    ref_lead = _match_external_ref(ref) if ref else None
+    if ref_lead:
+        return None, ref_lead, "external_ref"
 
     for field in LEAD_MATCH_FIELDS:
         value = (getattr(data, field) or "").strip()
@@ -1357,6 +1383,7 @@ MERGE_FILL_FIELDS: tuple[str, ...] = (
 MERGE_FILL_RELATIONS: tuple[str, ...] = ("lead_type", "city")
 REVIEW_GROUP_PREFIX = "review:duplicate-"
 REVIEW_GENERIC_TAG = "review:duplicates"
+PHONE_MATCH_MIN_DIGITS = 8
 CHANGE_REASON_MAX = 100  # simple_history's history_change_reason column
 
 
@@ -1369,9 +1396,23 @@ def status_rank(status: str) -> int:
     return STATUS_FUNNEL.index(status) if status in STATUS_FUNNEL else -1
 
 
+def _filled_identities(lead: Lead) -> int:
+    """How many identity fields (contact methods, handles, external_ref) are filled on the lead."""
+    return sum(1 for field in (*LEAD_MATCH_FIELDS, "external_ref") if getattr(lead, field))
+
+
 def pick_default_primary(leads: t.Sequence[Lead]) -> Lead:
-    """Pick the lead to keep by default: most advanced status, then the oldest (lowest created_at, then id)."""
-    return min(leads, key=lambda lead: (-status_rank(lead.status), lead.created_at, lead.pk))
+    """Pick the lead to keep: a do-not-contact one first, then most advanced status, most identities, oldest."""
+    return min(
+        leads,
+        key=lambda lead: (
+            not lead.do_not_contact,
+            -status_rank(lead.status),
+            -_filled_identities(lead),
+            lead.created_at,
+            lead.pk,
+        ),
+    )
 
 
 def _merged_status(primary: Lead, others: t.Sequence[Lead]) -> str:
@@ -1449,6 +1490,82 @@ def _merge_do_not_contact(primary: Lead, others: t.Sequence[Lead]) -> None:
     sync_do_not_contact_timestamp(primary)
 
 
+CONFLICT_NOTE_FIELDS: tuple[str, ...] = (
+    "external_ref",
+    *LEAD_ONLY_MATCH_FIELDS,
+    "email",
+    "phone",
+    "telegram",
+    "instagram",
+    "website",
+    "company",
+    "source",
+)
+
+
+def _differs(a: str, b: str) -> bool:
+    return a.strip().lower() != b.strip().lower()
+
+
+def _remember_identities(primary: Lead, other: Lead) -> None:
+    """Record ``other``'s external_refs and lead-only handles on the primary when they differ from its own."""
+    refs: list[str] = primary.merged_external_refs
+    for ref in [other.external_ref, *(other.merged_external_refs or [])]:
+        if ref and _differs(ref, primary.external_ref) and ref not in refs:
+            refs.append(ref)
+    for field in MERGED_IDENTITY_FIELDS:
+        known: list[str] = primary.merged_identities.setdefault(field, [])
+        for value in [getattr(other, field), *(other.merged_identities or {}).get(field, [])]:
+            if value and _differs(value, getattr(primary, field)) and value not in known:
+                known.append(value)
+
+
+def _keep_contact_methods(primary: Lead, other: Lead) -> None:
+    """Give ``other``'s lead-level contact methods a Contact row on the primary unless one already covers them."""
+    for field in CONTACT_FIELDS:
+        value = getattr(other, field)
+        if not value or not _differs(value, getattr(primary, field)):
+            continue
+        probe = Contact(**{field: value})
+        keys = _contact_keys(probe)
+        existing = primary.contacts.all()
+        covered = (
+            any(keys & _contact_keys(c) for c in existing)
+            if keys
+            else any(not _differs(getattr(c, field), value) for c in existing)
+        )
+        if not covered:
+            Contact.objects.create(lead=primary, name=other.name or "Merged", **{field: value})
+
+
+def _note_conflicts(primary: Lead, other: Lead) -> None:
+    """Append one note line listing every non-empty value of ``other`` that differs from the primary's."""
+    lost = [
+        f"{field}={getattr(other, field)}"
+        for field in CONFLICT_NOTE_FIELDS
+        if getattr(other, field) and _differs(getattr(other, field), getattr(primary, field))
+    ]
+    line = f"Merged from #{other.pk}: {', '.join(lost)}"
+    if lost and line not in primary.notes:
+        primary.notes = f"{primary.notes.rstrip()}\n\n{line}" if primary.notes.strip() else line
+
+
+def _preserve_identities(primary: Lead, others: t.Sequence[Lead]) -> None:
+    """Keep every non-empty value of a merged-away lead that did not make it onto the primary.
+
+    external_refs and lead-only handles go to ``merged_external_refs`` / ``merged_identities`` (upsert matches on
+    them, so a re-import resolves to the primary); contact methods become extra Contact rows; everything is also
+    listed in the primary's notes. Call after contacts moved and before the others are deleted.
+    """
+    primary.merged_external_refs = list(primary.merged_external_refs or [])
+    primary.merged_identities = {k: list(v) for k, v in (primary.merged_identities or {}).items()}
+    for other in others:
+        _remember_identities(primary, other)
+        _keep_contact_methods(primary, other)
+        _note_conflicts(primary, other)
+    primary.merged_identities = {k: v for k, v in primary.merged_identities.items() if v}
+
+
 def _contact_keys(contact: Contact) -> set[tuple[str, str]]:
     """Identity keys of a contact used to detect duplicates: (field, normalised value) for email and instagram."""
     keys: set[tuple[str, str]] = set()
@@ -1456,6 +1573,13 @@ def _contact_keys(contact: Contact) -> set[tuple[str, str]]:
         keys.add(("email", contact.email.strip().lower()))
     if contact.instagram.strip():
         keys.add(("instagram", contact.instagram.strip().lstrip("@").lower()))
+    digits = "".join(ch for ch in contact.phone if ch.isdigit())
+    if len(digits) >= PHONE_MATCH_MIN_DIGITS:
+        keys.add(("phone", digits))
+    handle = re.sub(r"^(https?://)?(www\.)?(t\.me|telegram\.me)/", "", contact.telegram.strip(), flags=re.I)
+    handle = handle.strip("/").lstrip("@").lower()
+    if handle:
+        keys.add(("telegram", handle))
     return keys
 
 
@@ -1555,6 +1679,7 @@ def merge_leads(primary: Lead, others: t.Sequence[Lead], user: AbstractBaseUser 
 
         _move_contacts(locked_primary, locked_others)
         _move_related(locked_primary, locked_others)
+        _preserve_identities(locked_primary, locked_others)
 
         locked_primary._change_reason = _change_reason(locked_others, user)  # type: ignore[attr-defined]
         for other in locked_others:
