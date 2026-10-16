@@ -5,6 +5,7 @@ from urllib.parse import urlencode, urlparse
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
+from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
 from django.contrib.auth.models import User
 from django.core.exceptions import PermissionDenied
 from django.db.models import Count, DateField, Q, QuerySet
@@ -814,16 +815,6 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         except models.GmailConnection.DoesNotExist:
             pass
 
-        # Get user's email signature
-        signature_html = ""
-        user_pk = getattr(request.user, "pk", None)
-        if user_pk is not None:
-            try:
-                sig = models.EmailSignature.objects.get(user_id=user_pk)
-                signature_html = sig.body
-            except (models.EmailSignature.DoesNotExist, TypeError, ValueError):
-                pass
-
         context = {
             **self.admin_site.each_context(request),
             "title": f"Send Email to {lead.name}",
@@ -835,7 +826,6 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
             "templates_by_language": templates_by_language,
             "next_action": next_action_data,
             "back_url": back_url,
-            "signature_html": signature_html,
             "opts": self.model._meta,
             "has_view_permission": True,
         }
@@ -1610,6 +1600,59 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
     ]
     ordering = ["-created_at"]
     list_per_page = 25
+    actions = ["mark_sent_confirmed", "mark_failed"]
+
+    def get_actions(self, request: HttpRequest) -> t.Any:
+        """Resolving a pending send is superuser-only."""
+        actions = super().get_actions(request)
+        if not request.user.is_superuser:
+            actions.pop("mark_sent_confirmed", None)
+            actions.pop("mark_failed", None)
+        return actions
+
+    def _resolve_pending(
+        self, request: HttpRequest, queryset: QuerySet[models.EmailSent], action: str, title: str
+    ) -> HttpResponse | None:
+        """Confirm page, then apply ``action`` ("sent" or "failed") to the PENDING rows in the queryset."""
+        pending = list(queryset.filter(status=models.EmailSent.Status.PENDING).select_related("lead"))
+        if not pending:
+            self.message_user(request, "No pending emails selected.", messages.WARNING)
+            return None
+        if request.POST.get("confirm") != "yes":
+            return render(
+                request,
+                "admin/leads/emailsent/resolve_confirm.html",
+                {
+                    **self.admin_site.each_context(request),
+                    "title": title,
+                    "emails": pending,
+                    "action": action,
+                    "action_checkbox_name": ACTION_CHECKBOX_NAME,
+                    "selected": [e.pk for e in pending],
+                    "opts": self.model._meta,
+                },
+            )
+        for email in pending:
+            if action == "sent":
+                lead_service.finalize_sent(email)
+            else:
+                lead_service.mark_send_failed(email, f"Marked failed by {request.user}: not delivered per Gmail")
+        self.message_user(request, f"Marked {len(pending)} email(s) as {action}.", messages.SUCCESS)
+        return None
+
+    @admin.action(description="Mark sent (confirmed in Gmail)", permissions=["resolve"])
+    def mark_sent_confirmed(self, request: HttpRequest, queryset: QuerySet[models.EmailSent]) -> HttpResponse | None:
+        """Pending rows that Gmail's Sent folder shows as delivered: apply the normal send side effects."""
+        return self._resolve_pending(request, queryset, "sent", "Mark pending emails as sent")
+
+    @admin.action(description="Mark failed (not delivered)", permissions=["resolve"])
+    def mark_failed(self, request: HttpRequest, queryset: QuerySet[models.EmailSent]) -> HttpResponse | None:
+        """Pending rows that Gmail's Sent folder does not show: allow the lead to be emailed again."""
+        return self._resolve_pending(request, queryset, "failed", "Mark pending emails as failed")
+
+    def has_resolve_permission(self, request: HttpRequest) -> bool:
+        """Only superusers may resolve pending sends."""
+        return bool(request.user.is_superuser)
 
     fieldsets = (
         (None, {"fields": ("lead", "template", "status", "sent_by")}),

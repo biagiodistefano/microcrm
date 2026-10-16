@@ -266,7 +266,6 @@
     </div>
     {% endif %}
 
-    {{ signature_html|json_script:"signature-data" }}
 
     <form method="post" id="send-email-form" novalidate>
         {% csrf_token %}
@@ -322,6 +321,7 @@
         <div class="form-row">
             <label for="id_body">Body</label>
             <div id="quill-editor"></div>
+            <p class="help" style="font-size: 0.8em; opacity: 0.7;">Your signature is added automatically when sending.</p>
             {{ form.body }}
             {{ form.body.errors }}
         </div>
@@ -360,8 +360,6 @@
         const usedTemplateIds = {{ used_template_ids|safe }};
         const templatesByLanguage = {{ templates_by_language|safe }};
 
-        // Load signature
-        const signatureHtml = JSON.parse(document.getElementById('signature-data').textContent);
 
         // Initialize Quill editor
         const quill = new Quill('#quill-editor', {
@@ -387,18 +385,9 @@
             }).join('');
         }
 
-        // Helper: build signature block with separator
-        function getSignatureBlock() {
-            if (!signatureHtml) return '';
-            return '<p><br></p><p>--</p><div data-revel-signature>' + signatureHtml + '</div>';
-        }
-
         // Load existing body content into Quill
         if (bodyTextarea.value) {
             quill.root.innerHTML = textToHtml(bodyTextarea.value);
-        } else if (signatureHtml) {
-            // Empty body — pre-load with just the signature
-            quill.root.innerHTML = '<p><br></p>' + getSignatureBlock();
         }
 
         // Sync Quill content to hidden textarea on form submit
@@ -455,9 +444,8 @@
                     .then(response => response.json())
                     .then(data => {
                         if (subjectInput) subjectInput.value = data.subject;
-                        // Set rendered template body + signature in editor
-                        const templateBody = textToHtml(data.body);
-                        quill.root.innerHTML = templateBody + getSignatureBlock();
+                        // Set rendered template body in editor (the signature is added when sending)
+                        quill.root.innerHTML = textToHtml(data.body);
                     })
                     .catch(error => {
                         console.error('Error fetching template:', error);

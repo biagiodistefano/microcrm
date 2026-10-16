@@ -12,6 +12,7 @@ from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.models import AnonymousUser, User
 from django.core.mail import EmailMessage
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from ninja.errors import HttpError
@@ -872,6 +873,17 @@ def send_email_to_lead(  # noqa: PLR0913
     unreplaced = validate_no_placeholders(subject, body)
     if unreplaced:
         raise ValueError(f"Unreplaced placeholders found: {', '.join(unreplaced)}")
+
+    # An API send for this lead may be in flight (or unresolved): never send over it. The lead row lock is held to
+    # the end of the surrounding transaction (ATOMIC_REQUESTS), so an API send cannot slip in between.
+    with transaction.atomic():
+        Lead.objects.select_for_update().filter(pk=lead.pk).first()
+        pending = lead.emails_sent.filter(status=EmailSent.Status.PENDING).first()
+    if pending is not None:
+        raise ValueError(
+            f"A send to this lead is still pending (email #{pending.pk}, started {pending.created_at:%Y-%m-%d %H:%M}). "
+            "Check Gmail's Sent folder, then resolve it under Sent Emails (Mark sent / Mark failed) first."
+        )
 
     gmail_connection = _get_gmail_connection(user)
 
@@ -1749,6 +1761,28 @@ def _apply_sent_effects(lead: Lead, email_sent: EmailSent) -> None:
     )
 
 
+def finalize_sent(email_sent: EmailSent, draft_id: int | None = None) -> None:
+    """Commit a successful send: mark SENT, drop the matching draft(s), apply the lead updates and follow-up.
+
+    Also used by the admin to resolve a stale PENDING row confirmed in Gmail.
+    """
+    with transaction.atomic():
+        email_sent.status = EmailSent.Status.SENT
+        email_sent.sent_at = email_sent.sent_at or timezone.now()
+        email_sent.error_message = ""
+        email_sent.save(update_fields=["status", "sent_at", "error_message"])
+        same_content = Q(lead_id=email_sent.lead_id, subject=email_sent.subject, to=email_sent.to)
+        EmailDraft.objects.filter(Q(pk=draft_id) | same_content if draft_id else same_content).delete()
+        _apply_sent_effects(Lead.objects.select_for_update().get(pk=email_sent.lead_id), email_sent)
+
+
+def mark_send_failed(email_sent: EmailSent, reason: str) -> None:
+    """Resolve a PENDING send as not delivered (a FAILED row never blocks a retry)."""
+    email_sent.status = EmailSent.Status.FAILED
+    email_sent.error_message = reason
+    email_sent.save(update_fields=["status", "error_message"])
+
+
 def _reserve_send(draft_id: int, user: User, result: DraftSendResult) -> tuple[EmailDraft, EmailSent] | None:
     """Phase A (short transaction): re-check every rule under locks and record a PENDING EmailSent.
 
@@ -1815,20 +1849,18 @@ def send_draft_as_user(draft_id: int, user: User) -> DraftSendResult:
         )
     except Exception as e:  # noqa: BLE001 - reported to the caller
         logger.warning("Token send of draft %s failed: %s", draft_id, e)
-        email_sent.status = EmailSent.Status.FAILED
-        email_sent.error_message = str(e)
-        email_sent.save(update_fields=["status", "error_message"])
+        mark_send_failed(email_sent, str(e))
         result.reasons.append(f"send failed: {e}")
         return result
 
-    with transaction.atomic():
-        email_sent.status = EmailSent.Status.SENT
-        email_sent.sent_at = timezone.now()
-        email_sent.save(update_fields=["status", "sent_at"])
-        EmailDraft.objects.filter(pk=draft.pk).delete()
-        _apply_sent_effects(Lead.objects.select_for_update().get(pk=draft.lead_id), email_sent)
-    result.sent = True
     result.email_sent_id = email_sent.pk
+    result.sent = True  # Gmail accepted it; from here on never call Gmail again for this draft
+    try:
+        email_sent.sent_at = timezone.now()
+        finalize_sent(email_sent, draft_id=draft.pk)
+    except Exception:
+        logger.exception("Bookkeeping failed after Gmail accepted email #%s (draft %s)", email_sent.pk, draft_id)
+        result.reasons.append("sent; bookkeeping failed, check admin (email stays pending until resolved)")
     return result
 
 

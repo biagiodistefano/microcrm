@@ -492,8 +492,7 @@ def test_token_scope(prod_auth: None, api_client: Client, token: str, lead: Lead
         ("post", "/api/cities/"),
     ):
         r = getattr(api_client, method)(path, **h)
-        assert r.status_code == 403, (method, path, r.status_code)
-        assert "use the API key" in r.json()["detail"]
+        assert r.status_code == 401, (method, path, r.status_code)  # token alone: no valid credential for this path
     assert Lead.objects.filter(pk=lead.pk).exists()
 
 
@@ -542,15 +541,15 @@ def test_stale_pending_still_blocks_and_is_flagged(me: User, lead: Lead, gmail: 
     gmail.assert_not_called()
 
 
-def test_phase_c_failure_leaves_pending_and_blocks_resend(me: User, lead: Lead) -> None:
+def test_phase_c_failure_reports_sent_and_blocks_resend(me: User, lead: Lead) -> None:
     draft = make_draft(lead, me)
     with (
         patch("leads.gmail.get_gmail_credentials"),
         patch("leads.gmail.send_email_via_gmail") as send,
         patch.object(service, "_apply_sent_effects", side_effect=RuntimeError("db hiccup")),
     ):
-        with pytest.raises(RuntimeError):
-            service.send_draft_as_user(draft.pk, me)
+        result = service.send_draft_as_user(draft.pk, me)
+        assert result.sent and "bookkeeping failed, check admin" in result.reasons[0]
         assert send.call_count == 1
         assert EmailSent.objects.get().status == EmailSent.Status.PENDING
         assert EmailDraft.objects.filter(pk=draft.pk).exists()
@@ -582,10 +581,13 @@ def test_batch_failure_midway_does_not_double_send_on_retry(prod_auth: None, me:
             patch.object(service, "_apply_sent_effects", flaky),
         ):
             r = c.post("/api/email-drafts/send", {"draft_ids": ids}, content_type=JSON, **bearer(token))
-            assert r.status_code == 500 and send.call_count == 2
-            assert EmailSent.objects.filter(status="sent").count() == 1  # first one's commit survived
+            assert r.status_code == 200 and send.call_count == 2  # the batch carried on past the failure
+            first, second = r.json()["results"]
+            assert first["sent"] and first["reasons"] == []
+            assert second["sent"] and "bookkeeping failed" in second["reasons"][0]
+            assert sorted(EmailSent.objects.values_list("status", flat=True)) == ["pending", "sent"]
             r = c.post("/api/email-drafts/send", {"draft_ids": ids}, content_type=JSON, **bearer(token))
-            assert r.status_code == 200
+            assert r.status_code == 200 and r.json()["sent"] == 0
             assert send.call_count == 2  # nothing re-sent
     finally:
         connection.settings_dict["ATOMIC_REQUESTS"] = old
@@ -656,8 +658,133 @@ def test_signature_image_only_marker(me: User) -> None:
     assert service.append_signature(once, me) == once
 
 
-def test_admin_editor_prefill_uses_marker() -> None:
+def test_admin_editor_does_not_prefill_signature() -> None:
     from pathlib import Path
 
-    tpl = Path(__file__).parents[2] / "templates/admin/leads/lead/send_email.html"
-    assert "data-revel-signature" in tpl.read_text()
+    text = (Path(__file__).parents[2] / "templates/admin/leads/lead/send_email.html").read_text()
+    assert "getSignatureBlock" not in text and "signature-data" not in text
+    assert "signature is added automatically when sending" in text
+
+
+def test_image_only_signature_not_doubled_via_admin_draft_roundtrip(me: User) -> None:
+    EmailSignature.objects.create(user=me, body='<p><img src="https://x/logo.png"></p>')
+    body = service.append_signature("<p>Hi</p>", me)
+    assert body.count("logo.png") == 1 and service.append_signature(body, me) == body
+
+
+# --- N1: admin send vs pending API send ---
+
+
+def test_admin_send_refused_while_api_send_pending(me: User, lead: Lead, gmail: MagicMock) -> None:
+    EmailSent.objects.create(lead=lead, from_email="a@b.c", to=["x@y.z"], subject="s", body="b", status="pending")
+    with pytest.raises(ValueError, match="still pending"):
+        service.send_email_to_lead(lead, "S", "<p>b</p>", ["org@example.com"], user=me)
+    draft = make_draft(lead, me)
+    with pytest.raises(ValueError, match="still pending"):
+        service.send_email_draft(draft, user=me)
+    gmail.assert_not_called()
+    assert EmailDraft.objects.filter(pk=draft.pk).exists()
+
+
+def test_admin_follow_up_on_contacted_lead_still_allowed(me: User, lead: Lead, gmail: MagicMock) -> None:
+    EmailSent.objects.create(lead=lead, from_email="a@b.c", to=["x@y.z"], subject="s", body="b", status="sent")
+    Lead.objects.filter(pk=lead.pk).update(status="contacted", last_contact=date(2026, 1, 1))
+    assert service.send_email_to_lead(lead, "S", "<p>b</p>", ["org@example.com"], user=me).status == "sent"
+
+
+def test_admin_draft_send_shows_message(me: User, lead: Lead, gmail: MagicMock) -> None:
+    from leads.admin import EmailDraftAdmin
+
+    EmailSent.objects.create(lead=lead, from_email="a@b.c", to=["x@y.z"], subject="s", body="b", status="pending")
+    draft = make_draft(lead, me)
+    req = _admin_request(me)
+    EmailDraftAdmin(EmailDraft, django_admin.site).send_selected_drafts(req, EmailDraft.objects.filter(pk=draft.pk))
+    assert any("still pending" in str(m) for m in req._messages)
+    gmail.assert_not_called()
+
+
+# --- N2: both headers (CLI style) ---
+
+
+def test_cli_style_both_headers(prod_auth: None, api_client: Client, token: str) -> None:
+    h = {"HTTP_X_API_KEY": "shared-key", **bearer(token)}
+    r = api_client.post("/api/leads/", {"name": "New Org"}, content_type=JSON, **h)
+    assert r.status_code == 201
+    assert api_client.get("/api/tags/", **h).status_code == 200
+
+
+def test_send_with_both_headers_uses_token_user(
+    prod_auth: None, api_client: Client, me: User, token: str, lead: Lead, gmail: MagicMock
+) -> None:
+    h = {"HTTP_X_API_KEY": "shared-key", **bearer(token)}
+    draft = make_draft(lead, me)
+    assert api_client.post(f"/api/email-drafts/{draft.pk}/send", **h).status_code == 200
+
+
+def test_send_with_only_api_key_is_403(prod_auth: None, api_client: Client, me: User, lead: Lead) -> None:
+    draft = make_draft(lead, me)
+    r = api_client.post(f"/api/email-drafts/{draft.pk}/send", HTTP_X_API_KEY="shared-key")
+    assert r.status_code == 403
+
+
+# --- N3: admin resolve of PENDING rows ---
+
+
+@pytest.fixture
+def pending_row(me: User, lead: Lead) -> EmailSent:
+    draft = make_draft(lead, me)
+    return EmailSent.objects.create(
+        lead=lead, from_email="a@b.c", to=draft.to, subject=draft.subject, body="b", status="pending", sent_by=me
+    )
+
+
+def _resolve(user: User, name: str, ids: list[int], confirm: bool = False) -> t.Any:
+    madmin: t.Any = django_admin.site._registry[EmailSent]
+    req = _admin_request(user)
+    if confirm:
+        req.POST = {"confirm": "yes"}
+    return madmin, req, getattr(madmin, name)(req, EmailSent.objects.filter(pk__in=ids))
+
+
+def test_resolve_actions_superuser_only(me: User) -> None:
+    madmin: t.Any = django_admin.site._registry[EmailSent]
+    req = _admin_request(me)
+    assert "mark_sent_confirmed" not in madmin.get_actions(req)
+    me.is_superuser = True
+    assert {"mark_sent_confirmed", "mark_failed"} <= set(madmin.get_actions(req))
+
+
+def test_mark_sent_confirmed_needs_confirmation_then_applies_effects(
+    me: User, lead: Lead, pending_row: EmailSent
+) -> None:
+    me.is_superuser = True
+    _, _, response = _resolve(me, "mark_sent_confirmed", [pending_row.pk])
+    assert response.status_code == 200 and b"Confirm" in response.content
+    pending_row.refresh_from_db()
+    assert pending_row.status == "pending"  # nothing happened yet
+
+    _resolve(me, "mark_sent_confirmed", [pending_row.pk], confirm=True)
+    pending_row.refresh_from_db()
+    lead.refresh_from_db()
+    assert pending_row.status == "sent" and pending_row.sent_at is not None
+    assert lead.status == "contacted" and lead.last_contact == timezone.localdate()
+    assert Action.objects.get(lead=lead).name == "Follow up email"
+    assert not EmailDraft.objects.filter(lead=lead).exists()
+
+
+def test_mark_failed_unblocks_lead(me: User, lead: Lead, pending_row: EmailSent, gmail: MagicMock) -> None:
+    me.is_superuser = True
+    _resolve(me, "mark_failed", [pending_row.pk], confirm=True)
+    pending_row.refresh_from_db()
+    assert pending_row.status == "failed" and "not delivered" in pending_row.error_message
+    lead.refresh_from_db()
+    assert lead.status == "new" and lead.last_contact is None
+    assert service.send_draft_as_user(EmailDraft.objects.get(lead=lead).pk, me).sent
+
+
+def test_resolve_ignores_non_pending_rows(me: User, lead: Lead) -> None:
+    done = EmailSent.objects.create(lead=lead, from_email="a@b.c", to=["x@y.z"], subject="s", body="b", status="sent")
+    me.is_superuser = True
+    _resolve(me, "mark_failed", [done.pk], confirm=True)
+    done.refresh_from_db()
+    assert done.status == "sent"

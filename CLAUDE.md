@@ -233,7 +233,7 @@ python cli.py jobs list --status completed
   `User`; use `leads.auth.get_request_user` / `require_request_user`). `X-API-Key` keeps working for everything else.
   The CLI reads the token from `CRM_TOKEN`. Tokens only work for staff users and only on: draft send endpoints,
   `GET` leads/email-drafts/messages, `POST /messages/{id}/mark-sent`, `GET /messages/{id}/contact-check`; anything
-  else with a Bearer token is 403 ("use the API key"). There is no `leads/{id}/send-email` endpoint any more: the
+  else falls through to the `X-API-Key` (the CLI sends both headers), so a token alone gets 401 there. There is no `leads/{id}/send-email` endpoint any more: the
   only API send path is the token draft-send flow.
 - **Sending drafts needs a personal token** (shared `X-API-Key` alone gets 403): `POST /email-drafts/{id}/send` and
   `POST /email-drafts/send` `{draft_ids}` (max 10) send only drafts assigned to the token's user, from their Gmail, via
@@ -245,7 +245,10 @@ python cli.py jobs list --status completed
   `POST /messages/{id}/mark-sent` with a token records `sent_by`.
 - **Signature**: `send_email_to_lead` (so admin sends, draft sends and the token API alike) appends the sending
   user's `EmailSignature` after `<p><br></p><p>--</p>`; idempotent (skipped when the body already contains the
-  signature text, e.g. the admin editor pre-filled it). The block is wrapped in `<div data-revel-signature>`.
+  signature text, e.g. the admin editor pre-filled it). The block is wrapped in `<div data-revel-signature>`. The admin editor no longer pre-fills the
+  signature (a note says it is added when sending).
+- **A FAILED send may still have been delivered** (Gmail can accept a message and the response be lost, or a later
+  step fail). Check Gmail's Sent folder before retrying a failed or unknown send.
 - **Send phases**: reserve (locks the user's GmailConnection + lead, commits a PENDING EmailSent) -> Gmail call outside
   any transaction -> commit SENT + lead updates, or FAILED. The draft-send views are exempted from ATOMIC_REQUESTS by
   `crm.middleware.NonAtomicSendMiddleware`. A PENDING row blocks resends; older than 15 min the admin shows

@@ -45,7 +45,7 @@ class BearerTokenAuth(HttpBearer):
         if not row.user.is_staff:
             return None
         if not token_may_call(request.method or "", request.path):
-            raise HttpError(403, "This endpoint is not available to personal tokens; use the API key for this endpoint")
+            return None  # not a token endpoint: fall through to the shared X-API-Key (CLI sends both headers)
         UserApiToken.objects.filter(pk=row.pk).update(last_used_at=timezone.now())
         return row.user
 
