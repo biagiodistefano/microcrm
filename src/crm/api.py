@@ -15,6 +15,7 @@ from leads.controllers import (
     EmailTemplateController,
     LeadController,
     LeadTypeController,
+    OutreachMessageController,
     ResearchJobController,
     TagController,
 )
@@ -76,4 +77,5 @@ api.register_controllers(
     EmailTemplateController,
     EmailSentController,
     EmailDraftController,
+    OutreachMessageController,
 )

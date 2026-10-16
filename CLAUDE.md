@@ -91,6 +91,7 @@ Commands:
   templates   Manage email templates
   emails      View sent emails
   drafts      Manage email drafts
+  messages    Manage outreach (DM) messages
 ```
 
 ### leads
@@ -113,6 +114,19 @@ leads send-email LEAD_ID [--template] [--subject] [--body] [--to] [--bcc]
                 NOTE: Runs in DRY-RUN mode by default. Use --send to actually send.
 leads emails    LEAD_ID [--raw]
 ```
+
+### messages (Outreach / DM messages; sending is always manual)
+```
+messages list      [--page] [--page-size] [--status] [--channel] [--batch] [--assigned-to]
+                   [--lead] [--created-since] [--search] [--raw]
+messages get       MESSAGE_ID [--raw]
+messages create    --lead --channel --text --assigned-to [--humanized-hash] [--batch] [--raw]
+messages mark-sent MESSAGE_ID [--raw]
+messages skip      MESSAGE_ID [--raw]
+```
+New lead fields (`--bluesky --facebook --linkedin --whatsapp --ticketing-platform --external-ref`) are on
+`leads create/update`; `leads import FILE --upsert` dedupes via `POST /leads/upsert`. `drafts create` takes
+`--assigned-to --from-email --humanized-hash --batch`. Leads with `do_not_contact` refuse new messages/drafts.
 
 ### cities
 ```
@@ -208,6 +222,16 @@ python cli.py cities research 11
 # Check research job status
 python cli.py jobs list --status completed
 ```
+
+## API Notes
+
+- `PUT` on leads/messages/drafts is a full replacement: omitted fields reset to their defaults (including the
+  new `bluesky`, `facebook`, `linkedin`, `whatsapp`, `external_ref`, `ticketing_platforms`). Use `PATCH` or
+  `POST /leads/upsert` to change only some fields. `PUT` never touches `do_not_contact`.
+- `POST /leads/upsert` returns `{id, created, do_not_contact, matched_on}`. `external_ref` is lowercased and
+  stripped everywhere. Aggregator/social websites (linktr.ee, instagram.com, ...) are never a dedupe key.
+- Marking a lead do-not-contact skips its draft DMs, deletes its unsent email drafts (history is kept), and blocks
+  every send path. An assigned email draft can only be sent by its assignee or a superuser, from their own Gmail.
 
 ## Architecture
 

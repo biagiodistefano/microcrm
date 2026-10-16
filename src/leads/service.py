@@ -3,11 +3,13 @@
 import logging
 import re
 import typing as t
+from datetime import timedelta
+from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.mail import EmailMessage
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from ninja.errors import HttpError
@@ -22,6 +24,7 @@ from leads.models import (
     GmailConnection,
     Lead,
     LeadType,
+    OutreachMessage,
     ResearchJob,
     Tag,
 )
@@ -37,11 +40,20 @@ from leads.schema import (
     EmailTemplatePatch,
     LeadIn,
     LeadPatch,
+    LeadUpsertIn,
+    OutreachMessageIn,
+    OutreachMessagePatch,
     ResearchJobIn,
     SendEmailIn,
 )
 
 CONTACT_FIELDS: tuple[str, ...] = ("email", "phone", "telegram", "instagram", "website")
+# Lead-only identity fields (not mirrored on Contact) that also count as dedupe keys
+LEAD_ONLY_MATCH_FIELDS: tuple[str, ...] = ("bluesky", "facebook", "linkedin", "whatsapp")
+LEAD_MATCH_FIELDS: tuple[str, ...] = (*CONTACT_FIELDS, *LEAD_ONLY_MATCH_FIELDS)
+# Fields filled on an existing lead only when currently blank
+LEAD_FILL_FIELDS: tuple[str, ...] = ("company", "notes", "source", "external_ref", *LEAD_MATCH_FIELDS)
+FOLLOW_UP_DAYS = 4
 
 logger = logging.getLogger(__name__)
 
@@ -110,19 +122,76 @@ def _dual_write_primary_contact(lead: Lead, contact_updates: dict[str, str], is_
     primary.save()
 
 
+def sync_do_not_contact_timestamp(lead: Lead) -> None:
+    """Stamp do_not_contact_at when suppression is switched on; reset the reason/stamp when switched off."""
+    if lead.do_not_contact and lead.do_not_contact_at is None:
+        lead.do_not_contact_at = timezone.now()
+    elif not lead.do_not_contact:
+        lead.do_not_contact_at = None
+        lead.do_not_contact_reason = ""
+
+
+def refuse_if_do_not_contact(lead: Lead) -> None:
+    """Raise a 400 if the lead is suppressed (no outreach may be created for it).
+
+    Raises:
+        HttpError: 400 when the lead is marked do not contact.
+    """
+    if lead.do_not_contact:
+        raise HttpError(400, f"Lead '{lead.name}' is marked do not contact; no outreach can be created for it")
+
+
+def suppress_outreach(lead: Lead) -> None:
+    """Neutralise pending outreach for a do-not-contact lead.
+
+    Draft DMs are marked skipped; unsent email drafts are deleted (their history rows are kept by
+    simple_history, so the audit trail survives, and nothing unsendable lingers in anyone's queue).
+    """
+    if not lead.do_not_contact:
+        return
+    for message in lead.messages.filter(status=OutreachMessage.Status.DRAFT):
+        message.status = OutreachMessage.Status.SKIPPED
+        message.save(update_fields=["status", "updated_at"])
+    for draft in lead.email_drafts.all():
+        draft.delete()
+
+
+def mark_do_not_contact(lead: Lead, reason: str = "") -> Lead:
+    """Suppress a lead (idempotent; keeps an existing reason when none is given)."""
+    lead.do_not_contact = True
+    if reason:
+        lead.do_not_contact_reason = reason
+    sync_do_not_contact_timestamp(lead)
+    lead.save(update_fields=["do_not_contact", "do_not_contact_reason", "do_not_contact_at", "updated_at"])
+    suppress_outreach(lead)
+    return lead
+
+
+def _ensure_external_ref_free(lead: Lead, external_ref: str) -> None:
+    """Raise 409 if another lead already owns this (non-empty) external_ref."""
+    if external_ref and Lead.objects.filter(external_ref=external_ref).exclude(pk=lead.pk).exists():
+        raise HttpError(409, f"A lead with external_ref '{external_ref}' already exists")
+
+
 def apply_lead_data(lead: Lead, data: LeadIn | LeadPatch, is_patch: bool = False) -> Lead:
     """Apply data to a lead, handling related objects and dual-writing contact fields."""
     exclude = {"city", "lead_type", "tags"}
     data_dict = data.model_dump(exclude=exclude, exclude_unset=is_patch)
 
+    _ensure_external_ref_free(lead, data_dict.get("external_ref") or "")
+
     contact_updates: dict[str, str] = {}
     for field, value in data_dict.items():
+        if value is None and field in ("ticketing_platforms", "do_not_contact", "do_not_contact_reason"):
+            continue
         setattr(lead, field, value)
         if field in CONTACT_FIELDS:
             contact_updates[field] = value or ""
 
     _apply_lead_relations(lead, data, is_patch)
+    sync_do_not_contact_timestamp(lead)
     lead.save()
+    suppress_outreach(lead)
 
     _dual_write_primary_contact(lead, contact_updates, is_patch)
 
@@ -149,6 +218,210 @@ def update_lead(lead: Lead, data: LeadIn) -> Lead:
 def patch_lead(lead: Lead, data: LeadPatch) -> Lead:
     """Partially update a lead."""
     return apply_lead_data(lead, data, is_patch=True)
+
+
+def bulk_update_lead_tags(lead_ids: list[int], add: list[str], remove: list[str]) -> int:
+    """Add and/or remove tags (case-insensitive names) on many leads. Returns how many leads exist and were touched."""
+    leads = list(Lead.objects.filter(id__in=lead_ids))
+    to_add = get_or_create_tags(add)
+    to_remove = [tag for name in remove for tag in Tag.objects.filter(name__iexact=name)]
+    with transaction.atomic():
+        for lead in leads:
+            if to_add:
+                lead.tags.add(*to_add)
+            if to_remove:
+                lead.tags.remove(*to_remove)
+    return len(leads)
+
+
+# --- Lead Upsert (dedupe + merge) ---
+
+
+# Hosts shared by many organizations (link hubs, socials, ticketing, maps): never a dedupe key
+AGGREGATOR_HOSTS: tuple[str, ...] = (
+    "linktr.ee",
+    "instagram.com",
+    "facebook.com",
+    "fb.com",
+    "ra.co",
+    "bsky.app",
+    "linkedin.com",
+    "tiktok.com",
+    "beacons.ai",
+    "lnk.bio",
+    "carrd.co",
+    "t.me",
+    "wa.me",
+    "maps.app.goo.gl",
+)
+
+
+def _is_aggregator(host: str, path: str) -> bool:
+    """True for hosts/paths that identify a platform rather than one organization."""
+    if any(host == h or host.endswith(f".{h}") for h in AGGREGATOR_HOSTS):
+        return True
+    if host.startswith("eventbrite.") or ".eventbrite." in host:
+        return True
+    is_google = host == "google.com" or host.startswith("google.") or host.endswith(".google.com")
+    return is_google and (path.startswith("/maps") or host.startswith("maps."))
+
+
+def normalize_website(url: str) -> str:
+    """Normalise a website to ``host/path`` (no scheme, www, query or trailing slash; host lowercased).
+
+    Returns "" for empty input and for aggregator/social hosts, which must never be used for matching.
+    """
+    url = url.strip()
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url if "//" in url else f"//{url}")
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return ""
+    path = parsed.path.rstrip("/")
+    if not host or _is_aggregator(host, path):
+        return ""
+    return f"{host}{path}"
+
+
+def _match_exact(field: str, value: str) -> tuple[Contact | None, Lead] | None:
+    """Case-insensitive exact match on a strong identity key (Contact rows first, then Lead columns).
+
+    Strong keys are never vetoed by external_ref. If several leads match, a do-not-contact one wins so a
+    suppressed lead can never be bypassed by a duplicate.
+    """
+    candidates: list[tuple[Contact | None, Lead]] = []
+    if field in CONTACT_FIELDS:
+        candidates += [
+            (c, c.lead) for c in Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value})
+        ]
+    candidates += [(None, lead) for lead in Lead.objects.filter(**{f"{field}__iexact": value})]
+    return next((c for c in candidates if c[1].do_not_contact), candidates[0] if candidates else None)
+
+
+def _match_website(value: str, ok: t.Callable[[Lead], bool]) -> tuple[Contact | None, Lead] | None:
+    """Match on a normalised website; stored values are normalised on the fly."""
+    norm = normalize_website(value)
+    if not norm:
+        return None
+    host = norm.split("/")[0]
+    for contact in Contact.objects.select_related("lead").filter(website__icontains=host):
+        if normalize_website(contact.website) == norm and ok(contact.lead):
+            return contact, contact.lead
+    for lead in Lead.objects.filter(website__icontains=host):
+        if normalize_website(lead.website) == norm and ok(lead):
+            return None, lead
+    return None
+
+
+def find_existing_lead(data: LeadUpsertIn, city: City | None) -> tuple[Contact | None, Lead | None, str | None]:
+    """Find the lead an incoming record refers to.
+
+    Order: external_ref, then each contact method / handle, then name+city. Exact matches on strong keys
+    (email, phone, instagram, telegram, bluesky, facebook, linkedin, whatsapp) win regardless of external_ref,
+    since the same organisation found on another source arrives with a different ref. Only the weak keys
+    (website, name+city) are vetoed by a different non-empty external_ref on the candidate.
+
+    Returns:
+        Tuple of (matched_contact, lead, matched_on). matched_contact is set only on a Contact-row match;
+        matched_on is the key name ("external_ref", "email", ..., "name_city"), or None if nothing matched.
+    """
+    ref = data.external_ref
+
+    def ok(lead: Lead) -> bool:
+        return not (ref and lead.external_ref and lead.external_ref != ref)
+
+    if ref:
+        lead = Lead.objects.filter(external_ref=ref).first()
+        if lead:
+            return None, lead, "external_ref"
+
+    for field in LEAD_MATCH_FIELDS:
+        value = (getattr(data, field) or "").strip()
+        if not value:
+            continue
+        found = _match_website(value, ok) if field == "website" else _match_exact(field, value)
+        if found:
+            return found[0], found[1], field
+
+    if city is not None:
+        for candidate in Lead.objects.filter(name__iexact=data.name, city=city):
+            if ok(candidate):
+                return None, candidate, "name_city"
+    return None, None, None
+
+
+def _merge_contact_methods(lead: Lead, matched: Contact | None, data: LeadUpsertIn) -> None:
+    """Mirror incoming contact methods onto Contacts: fill blanks, or add a secondary for a new method."""
+    incoming = {f: getattr(data, f) for f in CONTACT_FIELDS if getattr(data, f)}
+    if not incoming:
+        return
+    target = matched or lead.contacts.filter(is_primary=True).first()
+    shares = target is not None and any(
+        (getattr(target, f) or "").strip().lower() == v.strip().lower() for f, v in incoming.items()
+    )
+    if target is None:
+        Contact.objects.create(lead=lead, name="Primary", is_primary=True, **incoming)
+    elif matched is not None or shares:
+        for field, value in incoming.items():
+            if not getattr(target, field):
+                setattr(target, field, value)
+        target.save()
+    else:
+        Contact.objects.create(lead=lead, name=data.name or "Contact", is_primary=False, **incoming)
+
+
+def merge_lead_data(lead: Lead, matched: Contact | None, data: LeadUpsertIn) -> Lead:
+    """Merge incoming data into an existing lead.
+
+    Only blank fields are filled; status, temperature, value and last_contact are never touched.
+    Tags and ticketing platforms are merged additively.
+    """
+    for field in LEAD_FILL_FIELDS:
+        incoming = getattr(data, field)
+        if incoming and not getattr(lead, field):
+            if field == "external_ref":
+                _ensure_external_ref_free(lead, incoming)
+            setattr(lead, field, incoming)
+    if data.do_not_contact:
+        lead.do_not_contact = True
+        lead.do_not_contact_reason = lead.do_not_contact_reason or data.do_not_contact_reason
+        sync_do_not_contact_timestamp(lead)
+    if data.lead_type and not lead.lead_type:
+        lead.lead_type = get_or_create_lead_type(data.lead_type)
+    if data.city and not lead.city:
+        lead.city = get_or_create_city(data.city)
+    lead.ticketing_platforms = list(dict.fromkeys([*(lead.ticketing_platforms or []), *data.ticketing_platforms]))
+    lead.save()
+    suppress_outreach(lead)
+
+    _merge_contact_methods(lead, matched, data)
+    if data.tags:
+        lead.tags.add(*get_or_create_tags(data.tags))
+    return lead
+
+
+def upsert_lead(data: LeadUpsertIn) -> tuple[Lead, bool, str | None]:
+    """Create a lead or merge into the existing one it matches (idempotent for a given external_ref).
+
+    Returns:
+        Tuple of (lead, created, matched_on); matched_on is None when a lead was created.
+    """
+    city = get_or_create_city(data.city) if data.city else None
+    matched, lead, matched_on = find_existing_lead(data, city)
+    if lead is None:
+        try:
+            with transaction.atomic():
+                return create_lead(data), True, None
+        except IntegrityError:
+            # Lost a race on external_ref: the other writer's lead is now the match
+            matched, lead, matched_on = find_existing_lead(data, city)
+            if lead is None:
+                raise
+    if lead.do_not_contact:
+        return lead, False, matched_on  # suppressed: change nothing
+    return merge_lead_data(lead, matched, data), False, matched_on
 
 
 # --- Contact Functions ---
@@ -537,6 +810,8 @@ def send_email_to_lead(  # noqa: PLR0913
     """
     from leads.gmail import get_gmail_credentials, send_email_via_gmail
 
+    refuse_if_do_not_contact(lead)
+
     # Validate no placeholders remain
     unreplaced = validate_no_placeholders(subject, body)
     if unreplaced:
@@ -664,6 +939,7 @@ def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
     """
     from leads.tasks import send_email_task
 
+    refuse_if_do_not_contact(lead)
     contact = _resolve_send_contact(lead, data.contact_id)
     template, subject, body = _resolve_send_subject_body(lead, data, contact)
     to = _resolve_send_recipients(data.to, contact, lead)
@@ -721,6 +997,18 @@ def _default_draft_recipients(contact: Contact | None, lead: Lead) -> list[str]:
     return []
 
 
+def _resolve_user_by_email(email: str) -> User:
+    """Look up a user by email (case-insensitive).
+
+    Raises:
+        HttpError: 404 if no user has that email.
+    """
+    user = User.objects.filter(email__iexact=email).first()
+    if user is None:
+        raise HttpError(404, f"User with email {email} not found")
+    return user
+
+
 def create_email_draft(data: EmailDraftIn) -> EmailDraft:
     """Create a new email draft.
 
@@ -736,16 +1024,21 @@ def create_email_draft(data: EmailDraftIn) -> EmailDraft:
     lead = get_object_or_404(Lead, pk=data.lead_id)
     template = get_object_or_404(EmailTemplate, pk=data.template_id) if data.template_id else None
     contact = _resolve_draft_contact(lead, data.contact_id)
+    refuse_if_do_not_contact(lead)
+    assigned_to = _resolve_user_by_email(data.assigned_to_email) if data.assigned_to_email else None
 
     return EmailDraft.objects.create(
         lead=lead,
         contact=contact,
         template=template,
-        from_email=data.from_email or settings.DEFAULT_FROM_EMAIL,
+        assigned_to=assigned_to,
+        from_email=data.from_email or _resolve_from_email(_get_gmail_connection(assigned_to)),
         to=data.to or _default_draft_recipients(contact, lead),
         bcc=data.bcc,
         subject=data.subject,
         body=data.body,
+        humanized_hash=data.humanized_hash,
+        batch=data.batch,
     )
 
 
@@ -762,14 +1055,20 @@ def update_email_draft(draft: EmailDraft, data: EmailDraftIn) -> EmailDraft:
     Raises:
         Http404: If lead, template, or contact not found
     """
-    draft.lead = get_object_or_404(Lead, pk=data.lead_id)
+    new_lead = get_object_or_404(Lead, pk=data.lead_id)
+    if new_lead.pk != draft.lead_id:
+        refuse_if_do_not_contact(new_lead)
+    draft.lead = new_lead
     draft.template = get_object_or_404(EmailTemplate, pk=data.template_id) if data.template_id else None
     draft.contact = _resolve_draft_contact(draft.lead, data.contact_id)
-    draft.from_email = data.from_email or settings.DEFAULT_FROM_EMAIL
+    draft.assigned_to = _resolve_user_by_email(data.assigned_to_email) if data.assigned_to_email else None
+    draft.from_email = data.from_email or _resolve_from_email(_get_gmail_connection(draft.assigned_to))
     draft.to = data.to or _default_draft_recipients(draft.contact, draft.lead)
     draft.bcc = data.bcc
     draft.subject = data.subject
     draft.body = data.body
+    draft.humanized_hash = data.humanized_hash
+    draft.batch = data.batch
     draft.save()
     return draft
 
@@ -795,10 +1094,29 @@ def patch_email_draft(draft: EmailDraft, data: EmailDraftPatch) -> EmailDraft:
                 draft.contact = None
             else:
                 draft.contact = get_object_or_404(Contact, pk=value, lead=draft.lead)
+        elif field == "assigned_to_email":
+            draft.assigned_to = _resolve_user_by_email(value) if value else None
         else:
             setattr(draft, field, value)
     draft.save()
     return draft
+
+
+def _ensure_may_send_draft(draft: EmailDraft, user: User | None) -> None:
+    """Only the assignee (or a superuser acting explicitly) may send an assigned draft.
+
+    Sending always uses the acting user's own Gmail connection, never anyone else's.
+
+    Raises:
+        HttpError: 403 if the draft is assigned to someone else, or to someone and there is no acting user.
+    """
+    assignee = draft.assigned_to
+    if assignee is None:
+        return
+    if not isinstance(user, User):
+        raise HttpError(403, f"Draft is assigned to {assignee.email}; it must be sent by them from the admin")
+    if user.pk != assignee.pk and not user.is_superuser:
+        raise HttpError(403, f"Draft is assigned to {assignee.email}; only they (or a superuser) can send it")
 
 
 def send_email_draft(draft: EmailDraft, user: User | None = None) -> EmailSent:
@@ -816,6 +1134,9 @@ def send_email_draft(draft: EmailDraft, user: User | None = None) -> EmailSent:
     Raises:
         ValueError: If there are unreplaced placeholders in subject or body
     """
+    refuse_if_do_not_contact(draft.lead)
+    _ensure_may_send_draft(draft, user)
+
     # Validate no placeholders remain
     errors = validate_no_placeholders(draft.subject, draft.body)
     if errors:
@@ -872,6 +1193,7 @@ def save_email_as_draft(  # noqa: PLR0913
     Raises:
         Http404: If draft_id is invalid or belongs to a different lead
     """
+    refuse_if_do_not_contact(lead)
     from_email = _resolve_from_email(_get_gmail_connection(user))
 
     resolved_contact = contact if contact is not None else lead.contacts.filter(is_primary=True).first()
@@ -882,6 +1204,7 @@ def save_email_as_draft(  # noqa: PLR0913
         draft.template = template
         draft.contact = resolved_contact
         draft.from_email = from_email
+        draft.assigned_to = draft.assigned_to or (user if isinstance(user, User) else None)
         draft.to = to
         draft.bcc = bcc or []
         draft.subject = subject
@@ -894,8 +1217,108 @@ def save_email_as_draft(  # noqa: PLR0913
         contact=resolved_contact,
         template=template,
         from_email=from_email,
+        assigned_to=user if isinstance(user, User) else None,
         to=to,
         bcc=bcc or [],
         subject=subject,
         body=body,
     )
+
+
+# --- Outreach Message Functions ---
+
+
+def create_outreach_message(data: OutreachMessageIn) -> OutreachMessage:
+    """Create an outreach message in `draft` status. Never sends anything.
+
+    Raises:
+        Http404: If the lead doesn't exist.
+        HttpError: 404 if assigned_to_email matches no user.
+    """
+    lead = get_object_or_404(Lead, pk=data.lead_id)
+    refuse_if_do_not_contact(lead)
+    assigned_to = _resolve_user_by_email(data.assigned_to_email) if data.assigned_to_email else None
+    return OutreachMessage.objects.create(
+        lead=lead,
+        channel=data.channel,
+        text=data.text,
+        assigned_to=assigned_to,
+        humanized_hash=data.humanized_hash,
+        batch=data.batch,
+    )
+
+
+def update_outreach_message(message: OutreachMessage, data: OutreachMessageIn) -> OutreachMessage:
+    """Update an outreach message (full replacement of its input fields)."""
+    new_lead = get_object_or_404(Lead, pk=data.lead_id)
+    if new_lead.pk != message.lead_id:
+        refuse_if_do_not_contact(new_lead)
+    message.lead = new_lead
+    message.channel = data.channel
+    message.text = data.text
+    message.assigned_to = _resolve_user_by_email(data.assigned_to_email) if data.assigned_to_email else None
+    message.humanized_hash = data.humanized_hash
+    message.batch = data.batch
+    message.save()
+    return message
+
+
+def patch_outreach_message(message: OutreachMessage, data: OutreachMessagePatch) -> OutreachMessage:
+    """Partially update an outreach message."""
+    for field, value in data.model_dump(exclude_unset=True).items():
+        if field == "assigned_to_email":
+            message.assigned_to = _resolve_user_by_email(value) if value else None
+        elif value is not None:
+            setattr(message, field, value)
+    message.save()
+    return message
+
+
+def mark_message_sent(message: OutreachMessage, user: User | None = None) -> OutreachMessage:
+    """Record that a human sent this message by hand.
+
+    Sets status/sent_at/sent_by, bumps the lead's last_contact to today, moves a `new` lead to `contacted`
+    (later statuses are never downgraded) and schedules a follow-up Action. Idempotent for already-sent messages.
+    """
+    today = timezone.localdate()
+    with transaction.atomic():
+        # Lock the row and re-check, so a concurrent/stale second call creates no second follow-up
+        list(OutreachMessage.objects.select_for_update().filter(pk=message.pk))
+        message.refresh_from_db()
+        if message.status == OutreachMessage.Status.SENT:
+            return message
+        refuse_if_do_not_contact(message.lead)
+        message.status = OutreachMessage.Status.SENT
+        message.sent_at = timezone.now()
+        message.sent_by = user if isinstance(user, User) else None
+        message.save()
+
+        # Re-read the lead so a stale in-memory status can never cause a downgrade
+        lead = Lead.objects.select_for_update().get(pk=message.lead_id)
+        lead.last_contact = today
+        update_fields = ["last_contact", "updated_at"]
+        if lead.status == Lead.Status.NEW:
+            lead.status = Lead.Status.CONTACTED
+            update_fields.append("status")
+        lead.save(update_fields=update_fields)
+
+        Action.objects.create(
+            lead=lead,
+            name=f"Follow up {message.get_channel_display()} DM",
+            notes=f"Follow up on outreach message #{message.pk}",
+            due_date=today + timedelta(days=FOLLOW_UP_DAYS),
+        )
+    return message
+
+
+def mark_message_skipped(message: OutreachMessage) -> OutreachMessage:
+    """Mark a message as skipped (no lead side effects).
+
+    Raises:
+        ValueError: If the message was already sent.
+    """
+    if message.status == OutreachMessage.Status.SENT:
+        raise ValueError("Cannot skip a message that was already sent")
+    message.status = OutreachMessage.Status.SKIPPED
+    message.save(update_fields=["status", "updated_at"])
+    return message

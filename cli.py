@@ -135,8 +135,12 @@ def leads_list(
     search: str | None = typer.Option(None, "--search", "-q", help="Search across name, email, company, notes"),
     # Filters
     status: str | None = typer.Option(
-        None, "--status", help="Filter by status (new, contacted, qualified, converted, lost)"
+        None,
+        "--status",
+        help="Filter by status (new, contacted, replied, qualified, call_booked, org_created, ...)",
     ),
+    external_ref: str | None = typer.Option(None, "--external-ref", help="Filter by external reference"),
+    do_not_contact: bool | None = typer.Option(None, "--do-not-contact/--contactable", help="Filter by suppression"),
     temperature: str | None = typer.Option(None, "--temperature", "-t", help="Filter by temperature (cold, warm, hot)"),
     lead_type: str | None = typer.Option(None, "--type", help="Filter by lead type name"),
     city_id: int | None = typer.Option(None, "--city-id", help="Filter by city ID"),
@@ -160,6 +164,8 @@ def leads_list(
             "city": city,
             "country": country,
             "tag": tag,
+            "external_ref": external_ref,
+            "do_not_contact": None if do_not_contact is None else str(do_not_contact).lower(),
         }
         if no_draft:
             params["has_draft"] = "false"
@@ -206,8 +212,16 @@ def leads_create(
     telegram: str = typer.Option("", "--telegram", help="Telegram username"),
     instagram: str = typer.Option("", "--instagram", help="Instagram handle"),
     website: str = typer.Option("", "--website", "-w", help="Website URL"),
+    bluesky: str = typer.Option("", "--bluesky", help="Bluesky handle"),
+    facebook: str = typer.Option("", "--facebook", help="Facebook page URL or slug"),
+    linkedin: str = typer.Option("", "--linkedin", help="LinkedIn URL"),
+    whatsapp: str = typer.Option("", "--whatsapp", help="WhatsApp number"),
+    ticketing_platforms: list[str] = typer.Option(
+        [], "--ticketing-platform", help="Ticketing platform key (repeatable)"
+    ),
+    external_ref: str = typer.Option("", "--external-ref", help="External reference (unique)"),
     source: str = typer.Option("", "--source", help="Lead source"),
-    status: str = typer.Option("new", "--status", "-s", help="Status (new, contacted, qualified, converted, lost)"),
+    status: str = typer.Option("new", "--status", "-s", help="Status (see `leads list --help`)"),
     temperature: str = typer.Option("cold", "--temperature", "-t", help="Temperature (cold, warm, hot)"),
     tags: list[str] = typer.Option([], "--tag", help="Tags (can be specified multiple times)"),
     notes: str = typer.Option("", "--notes", help="Additional notes"),
@@ -224,6 +238,12 @@ def leads_create(
             "telegram": telegram,
             "instagram": instagram,
             "website": website,
+            "bluesky": bluesky,
+            "facebook": facebook,
+            "linkedin": linkedin,
+            "whatsapp": whatsapp,
+            "ticketing_platforms": ticketing_platforms,
+            "external_ref": external_ref,
             "source": source,
             "status": status,
             "temperature": temperature,
@@ -261,6 +281,13 @@ def leads_update(
     telegram: str | None = typer.Option(None, "--telegram", help="Telegram username"),
     instagram: str | None = typer.Option(None, "--instagram", help="Instagram handle"),
     website: str | None = typer.Option(None, "--website", "-w", help="Website URL"),
+    bluesky: str | None = typer.Option(None, "--bluesky", help="Bluesky handle"),
+    facebook: str | None = typer.Option(None, "--facebook", help="Facebook page URL or slug"),
+    linkedin: str | None = typer.Option(None, "--linkedin", help="LinkedIn URL"),
+    whatsapp: str | None = typer.Option(None, "--whatsapp", help="WhatsApp number"),
+    ticketing_platforms: list[str] | None = typer.Option(None, "--ticketing-platform", help="Ticketing platform keys"),
+    external_ref: str | None = typer.Option(None, "--external-ref", help="External reference (unique)"),
+    do_not_contact: bool | None = typer.Option(None, "--do-not-contact/--contactable", help="Set/clear suppression"),
     source: str | None = typer.Option(None, "--source", help="Lead source"),
     status: str | None = typer.Option(None, "--status", "-s", help="Status"),
     temperature: str | None = typer.Option(None, "--temperature", "-t", help="Temperature"),
@@ -280,6 +307,13 @@ def leads_update(
             "telegram": telegram,
             "instagram": instagram,
             "website": website,
+            "bluesky": bluesky,
+            "facebook": facebook,
+            "linkedin": linkedin,
+            "whatsapp": whatsapp,
+            "ticketing_platforms": ticketing_platforms,
+            "external_ref": external_ref,
+            "do_not_contact": do_not_contact,
             "source": source,
             "status": status,
             "temperature": temperature,
@@ -318,12 +352,41 @@ def leads_delete(
         handle_error(e)
 
 
+IMPORT_STRING_KEYS = (
+    "email",
+    "phone",
+    "telegram",
+    "instagram",
+    "website",
+    "source",
+    "notes",
+    "company",
+    "bluesky",
+    "facebook",
+    "linkedin",
+    "whatsapp",
+    "external_ref",
+)
+
+
+def _normalize_import_lead(lead: dict) -> None:
+    """Turn nulls into the empty values the API expects."""
+    for key in IMPORT_STRING_KEYS:
+        if lead.get(key) is None:
+            lead[key] = ""
+    if lead.get("ticketing_platforms") is None:
+        lead.pop("ticketing_platforms", None)
+
+
 @leads_app.command("import")
 def leads_import(
     file: Path = typer.Argument(..., help="JSON file containing leads array"),
     dry_run: bool = typer.Option(False, "--dry-run", "-d", help="Validate without creating"),
+    upsert: bool = typer.Option(
+        False, "--upsert", help="Dedupe/merge via POST /leads/upsert instead of always creating"
+    ),
 ) -> None:
-    """Import leads from a JSON file."""
+    """Import leads from a JSON file (supports the bluesky/facebook/linkedin/whatsapp/external_ref fields)."""
     if not file.exists():
         rprint(f"[red]File not found: {file}[/red]")
         raise typer.Exit(1)
@@ -348,12 +411,15 @@ def leads_import(
     failed = 0
     for i, lead in enumerate(leads, 1):
         # Normalize null values
-        for key in ("email", "phone", "telegram", "instagram", "website", "source", "notes", "company"):
-            if lead.get(key) is None:
-                lead[key] = ""
+        _normalize_import_lead(lead)
         try:
-            result = api.post("/leads/", lead)
-            rprint(f"  [{i}/{len(leads)}] [green]Created:[/green] {result['name']} (#{result['id']})")
+            if upsert:
+                result = api.post("/leads/upsert", lead)
+                verb = "Created" if result["created"] else "Merged"
+                rprint(f"  [{i}/{len(leads)}] [green]{verb}:[/green] {lead.get('name', '')} (#{result['id']})")
+            else:
+                result = api.post("/leads/", lead)
+                rprint(f"  [{i}/{len(leads)}] [green]Created:[/green] {result['name']} (#{result['id']})")
             success += 1
         except httpx.HTTPStatusError as e:
             try:
@@ -1263,9 +1329,13 @@ def drafts_create(
     template_id: int | None = typer.Option(None, "--template", "-t", help="Template ID"),
     to: str | None = typer.Option(None, "--to", help="Recipient email (comma-separated, defaults to lead email)"),
     bcc: str | None = typer.Option(None, "--bcc", help="BCC emails (comma-separated)"),
+    from_email: str | None = typer.Option(None, "--from-email", help="Sender (defaults to assignee's Gmail)"),
+    assigned_to: str | None = typer.Option(None, "--assigned-to", help="Email of the user whose queue it lands in"),
+    humanized_hash: str | None = typer.Option(None, "--humanized-hash", help="sha256 of subject+\\x1f+body"),
+    batch: str | None = typer.Option(None, "--batch", help="Batch label"),
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
 ) -> None:
-    """Create a new email draft."""
+    """Create a new email draft (never sends)."""
     try:
         data: dict[str, t.Any] = {
             "lead_id": lead_id,
@@ -1278,6 +1348,14 @@ def drafts_create(
             data["to"] = [e.strip() for e in to.split(",")]
         if bcc:
             data["bcc"] = [e.strip() for e in bcc.split(",")]
+        if from_email:
+            data["from_email"] = from_email
+        if assigned_to:
+            data["assigned_to_email"] = assigned_to
+        if humanized_hash:
+            data["humanized_hash"] = humanized_hash
+        if batch:
+            data["batch"] = batch
 
         result = api.post("/email-drafts/", data)
         if raw:
@@ -1359,6 +1437,131 @@ def drafts_send(
             output_json(result, raw=True)
         else:
             rprint(f"[green]Draft sent successfully! Email ID: #{result['id']}[/green]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+# --- Outreach Messages Commands ---
+messages_app = typer.Typer(help="Manage outreach (DM) messages. Sending is always done by hand.", no_args_is_help=True)
+app.add_typer(messages_app, name="messages")
+
+
+@messages_app.command("list")
+def messages_list(
+    page: int = typer.Option(1, "--page", "-p", help="Page number"),
+    page_size: int = typer.Option(20, "--page-size", "-s", help="Items per page"),
+    status: str | None = typer.Option(None, "--status", help="draft, sent, skipped"),
+    channel: str | None = typer.Option(
+        None, "--channel", help="instagram, facebook, whatsapp, bluesky, linkedin, telegram"
+    ),
+    batch: str | None = typer.Option(None, "--batch", help="Batch label"),
+    assigned_to: str | None = typer.Option(None, "--assigned-to", help="Assignee email"),
+    lead_id: int | None = typer.Option(None, "--lead", "-l", help="Filter by lead ID"),
+    created_since: str | None = typer.Option(None, "--created-since", help="ISO 8601 datetime with timezone"),
+    search: str | None = typer.Option(None, "--search", "-q", help="Search text, lead name, batch"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """List outreach messages."""
+    try:
+        params = {
+            "page": page,
+            "page_size": page_size,
+            "status": status,
+            "channel": channel,
+            "batch": batch,
+            "assigned_to_email": assigned_to,
+            "lead_id": lead_id,
+            "created_since": created_since,
+            "search": search,
+        }
+        result = api.get("/messages/", params)
+        if raw:
+            output_json(result, raw=True)
+        else:
+            items = result.get("items") or result.get("results", [])
+            if items:
+                output_table(
+                    items,
+                    ["id", "lead_id", "channel", "status", "assigned_to_email", "batch", "is_humanized"],
+                    title=f"Messages (page {page}, {result.get('count', 0)} total)",
+                )
+            else:
+                rprint("[yellow]No messages found[/yellow]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@messages_app.command("get")
+def messages_get(
+    message_id: int = typer.Argument(..., help="Message ID"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Get a single outreach message (includes the deeplink)."""
+    try:
+        output_json(api.get(f"/messages/{message_id}"), raw=raw)
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@messages_app.command("create")
+def messages_create(
+    lead_id: int = typer.Option(..., "--lead", "-l", help="Lead ID"),
+    channel: str = typer.Option(
+        ..., "--channel", "-c", help="instagram, facebook, whatsapp, bluesky, linkedin, telegram"
+    ),
+    text: str = typer.Option(..., "--text", "-t", help="Message text"),
+    assigned_to: str = typer.Option(..., "--assigned-to", help="Assignee email (required)"),
+    humanized_hash: str = typer.Option("", "--humanized-hash", help="sha256 of the humanized text"),
+    batch: str = typer.Option("", "--batch", help="Batch label"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Create an outreach message as a draft (does not send anything)."""
+    try:
+        data: dict[str, t.Any] = {
+            "lead_id": lead_id,
+            "channel": channel,
+            "text": text,
+            "humanized_hash": humanized_hash,
+            "batch": batch,
+            "assigned_to_email": assigned_to,
+        }
+        result = api.post("/messages/", data)
+        if raw:
+            output_json(result, raw=True)
+        else:
+            rprint(f"[green]Created message #{result['id']}[/green] ({result['channel']}) {result['deeplink']}")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@messages_app.command("mark-sent")
+def messages_mark_sent(
+    message_id: int = typer.Argument(..., help="Message ID"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Record that the message was sent by hand."""
+    try:
+        result = api.post(f"/messages/{message_id}/mark-sent")
+        if raw:
+            output_json(result, raw=True)
+        else:
+            rprint(f"[green]Message #{result['id']} marked sent[/green]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
+@messages_app.command("skip")
+def messages_skip(
+    message_id: int = typer.Argument(..., help="Message ID"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Mark the message as skipped."""
+    try:
+        result = api.post(f"/messages/{message_id}/skip")
+        if raw:
+            output_json(result, raw=True)
+        else:
+            rprint(f"[green]Message #{result['id']} skipped[/green]")
     except httpx.HTTPStatusError as e:
         handle_error(e)
 

@@ -1,16 +1,19 @@
 import typing as t
 from datetime import date
+from urllib.parse import urlparse
 
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.auth.models import User
-from django.db.models import DateField, QuerySet
+from django.core.exceptions import PermissionDenied
+from django.db.models import DateField, Q, QuerySet
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import path, reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
+from ninja.errors import HttpError
 from simple_history.admin import SimpleHistoryAdmin
 from solo.admin import SingletonModelAdmin
 from unfold.admin import ModelAdmin, StackedInline, TabularInline
@@ -335,6 +338,45 @@ class ContactInline(StackedInline):  # type: ignore[misc]
     ordering = ["-is_primary", "name"]
 
 
+def _humanized_badge(is_humanized: bool, humanized_hash: str) -> str:  # noqa: FBT001
+    """Badge showing whether text still matches the hash recorded when it was humanized."""
+    if is_humanized:
+        return format_html('<span style="color:#059669;">&#10003; humanized</span>')
+    label = "edited after humanizing" if humanized_hash else "not humanized"
+    return format_html(
+        '<span style="background:#f59e0b; color:#fff; padding:2px 8px; border-radius:4px; font-size:0.8em;">'
+        "&#9888; {}</span>",
+        label,
+    )
+
+
+def _dm_link(obj: "models.OutreachMessage") -> str:
+    """Render the prominent "Open DM" button (new tab) for a message, or a dash if there is no deeplink."""
+    url = obj.deeplink
+    if not url:
+        return "-"
+    return format_html(
+        '<a href="{}" target="_blank" rel="noopener noreferrer" '
+        'style="display:inline-block; background:#2563eb; color:#fff; font-weight:600; padding:4px 12px; '
+        'border-radius:6px; white-space:nowrap; text-decoration:none;">Open DM &#8599;</a>',
+        url,
+    )
+
+
+class OutreachMessageInline(TabularInline):  # type: ignore[misc]
+    """Inline for outreach messages on Lead admin. Status changes go through the Mark sent / Skip actions."""
+
+    model = models.OutreachMessage
+    extra = 0
+    fields = ["channel", "text", "status", "assigned_to", "batch", "open_dm"]
+    readonly_fields = ["status", "open_dm"]
+    ordering = ["-created_at"]
+
+    @admin.display(description="Open DM")
+    def open_dm(self, obj: models.OutreachMessage) -> str:
+        return _dm_link(obj) if obj.pk else "-"
+
+
 class ActionInline(TabularInline):  # type: ignore[misc]
     """Inline for actions on Lead admin."""
 
@@ -427,7 +469,7 @@ class SendEmailForm(forms.Form):
 class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin):  # type: ignore[misc]
     """Admin for Lead model."""
 
-    inlines = [ContactInline, ActionInline]
+    inlines = [ContactInline, OutreachMessageInline, ActionInline]
     list_display = [
         "display_name_with_notes",
         "display_company_type",
@@ -445,6 +487,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         CityByCountryFilter,
         "status",
         "temperature",
+        "do_not_contact",
         "lead_type",
         "tags",
         HasEmailFilter,
@@ -462,24 +505,34 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         "contacts__telegram",
         "contacts__instagram",
         "contacts__website",
+        "external_ref",
+        "bluesky",
+        "facebook",
+        "linkedin",
+        "whatsapp",
     ]
     autocomplete_fields = ["city", "lead_type"]
     filter_horizontal = ["tags"]
-    readonly_fields = ["created_at", "updated_at"]
+    readonly_fields = ["created_at", "updated_at", "do_not_contact_at"]
     date_hierarchy = "created_at"
     list_per_page = 25
     list_filter_submit = True
     save_on_top = True
     actions = [
+        "mark_do_not_contact_bulk",
         "set_status_contacted",
+        "set_status_replied",
         "set_status_qualified",
+        "set_status_call_booked",
+        "set_status_org_created",
+        "set_status_first_event_live",
         "set_status_converted",
         "set_status_lost",
         "set_temp_cold",
         "set_temp_warm",
         "set_temp_hot",
     ]
-    actions_submit_line = ["log_contact", "mark_contacted", "mark_converted", "mark_lost"]
+    actions_submit_line = ["log_contact", "mark_contacted", "mark_converted", "mark_lost", "mark_do_not_contact"]
 
     # NOTE: the legacy "Contact" fieldset (email/phone/telegram/instagram/website)
     # has been removed in Phase 3. Contact info is now managed via the ContactInline.
@@ -488,6 +541,11 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
     fieldsets = (
         (None, {"fields": ("name", "company", "lead_type", "city")}),
         ("Lead Info", {"fields": ("source", "status", "temperature", "tags", "value")}),
+        (
+            "Social & Platforms",
+            {"fields": ("bluesky", "facebook", "linkedin", "whatsapp", "ticketing_platforms", "external_ref")},
+        ),
+        ("Suppression", {"fields": ("do_not_contact", "do_not_contact_reason", "do_not_contact_at")}),
         ("Follow-up", {"fields": ("last_contact",)}),
         ("Notes", {"fields": ("notes",)}),
         ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
@@ -495,6 +553,16 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
 
     class Media:
         js = ["leads/js/chained_filters.js"]
+
+    def save_model(self, request: HttpRequest, obj: models.Lead, form: t.Any, change: bool) -> None:  # noqa: FBT001
+        """Keep the do-not-contact stamp consistent."""
+        lead_service.sync_do_not_contact_timestamp(obj)
+        super().save_model(request, obj, form, change)
+
+    def save_related(self, request: HttpRequest, form: t.Any, formsets: t.Any, change: bool) -> None:  # noqa: FBT001
+        """Neutralise pending outreach AFTER inlines are saved, so an inline can't resurrect a draft."""
+        super().save_related(request, form, formsets, change)
+        lead_service.suppress_outreach(form.instance)
 
     def get_urls(self) -> list[t.Any]:
         """Add custom URLs for email and filter endpoints."""
@@ -752,6 +820,42 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         queryset.update(status=models.Lead.Status.CONTACTED)
         self.message_user(request, f"Updated {queryset.count()} leads to Contacted", messages.SUCCESS)
 
+    @admin.action(description="⛔ Mark do not contact")
+    def mark_do_not_contact_bulk(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> None:
+        for lead in queryset:
+            lead_service.mark_do_not_contact(lead)
+        self.message_user(request, f"Marked {queryset.count()} leads as do not contact", messages.SUCCESS)
+
+    @action(description="Mark Do Not Contact", url_path="mark-do-not-contact", icon="block", variant="danger")  # type: ignore[untyped-decorator]
+    def mark_do_not_contact(self, request: HttpRequest, instance: models.Lead) -> HttpResponse:
+        """Suppress this lead, using the reason typed in the form (if any)."""
+        from django.http import HttpResponseRedirect
+
+        reason = request.POST.get("do_not_contact_reason", "") if request.method == "POST" else ""
+        lead_service.mark_do_not_contact(instance, reason)
+        self.message_user(request, f"Marked '{instance.name}' as do not contact", messages.SUCCESS)
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", reverse("admin:leads_lead_changelist")))
+
+    @admin.action(description="→ Set status: Replied")
+    def set_status_replied(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> None:
+        queryset.update(status=models.Lead.Status.REPLIED)
+        self.message_user(request, f"Updated {queryset.count()} leads to Replied", messages.SUCCESS)
+
+    @admin.action(description="→ Set status: Call booked")
+    def set_status_call_booked(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> None:
+        queryset.update(status=models.Lead.Status.CALL_BOOKED)
+        self.message_user(request, f"Updated {queryset.count()} leads to Call booked", messages.SUCCESS)
+
+    @admin.action(description="→ Set status: Org created")
+    def set_status_org_created(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> None:
+        queryset.update(status=models.Lead.Status.ORG_CREATED)
+        self.message_user(request, f"Updated {queryset.count()} leads to Org created", messages.SUCCESS)
+
+    @admin.action(description="→ Set status: First event live")
+    def set_status_first_event_live(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> None:
+        queryset.update(status=models.Lead.Status.FIRST_EVENT_LIVE)
+        self.message_user(request, f"Updated {queryset.count()} leads to First event live", messages.SUCCESS)
+
     @admin.action(description="→ Set status: Qualified")
     def set_status_qualified(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> None:
         queryset.update(status=models.Lead.Status.QUALIFIED)
@@ -841,15 +945,25 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
 
     @admin.display(description="Name", ordering="name")
     def display_name_with_notes(self, obj: models.Lead) -> str:
-        """Display name with notes on hover."""
+        """Display name with notes on hover, plus a do-not-contact badge."""
+        badge = (
+            format_html(
+                ' <span title="{}" style="background:#b91c1c; color:#fff; padding:1px 6px; border-radius:4px; '
+                'font-size:0.75em; font-weight:700;">DO NOT CONTACT</span>',
+                obj.do_not_contact_reason,
+            )
+            if obj.do_not_contact
+            else ""
+        )
         if not obj.notes:
-            return obj.name
+            return format_html("{}{}", obj.name, badge)
         # Truncate very long notes for tooltip (max 500 chars)
         tooltip_notes = obj.notes[:500] + "..." if len(obj.notes) > 500 else obj.notes
         return format_html(
-            '<span title="{}" style="cursor: help; border-bottom: 1px dotted #999;">{}</span>',
+            '<span title="{}" style="cursor: help; border-bottom: 1px dotted #999;">{}</span>{}',
             tooltip_notes,
             obj.name,
+            badge,
         )
 
     @admin.display(description="Company / Type")
@@ -878,7 +992,11 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         colors: dict[str, str] = {
             models.Lead.Status.NEW: "#3b82f6",  # blue
             models.Lead.Status.CONTACTED: "#f59e0b",  # amber
+            models.Lead.Status.REPLIED: "#8b5cf6",  # violet
             models.Lead.Status.QUALIFIED: "#10b981",  # green
+            models.Lead.Status.CALL_BOOKED: "#06b6d4",  # cyan
+            models.Lead.Status.ORG_CREATED: "#6366f1",  # indigo
+            models.Lead.Status.FIRST_EVENT_LIVE: "#14b8a6",  # teal
             models.Lead.Status.CONVERTED: "#059669",  # darker green
             models.Lead.Status.LOST: "#ef4444",  # red
         }
@@ -1132,6 +1250,188 @@ class ActionAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
         return HttpResponseRedirect(request.META.get("HTTP_REFERER", reverse("admin:leads_action_changelist")))
 
 
+class OutreachQueueFilter(admin.SimpleListFilter):
+    """Queue scope. Defaults to my (and unassigned) drafts; one click shows everyone's drafts or everything.
+
+    Suppressed (do-not-contact) leads never appear in the drafts queues.
+    """
+
+    title = "queue"
+    parameter_name = "queue"
+
+    def lookups(self, request: HttpRequest, model_admin: t.Any) -> list[tuple[str, str]]:
+        return [("drafts", "All drafts"), ("all", "Everything")]
+
+    def choices(self, changelist: t.Any) -> t.Iterator[t.Any]:
+        yield {
+            "selected": self.value() is None,
+            "query_string": changelist.get_query_string(remove=[self.parameter_name]),
+            "display": "Mine + unassigned",
+        }
+        for lookup, title in self.lookup_choices:
+            yield {
+                "selected": self.value() == str(lookup),
+                "query_string": changelist.get_query_string({self.parameter_name: lookup}),
+                "display": title,
+            }
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> QuerySet[t.Any]:
+        if self.value() == "all":
+            return queryset
+        queryset = queryset.filter(status=models.OutreachMessage.Status.DRAFT, lead__do_not_contact=False)
+        if self.value() == "drafts":
+            return queryset
+        return queryset.filter(Q(assigned_to=request.user) | Q(assigned_to__isnull=True))
+
+
+def _require_same_origin(request: HttpRequest) -> None:
+    """Row actions are plain GET links (Unfold cannot POST them), so be strict about where the click came from.
+
+    Requires Sec-Fetch-Site of same-origin/none AND a Referer on this exact host; a missing header is refused.
+    """
+    if request.headers.get("Sec-Fetch-Site") not in ("same-origin", "none"):
+        raise PermissionDenied
+    referer = request.headers.get("Referer", "")
+    if not referer or urlparse(referer).netloc != request.get_host():
+        raise PermissionDenied
+
+
+@admin.register(models.OutreachMessage)
+class OutreachMessageAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
+    """Admin for OutreachMessage: the rep's DM queue (open deeplink, paste text, send by hand, mark sent)."""
+
+    list_display = ["lead_link", "channel", "open_dm", "text_with_copy", "display_humanized", "batch", "display_status"]
+    list_display_links = ["channel"]
+    list_filter = [OutreachQueueFilter, "status", "channel", "assigned_to", "batch"]
+    search_fields = ["text", "lead__name", "batch"]
+    autocomplete_fields = ["lead"]
+    readonly_fields = ["status", "sent_at", "sent_by", "open_dm", "display_humanized", "created_at", "updated_at"]
+    list_per_page = 25
+    list_filter_submit = True
+    actions = ["mark_sent_bulk", "skip_bulk"]
+    actions_row = ["mark_sent_row", "skip_row"]
+    actions_submit_line = ["mark_sent_detail", "skip_detail"]
+
+    fieldsets = (
+        (None, {"fields": ("lead", "channel", "open_dm", "text", "assigned_to", "batch")}),
+        ("Status", {"fields": ("status", "sent_at", "sent_by", "humanized_hash", "display_humanized")}),
+        ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
+    )
+
+    class Media:
+        js = ["leads/js/outreach_copy.js"]
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[models.OutreachMessage]:
+        qs: QuerySet[models.OutreachMessage] = super().get_queryset(request)
+        return qs.select_related("lead", "assigned_to", "sent_by").prefetch_related("lead__contacts")
+
+    @admin.display(description="Lead", ordering="lead__name")
+    def lead_link(self, obj: models.OutreachMessage) -> str:
+        url = reverse("admin:leads_lead_change", args=[obj.lead_id])
+        return format_html('<a href="{}">{}</a>', url, obj.lead.name)
+
+    @admin.display(description="Open DM")
+    def open_dm(self, obj: models.OutreachMessage) -> str:
+        return _dm_link(obj) if obj.pk else "-"
+
+    @admin.display(description="Message")
+    def text_with_copy(self, obj: models.OutreachMessage) -> str:
+        return format_html(
+            '<div style="display:flex; gap:8px; align-items:flex-start; max-width:640px;">'
+            '<span style="white-space:pre-wrap;">{}</span>'
+            '<button type="button" class="js-copy-text" data-copy-text="{}" '
+            'style="border:1px solid #9ca3af; border-radius:6px; padding:2px 8px; font-size:0.8em;">Copy</button>'
+            "</div>",
+            obj.text,
+            obj.text,
+        )
+
+    @admin.display(description="Humanized")
+    def display_humanized(self, obj: models.OutreachMessage) -> str:
+        return _humanized_badge(obj.is_humanized, obj.humanized_hash)
+
+    @admin.display(description="Status", ordering="status")
+    def display_status(self, obj: models.OutreachMessage) -> str:
+        colors: dict[str, str] = {
+            models.OutreachMessage.Status.DRAFT: "#f59e0b",
+            models.OutreachMessage.Status.SENT: "#10b981",
+            models.OutreachMessage.Status.SKIPPED: "#6b7280",
+        }
+        return format_html(
+            '<span style="background: {}; color: white; padding: 2px 8px; '
+            'border-radius: 4px; font-size: 0.8em;">{}</span>',
+            colors.get(obj.status, "#666"),
+            obj.get_status_display(),
+        )
+
+    def _mark_sent(self, request: HttpRequest, queryset: QuerySet[models.OutreachMessage]) -> int:
+        count = 0
+        for message in queryset.exclude(status=models.OutreachMessage.Status.SENT):
+            try:
+                lead_service.mark_message_sent(message, t.cast(User, request.user))
+            except HttpError as e:
+                self.message_user(request, f"{message.lead.name}: {e.message}", messages.ERROR)
+            else:
+                count += 1
+        return count
+
+    def _skip(self, request: HttpRequest, queryset: QuerySet[models.OutreachMessage]) -> int:
+        count = 0
+        for message in queryset.exclude(status=models.OutreachMessage.Status.SENT):
+            lead_service.mark_message_skipped(message)
+            count += 1
+        return count
+
+    @admin.action(description="Mark sent")
+    def mark_sent_bulk(self, request: HttpRequest, queryset: QuerySet[models.OutreachMessage]) -> None:
+        count = self._mark_sent(request, queryset)
+        self.message_user(request, f"Marked {count} message(s) as sent", messages.SUCCESS)
+
+    @admin.action(description="Skip")
+    def skip_bulk(self, request: HttpRequest, queryset: QuerySet[models.OutreachMessage]) -> None:
+        count = self._skip(request, queryset)
+        self.message_user(request, f"Skipped {count} message(s)", messages.SUCCESS)
+
+    def _back(self, request: HttpRequest) -> HttpResponse:
+        from django.http import HttpResponseRedirect
+
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", reverse("admin:leads_outreachmessage_changelist")))
+
+    @action(description="Mark sent", url_path="mark-sent", icon="send", variant="success", attrs={"target": "_self"})  # type: ignore[untyped-decorator]
+    def mark_sent_row(self, request: HttpRequest, object_id: int) -> HttpResponse:
+        _require_same_origin(request)
+        count = self._mark_sent(request, self.get_queryset(request).filter(pk=object_id))
+        self.message_user(request, f"Marked {count} message(s) as sent", messages.SUCCESS)
+        return self._back(request)
+
+    @action(description="Skip", url_path="skip", icon="skip_next", variant="default", attrs={"target": "_self"})  # type: ignore[untyped-decorator]
+    def skip_row(self, request: HttpRequest, object_id: int) -> HttpResponse:
+        _require_same_origin(request)
+        count = self._skip(request, self.get_queryset(request).filter(pk=object_id))
+        self.message_user(request, f"Skipped {count} message(s)", messages.SUCCESS)
+        return self._back(request)
+
+    @action(description="Mark sent", url_path="mark-sent-detail", icon="send", variant="success")  # type: ignore[untyped-decorator]
+    def mark_sent_detail(self, request: HttpRequest, instance: models.OutreachMessage) -> HttpResponse:
+        try:
+            lead_service.mark_message_sent(instance, t.cast(User, request.user))
+        except HttpError as e:
+            self.message_user(request, e.message, messages.ERROR)
+        else:
+            self.message_user(request, f"Marked message to '{instance.lead.name}' as sent", messages.SUCCESS)
+        return self._back(request)
+
+    @action(description="Skip", url_path="skip-detail", icon="skip_next", variant="default")  # type: ignore[untyped-decorator]
+    def skip_detail(self, request: HttpRequest, instance: models.OutreachMessage) -> HttpResponse:
+        try:
+            lead_service.mark_message_skipped(instance)
+        except ValueError as e:
+            self.message_user(request, str(e), messages.ERROR)
+        else:
+            self.message_user(request, f"Skipped message to '{instance.lead.name}'", messages.SUCCESS)
+        return self._back(request)
+
+
 @admin.register(models.EmailTemplate)
 class EmailTemplateAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
     """Admin for EmailTemplate model."""
@@ -1229,11 +1529,21 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
 
     change_form_template = "admin/leads/emaildraft/change_form.html"
 
-    list_display = ["id", "edit_link", "lead_link", "subject_preview", "template", "updated_at", "created_at"]
+    list_display = [
+        "id",
+        "edit_link",
+        "lead_link",
+        "subject_preview",
+        "assigned_to",
+        "display_humanized",
+        "template",
+        "updated_at",
+        "created_at",
+    ]
     list_display_links = None  # Disable default linking since we have custom edit_link
-    list_filter = ["template", ("created_at", RangeDateFilter), ("updated_at", RangeDateFilter)]
+    list_filter = ["assigned_to", "template", ("created_at", RangeDateFilter), ("updated_at", RangeDateFilter)]
     search_fields = ["subject", "body", "lead__name", "to"]
-    readonly_fields = ["id", "created_at", "updated_at"]
+    readonly_fields = ["id", "display_humanized", "created_at", "updated_at"]
     autocomplete_fields = ["lead", "template"]
     actions = ["send_selected_drafts"]
     actions_submit_line = ["send_draft"]
@@ -1242,10 +1552,14 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (None, {"fields": ("id", "lead", "template")}),
-        ("Recipients", {"fields": ("from_email", "to", "bcc")}),
-        ("Content", {"fields": ("subject", "body")}),
+        ("Recipients", {"fields": ("assigned_to", "from_email", "to", "bcc")}),
+        ("Content", {"fields": ("subject", "body", "humanized_hash", "display_humanized", "batch")}),
         ("Timestamps", {"fields": ("created_at", "updated_at")}),
     )
+
+    @admin.display(description="Humanized")
+    def display_humanized(self, obj: models.EmailDraft) -> str:
+        return _humanized_badge(obj.is_humanized, obj.humanized_hash)
 
     @admin.display(description="Edit")
     def edit_link(self, obj: models.EmailDraft) -> str:

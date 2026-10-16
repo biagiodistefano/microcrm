@@ -18,6 +18,7 @@ from leads.models import (
     EmailTemplate,
     Lead,
     LeadType,
+    OutreachMessage,
     ResearchJob,
     Tag,
 )
@@ -47,7 +48,15 @@ from leads.schema import (
     LeadIn,
     LeadPatch,
     LeadSchema,
+    LeadTagsIn,
+    LeadTagsOut,
     LeadTypeSchema,
+    LeadUpsertIn,
+    LeadUpsertOut,
+    OutreachMessageFilterSchema,
+    OutreachMessageIn,
+    OutreachMessagePatch,
+    OutreachMessageSchema,
     ResearchJobDetailSchema,
     ResearchJobFilterSchema,
     ResearchJobIn,
@@ -79,6 +88,11 @@ class LeadController(ControllerBase):
             "contacts__instagram",
             "contacts__website",
             "contacts__phone",
+            "external_ref",
+            "bluesky",
+            "facebook",
+            "linkedin",
+            "whatsapp",
         ],
     )
     def list_leads(
@@ -91,7 +105,13 @@ class LeadController(ControllerBase):
         via the `search` query parameter.
 
         Filter options:
-        - status: Filter by lead status (new, contacted, qualified, converted, lost)
+        - status: Filter by lead status (new, contacted, replied, qualified, call_booked, org_created,
+          first_event_live, converted, lost)
+        - external_ref: Filter by external reference (case-insensitive exact match)
+        - do_not_contact: true/false
+        - source: source starts with (case-insensitive)
+        - tags: repeat the param (`?tags=a&tags=b`); leads must have all of them
+        - updated_since / created_since: ISO 8601 datetimes with timezone
         - temperature: Filter by temperature (cold, warm, hot)
         - lead_type: Filter by lead type name (exact, case-insensitive)
         - city_id: Filter by city ID (exact match, recommended for autocomplete)
@@ -100,7 +120,48 @@ class LeadController(ControllerBase):
         - tag: Filter by tag name (exact, case-insensitive)
         - has_draft: Filter by whether lead has an email draft (true/false)
         """
-        return filters.filter(self.get_queryset()).distinct()
+        qs = filters.filter(self.get_queryset())
+        for tag in filters.tags or []:
+            qs = qs.filter(tags__name__iexact=tag)  # one join per tag => all-of
+        return qs.distinct()
+
+    @route.post("/tags", response=LeadTagsOut)
+    def bulk_tags(self, data: LeadTagsIn) -> LeadTagsOut:
+        """Add and/or remove tags on many leads at once.
+
+        Example request: `{"lead_ids": [1, 2], "add": ["Wave 1"], "remove": ["Cold list"]}`.
+        Returns `{"updated": 2}` (number of leads found). Unknown lead ids are ignored.
+        """
+        return LeadTagsOut(updated=service.bulk_update_lead_tags(data.lead_ids, data.add, data.remove))
+
+    @route.post("/upsert", response=LeadUpsertOut)
+    def upsert_lead(self, data: LeadUpsertIn) -> LeadUpsertOut:
+        """Create a lead, or merge into the existing one it matches (idempotent).
+
+        Matching order: `external_ref`, then email / phone / instagram / telegram / website / bluesky /
+        facebook / linkedin / whatsapp, then name + city. On a match only blank fields are filled
+        (status, temperature and value are never overwritten); tags and ticketing_platforms merge additively.
+
+        Example request:
+        ```json
+        {
+          "external_ref": "salesops:ig:berlinqueerparty",
+          "name": "Berlin Queer Party",
+          "type": "Collective",
+          "city": {"name": "Berlin", "country": "Germany", "iso2": "DE"},
+          "instagram": "berlinqueerparty",
+          "ticketing_platforms": ["eventbrite"],
+          "tags": ["Queer"]
+        }
+        ```
+
+        Returns `{"id": 123, "created": true, "do_not_contact": false, "matched_on": null}`; `matched_on`
+        names the key an existing lead was matched on (e.g. "external_ref", "email", "name_city").
+        A candidate matching a lead marked do-not-contact changes nothing and returns
+        `{"id": ..., "created": false, "do_not_contact": true, ...}`.
+        """
+        lead, created, matched_on = service.upsert_lead(data)
+        return LeadUpsertOut(id=lead.id, created=created, do_not_contact=lead.do_not_contact, matched_on=matched_on)
 
     @route.get("/{lead_id}", response=LeadSchema)
     def get_lead(self, lead_id: int) -> Lead:
@@ -590,8 +651,11 @@ class EmailDraftController(ControllerBase):
         Filter options:
         - lead_id: Filter by lead ID
         - template_id: Filter by template ID
+        - assigned_to_email: Filter by the assignee's email
+        - batch: exact batch label
+        - created_since: ISO 8601 datetime with timezone
         """
-        return filters.filter(EmailDraft.objects.select_related("lead", "template").all())
+        return filters.filter(EmailDraft.objects.select_related("lead", "template", "assigned_to").all())
 
     @route.get("/{draft_id}", response=EmailDraftSchema)
     def get_draft(self, draft_id: int) -> EmailDraft:
@@ -604,6 +668,8 @@ class EmailDraftController(ControllerBase):
 
         Lead ID is required. Template ID is optional.
         If 'to' is not provided, defaults to the lead's email address.
+        `assigned_to_email` puts the draft in that user's queue; if `from_email` is omitted it defaults to
+        that user's connected Gmail address (else DEFAULT_FROM_EMAIL). Creating a draft never sends anything.
         """
         return 201, service.create_email_draft(data)
 
@@ -642,5 +708,96 @@ class EmailDraftController(ControllerBase):
         draft = get_object_or_404(EmailDraft, pk=draft_id)
         try:
             return 201, service.send_email_draft(draft)
+        except ValueError as e:
+            raise HttpError(400, str(e))
+
+
+@api_controller("/messages", tags=["Outreach Messages"])
+class OutreachMessageController(ControllerBase):
+    """Outreach (DM) message controller. Messages are sent by a human by hand; the API never sends."""
+
+    def get_queryset(self) -> QuerySet[OutreachMessage]:
+        """Get base queryset."""
+        return OutreachMessage.objects.select_related("lead", "assigned_to", "sent_by").prefetch_related(
+            "lead__contacts"
+        )
+
+    @route.get("/", response=PaginatedResponseSchema[OutreachMessageSchema])
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["text", "lead__name", "batch"])
+    def list_messages(
+        self,
+        filters: OutreachMessageFilterSchema = Query(...),  # type: ignore[type-arg]
+    ) -> QuerySet[OutreachMessage]:
+        """List outreach messages.
+
+        Filter options:
+        - status: draft, sent, skipped
+        - channel: instagram, facebook, whatsapp, bluesky, linkedin, telegram
+        - batch: exact batch label
+        - created_since: ISO 8601 datetime with timezone
+        - assigned_to_email: assignee's email (case-insensitive)
+        - lead_id: lead ID
+        """
+        return filters.filter(self.get_queryset())
+
+    @route.get("/{message_id}", response=OutreachMessageSchema)
+    def get_message(self, message_id: int) -> OutreachMessage:
+        """Get a single outreach message."""
+        return get_object_or_404(self.get_queryset(), id=message_id)
+
+    @route.post("/", response={201: OutreachMessageSchema})
+    def create_message(self, data: OutreachMessageIn) -> tuple[int, OutreachMessage]:
+        """Create an outreach message as a draft in the assignee's queue. Nothing is sent.
+
+        Example request:
+        ```json
+        {
+          "lead_id": 12,
+          "channel": "instagram",
+          "text": "Hey! ...",
+          "assigned_to_email": "weronika@letsrevel.io",
+          "humanized_hash": "sha256:ab12...",
+          "batch": "2026-10-berlin-01"
+        }
+        ```
+        """
+        return 201, service.create_outreach_message(data)
+
+    @route.put("/{message_id}", response=OutreachMessageSchema)
+    def update_message(self, message_id: int, data: OutreachMessageIn) -> OutreachMessage:
+        """Update a message (full replacement of its input fields; status is unchanged)."""
+        message = get_object_or_404(OutreachMessage, id=message_id)
+        return service.update_outreach_message(message, data)
+
+    @route.patch("/{message_id}", response=OutreachMessageSchema)
+    def patch_message(self, message_id: int, data: OutreachMessagePatch) -> OutreachMessage:
+        """Partially update a message."""
+        message = get_object_or_404(OutreachMessage, id=message_id)
+        return service.patch_outreach_message(message, data)
+
+    @route.delete("/{message_id}", response={204: None})
+    def delete_message(self, message_id: int) -> tuple[int, None]:
+        """Delete a message."""
+        message = get_object_or_404(OutreachMessage, id=message_id)
+        message.delete()
+        return 204, None
+
+    @route.post("/{message_id}/mark-sent", response=OutreachMessageSchema)
+    def mark_sent(self, message_id: int) -> OutreachMessage:
+        """Record that the message was sent by hand.
+
+        Sets sent_at, updates the lead's last_contact, moves a `new` lead to `contacted` and creates a
+        follow-up action due in 4 days. Idempotent.
+        """
+        message = get_object_or_404(self.get_queryset(), id=message_id)
+        return service.mark_message_sent(message)
+
+    @route.post("/{message_id}/skip", response=OutreachMessageSchema)
+    def skip(self, message_id: int) -> OutreachMessage:
+        """Mark the message as skipped. Returns 400 if it was already sent."""
+        message = get_object_or_404(self.get_queryset(), id=message_id)
+        try:
+            return service.mark_message_skipped(message)
         except ValueError as e:
             raise HttpError(400, str(e))

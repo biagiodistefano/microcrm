@@ -230,6 +230,11 @@ UNFOLD = {
                     {"title": "Leads", "icon": "person_add", "link": reverse_lazy("admin:leads_lead_changelist")},
                     {"title": "Actions", "icon": "task_alt", "link": reverse_lazy("admin:leads_action_changelist")},
                     {
+                        "title": "Outreach Messages",
+                        "icon": "forum",
+                        "link": reverse_lazy("admin:leads_outreachmessage_changelist"),
+                    },
+                    {
                         "title": "Lead Types",
                         "icon": "category",
                         "link": reverse_lazy("admin:leads_leadtype_changelist"),
