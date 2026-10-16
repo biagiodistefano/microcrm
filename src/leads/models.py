@@ -105,6 +105,17 @@ class Lead(models.Model):
         max_length=255, blank=True, help_text="Stable ID from an external tool, used for idempotent upserts"
     )
 
+    # Identities of leads merged into this one, so re-imports of them resolve here (see service.merge_leads)
+    merged_external_refs = models.JSONField(
+        default=list, blank=True, editable=False, help_text="external_refs of leads merged into this one"
+    )
+    merged_identities = models.JSONField(
+        default=dict,
+        blank=True,
+        editable=False,
+        help_text="Handles of merged leads, {field: [values]} for bluesky/facebook/linkedin/whatsapp",
+    )
+
     # Suppression: set only by explicit action, never cleared by upsert/import/research
     do_not_contact = models.BooleanField(default=False, help_text="Never message this lead (suppressed forever)")
     do_not_contact_reason = models.TextField(blank=True)

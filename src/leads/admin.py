@@ -1,17 +1,17 @@
 import typing as t
 from datetime import date
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.auth.models import User
 from django.core.exceptions import PermissionDenied
-from django.db.models import DateField, Q, QuerySet
+from django.db.models import Count, DateField, Q, QuerySet
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import path, reverse
-from django.utils.html import format_html
+from django.utils.html import format_html, format_html_join
 from django.utils.safestring import mark_safe
 from ninja.errors import HttpError
 from simple_history.admin import SimpleHistoryAdmin
@@ -67,6 +67,34 @@ class CityByCountryFilter(DropdownFilter):  # type: ignore[misc]
         """Filter leads by city id."""
         if self.value():
             return queryset.filter(city__id=self.value())
+        return queryset
+
+
+class DuplicateGroupFilter(DropdownFilter):  # type: ignore[misc]
+    """Open one group of suspected duplicates (tag ``review:duplicate-<n>``) at a time."""
+
+    title = "duplicate group"
+    parameter_name = "duplicate_group"
+
+    def lookups(self, request: HttpRequest, model_admin: t.Any) -> list[tuple[str, str]]:
+        """Return one entry per review:duplicate-<n> tag, with the number of leads still in the group."""
+        tags = (
+            models.Tag.objects.filter(name__istartswith=lead_service.REVIEW_GROUP_PREFIX)
+            .annotate(lead_count=Count("leads"))
+            .order_by("name")
+        )
+        return sorted(
+            (
+                (tag.name, f"{tag.name.removeprefix(lead_service.REVIEW_GROUP_PREFIX)} ({tag.lead_count} leads)")
+                for tag in tags
+            ),
+            key=lambda item: (len(item[0]), item[0]),
+        )
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> QuerySet[t.Any]:
+        """Show only the leads carrying the chosen group tag."""
+        if self.value():
+            return queryset.filter(tags__name=self.value())
         return queryset
 
 
@@ -490,6 +518,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         "do_not_contact",
         "lead_type",
         "tags",
+        DuplicateGroupFilter,
         HasEmailFilter,
         HasPhoneFilter,
         HasInstagramFilter,
@@ -513,12 +542,13 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
     ]
     autocomplete_fields = ["city", "lead_type"]
     filter_horizontal = ["tags"]
-    readonly_fields = ["created_at", "updated_at", "do_not_contact_at"]
+    readonly_fields = ["created_at", "updated_at", "do_not_contact_at", "duplicate_groups"]
     date_hierarchy = "created_at"
     list_per_page = 25
     list_filter_submit = True
     save_on_top = True
     actions = [
+        "merge_selected_leads",
         "mark_do_not_contact_bulk",
         "set_status_contacted",
         "set_status_replied",
@@ -540,7 +570,7 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
     # until Phase 4 drops them.
     fieldsets = (
         (None, {"fields": ("name", "company", "lead_type", "city")}),
-        ("Lead Info", {"fields": ("source", "status", "temperature", "tags", "value")}),
+        ("Lead Info", {"fields": ("source", "status", "temperature", "tags", "duplicate_groups", "value")}),
         (
             "Social & Platforms",
             {"fields": ("bluesky", "facebook", "linkedin", "whatsapp", "ticketing_platforms", "external_ref")},
@@ -572,6 +602,11 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
                 "filter-cities/",
                 self.admin_site.admin_view(self.filter_cities_view),
                 name="leads_lead_filter_cities",
+            ),
+            path(
+                "merge/",
+                self.admin_site.admin_view(self.merge_leads_view),
+                name="leads_lead_merge",
             ),
             path(
                 "<int:lead_id>/send-email/",
@@ -814,6 +849,101 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         subject, body = lead_service.render_email_template(template, lead)
         return JsonResponse({"subject": subject, "body": body})
 
+    # Merging duplicates
+    @admin.action(description="Merge selected leads…", permissions=["merge"])
+    def merge_selected_leads(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> HttpResponse:
+        """Send the selected leads to the "Merge leads" confirmation page."""
+        ids = ",".join(str(pk) for pk in queryset.order_by("pk").values_list("pk", flat=True))
+        return redirect(f"{reverse('admin:leads_lead_merge')}?ids={ids}")
+
+    def has_merge_permission(self, request: HttpRequest) -> bool:
+        """Merging deletes leads, so it needs both change and delete permission."""
+        return bool(self.has_change_permission(request) and self.has_delete_permission(request))
+
+    def _merge_page(
+        self, request: HttpRequest, leads: list[models.Lead], primary_id: int, error: str = ""
+    ) -> HttpResponse:
+        """Render the merge confirmation page for ``leads`` with ``primary_id`` pre-selected."""
+        counts = lead_service.summarize_merge(leads)
+        rows = []
+        for lead in leads:
+            contact = lead.contacts.order_by("-is_primary", "pk").first()
+            rows.append(
+                {
+                    "lead": lead,
+                    "email": lead.email or (contact.email if contact else ""),
+                    "instagram": lead.instagram or (contact.instagram if contact else ""),
+                    "counts": counts[lead.pk],
+                    "link": reverse("admin:leads_lead_change", args=[lead.pk]),
+                }
+            )
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Merge leads",
+            "opts": self.model._meta,
+            "rows": rows,
+            "primary_id": primary_id,
+            "ids": ",".join(str(lead.pk) for lead in leads),
+            "any_dnc": any(lead.do_not_contact for lead in leads),
+            "error": error,
+            "back_url": reverse("admin:leads_lead_changelist"),
+        }
+        return render(request, "admin/leads/lead/merge_confirm.html", context, status=400 if error else 200)
+
+    def merge_leads_view(self, request: HttpRequest) -> HttpResponse:
+        """Confirmation page (GET) and the merge itself (POST) for a set of suspected duplicates."""
+        if not self.has_merge_permission(request):
+            raise PermissionDenied
+        raw = request.POST.get("ids") if request.method == "POST" else request.GET.get("ids", "")
+        try:
+            ids = list(dict.fromkeys(int(x) for x in (raw or "").split(",") if x.strip()))
+        except ValueError:
+            ids = []
+        leads = sorted(
+            models.Lead.objects.filter(pk__in=ids).select_related("city"), key=lambda lead: (lead.created_at, lead.pk)
+        )
+        back = reverse("admin:leads_lead_changelist")
+        if len(leads) < 2:
+            self.message_user(request, "Select at least two leads to merge.", messages.WARNING)
+            return redirect(back)
+        if len(leads) > lead_service.MERGE_MAX_LEADS:
+            self.message_user(
+                request, f"You can merge at most {lead_service.MERGE_MAX_LEADS} leads at once.", messages.ERROR
+            )
+            return redirect(back)
+        default_primary = lead_service.pick_default_primary(leads)
+
+        if request.method != "POST":
+            return self._merge_page(request, leads, default_primary.pk)
+
+        by_id = {lead.pk: lead for lead in leads}
+        try:
+            primary = by_id[int(request.POST.get("primary", ""))]
+        except (KeyError, ValueError):
+            return self._merge_page(request, leads, default_primary.pk, "Please choose which lead to keep.")
+        try:
+            merged = lead_service.merge_leads(primary, [lead for lead in leads if lead.pk != primary.pk], request.user)
+        except lead_service.MergeError as exc:
+            return self._merge_page(request, leads, primary.pk, str(exc))
+        self.message_user(request, f"Merged {len(leads)} leads into '{merged.name}'.", messages.SUCCESS)
+        return redirect(reverse("admin:leads_lead_change", args=[merged.pk]))
+
+    @admin.display(description="Possible duplicates")
+    def duplicate_groups(self, obj: models.Lead | None) -> str:
+        """Links to open (or merge) each group of suspected duplicates this lead belongs to."""
+        if obj is None or obj.pk is None:
+            return "-"
+        links = []
+        for tag in obj.tags.filter(name__istartswith=lead_service.REVIEW_GROUP_PREFIX):
+            members = list(tag.leads.order_by("pk").values_list("pk", flat=True))
+            group_url = f"{reverse('admin:leads_lead_changelist')}?{urlencode({'duplicate_group': tag.name})}"
+            part = format_html('<a href="{}">Open group ({} leads)</a>', group_url, len(members))
+            if 2 <= len(members) <= lead_service.MERGE_MAX_LEADS:
+                merge_url = f"{reverse('admin:leads_lead_merge')}?ids={','.join(map(str, members))}"
+                part = format_html('{} · <a href="{}">Review and merge</a>', part, merge_url)
+            links.append(part)
+        return format_html_join(mark_safe("<br>"), "{}", ((link,) for link in links)) if links else "-"
+
     # Bulk actions for status
     @admin.action(description="→ Set status: Contacted")
     def set_status_contacted(self, request: HttpRequest, queryset: QuerySet[models.Lead]) -> None:
@@ -1025,13 +1155,21 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         tags = obj.tags.all()
         if not tags:
             return "-"
-        pills = []
+        parts = []
         for tag in tags:
-            pills.append(
-                f'<span style="background: #e5e7eb; color: #374151; padding: 1px 6px; '
-                f'border-radius: 9999px; font-size: 0.75em; margin-right: 2px;">{tag.name}</span>'
+            parts.append(
+                format_html(
+                    '<span style="background: #e5e7eb; color: #374151; padding: 1px 6px; '
+                    'border-radius: 9999px; font-size: 0.75em; margin-right: 2px;">{}</span>',
+                    tag.name,
+                )
             )
-        return mark_safe(" ".join(pills))
+            if tag.name.lower().startswith(lead_service.REVIEW_GROUP_PREFIX):
+                url = f"{reverse('admin:leads_lead_changelist')}?{urlencode({'duplicate_group': tag.name})}"
+                parts.append(
+                    format_html('<a href="{}" style="font-size: 0.75em; margin-right: 4px;">Open group</a>', url)
+                )
+        return format_html_join(" ", "{}", ((part,) for part in parts))
 
     @admin.display(description="Last Contact")
     def display_last_contact(self, obj: models.Lead) -> str:

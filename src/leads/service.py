@@ -7,7 +7,8 @@ from datetime import timedelta
 from urllib.parse import urlparse
 
 from django.conf import settings
-from django.contrib.auth.models import User
+from django.contrib.auth.base_user import AbstractBaseUser
+from django.contrib.auth.models import AnonymousUser, User
 from django.core.mail import EmailMessage
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
@@ -51,6 +52,7 @@ CONTACT_FIELDS: tuple[str, ...] = ("email", "phone", "telegram", "instagram", "w
 # Lead-only identity fields (not mirrored on Contact) that also count as dedupe keys
 LEAD_ONLY_MATCH_FIELDS: tuple[str, ...] = ("bluesky", "facebook", "linkedin", "whatsapp")
 LEAD_MATCH_FIELDS: tuple[str, ...] = (*CONTACT_FIELDS, *LEAD_ONLY_MATCH_FIELDS)
+MERGED_IDENTITY_FIELDS: tuple[str, ...] = LEAD_ONLY_MATCH_FIELDS
 # Fields filled on an existing lead only when currently blank
 LEAD_FILL_FIELDS: tuple[str, ...] = ("company", "notes", "source", "external_ref", *LEAD_MATCH_FIELDS)
 FOLLOW_UP_DAYS = 4
@@ -285,6 +287,30 @@ def normalize_website(url: str) -> str:
     return f"{host}{path}"
 
 
+def _leads_with_merged_identity(field: str, value: str) -> list[Lead]:
+    """Leads that absorbed a merged-away lead owning ``value`` for ``field`` ("external_ref" or a handle field)."""
+    wanted = value.strip().lower()
+    found = []
+    for lead in (
+        Lead.objects.exclude(merged_external_refs=[])
+        if field == "external_ref"
+        else Lead.objects.exclude(merged_identities={})
+    ):
+        values = lead.merged_external_refs if field == "external_ref" else lead.merged_identities.get(field, [])
+        if wanted in (str(v).strip().lower() for v in values):
+            found.append(lead)
+    return found
+
+
+def _match_external_ref(ref: str) -> Lead | None:
+    """Lead owning ``ref`` directly, else one that absorbed a lead owning it through a merge (do-not-contact first)."""
+    lead = Lead.objects.filter(external_ref=ref).first()
+    if lead:
+        return lead
+    merged = _leads_with_merged_identity("external_ref", ref)
+    return next((x for x in merged if x.do_not_contact), merged[0] if merged else None)
+
+
 def _match_exact(field: str, value: str) -> tuple[Contact | None, Lead] | None:
     """Case-insensitive exact match on a strong identity key (Contact rows first, then Lead columns).
 
@@ -297,6 +323,8 @@ def _match_exact(field: str, value: str) -> tuple[Contact | None, Lead] | None:
             (c, c.lead) for c in Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value})
         ]
     candidates += [(None, lead) for lead in Lead.objects.filter(**{f"{field}__iexact": value})]
+    if field in MERGED_IDENTITY_FIELDS:
+        candidates += [(None, lead) for lead in _leads_with_merged_identity(field, value)]
     return next((c for c in candidates if c[1].do_not_contact), candidates[0] if candidates else None)
 
 
@@ -332,10 +360,9 @@ def find_existing_lead(data: LeadUpsertIn, city: City | None) -> tuple[Contact |
     def ok(lead: Lead) -> bool:
         return not (ref and lead.external_ref and lead.external_ref != ref)
 
-    if ref:
-        lead = Lead.objects.filter(external_ref=ref).first()
-        if lead:
-            return None, lead, "external_ref"
+    ref_lead = _match_external_ref(ref) if ref else None
+    if ref_lead:
+        return None, ref_lead, "external_ref"
 
     for field in LEAD_MATCH_FIELDS:
         value = (getattr(data, field) or "").strip()
@@ -1322,3 +1349,377 @@ def mark_message_skipped(message: OutreachMessage) -> OutreachMessage:
     message.status = OutreachMessage.Status.SKIPPED
     message.save(update_fields=["status", "updated_at"])
     return message
+
+
+# --- Lead merge (duplicate resolution) ---
+
+MERGE_MAX_LEADS = 20
+# Funnel order, least to most advanced. "lost" is handled separately.
+STATUS_FUNNEL: tuple[str, ...] = (
+    Lead.Status.NEW,
+    Lead.Status.CONTACTED,
+    Lead.Status.REPLIED,
+    Lead.Status.QUALIFIED,
+    Lead.Status.CALL_BOOKED,
+    Lead.Status.ORG_CREATED,
+    Lead.Status.FIRST_EVENT_LIVE,
+    Lead.Status.CONVERTED,
+)
+TEMPERATURE_ORDER: tuple[str, ...] = (Lead.Temperature.COLD, Lead.Temperature.WARM, Lead.Temperature.HOT)
+# Plain Lead columns copied from the others onto the primary only while the primary's value is blank
+MERGE_FILL_FIELDS: tuple[str, ...] = (
+    "company",
+    "email",
+    "phone",
+    "telegram",
+    "instagram",
+    "website",
+    "bluesky",
+    "facebook",
+    "linkedin",
+    "whatsapp",
+    "source",
+)
+MERGE_FILL_RELATIONS: tuple[str, ...] = ("lead_type", "city")
+REVIEW_GROUP_PREFIX = "review:duplicate-"
+REVIEW_GENERIC_TAG = "review:duplicates"
+PHONE_MATCH_MIN_DIGITS = 8
+CHANGE_REASON_MAX = 100  # simple_history's history_change_reason column
+
+
+class MergeError(ValueError):
+    """Raised when a set of leads cannot be merged."""
+
+
+def status_rank(status: str) -> int:
+    """Position of a status along the funnel (-1 for lost), used to compare how advanced leads are."""
+    return STATUS_FUNNEL.index(status) if status in STATUS_FUNNEL else -1
+
+
+def _filled_identities(lead: Lead) -> int:
+    """How many identity fields (contact methods, handles, external_ref) are filled on the lead."""
+    return sum(1 for field in (*LEAD_MATCH_FIELDS, "external_ref") if getattr(lead, field))
+
+
+def pick_default_primary(leads: t.Sequence[Lead]) -> Lead:
+    """Pick the lead to keep: a do-not-contact one first, then most advanced status, most identities, oldest."""
+    return min(
+        leads,
+        key=lambda lead: (
+            not lead.do_not_contact,
+            -status_rank(lead.status),
+            -_filled_identities(lead),
+            lead.created_at,
+            lead.pk,
+        ),
+    )
+
+
+def _merged_status(primary: Lead, others: t.Sequence[Lead]) -> str:
+    """Most advanced funnel status; a lost lead only counts when nobody got beyond "contacted"."""
+    everyone = [primary, *others]
+    best = max((lead.status for lead in everyone), key=status_rank)
+    if not any(lead.status == Lead.Status.LOST for lead in everyone):
+        return best
+    if status_rank(best) > status_rank(Lead.Status.CONTACTED):
+        return best
+    return Lead.Status.LOST if primary.status == Lead.Status.NEW else str(primary.status)
+
+
+def _merge_notes(primary: Lead, others: t.Sequence[Lead]) -> str:
+    """Append each other lead's notes under a "Merged from" header (skipping text already present)."""
+    notes = primary.notes
+    for other in others:
+        if not other.notes.strip():
+            continue
+        block = f"Merged from #{other.pk} ({other.name}): {other.notes.strip()}"
+        if block not in notes:
+            notes = f"{notes.rstrip()}\n\n{block}" if notes.strip() else block
+    return notes
+
+
+def _merge_lead_fields(primary: Lead, others: t.Sequence[Lead]) -> None:
+    """Apply the field-by-field merge rules to ``primary`` in memory (nothing is saved)."""
+    for field in MERGE_FILL_FIELDS:
+        if not getattr(primary, field):
+            setattr(primary, field, next((getattr(o, field) for o in others if getattr(o, field)), ""))
+    if primary.lead_type_id is None:
+        primary.lead_type = next((o.lead_type for o in others if o.lead_type_id), None)
+    if primary.city_id is None:
+        primary.city = next((o.city for o in others if o.city_id), None)
+
+    primary.notes = _merge_notes(primary, others)
+    platforms = list(primary.ticketing_platforms or [])
+    for other in others:
+        platforms.extend(p for p in (other.ticketing_platforms or []) if p not in platforms)
+    primary.ticketing_platforms = platforms
+
+    values = [lead.value for lead in (primary, *others) if lead.value is not None]
+    primary.value = max(values) if values else None
+    contacts = [lead.last_contact for lead in (primary, *others) if lead.last_contact is not None]
+    primary.last_contact = max(contacts) if contacts else None
+    primary.status = _merged_status(primary, others)
+    primary.temperature = max((lead.temperature for lead in (primary, *others)), key=TEMPERATURE_ORDER.index)
+
+
+def _merge_external_ref(primary: Lead, others: t.Sequence[Lead]) -> None:
+    """Keep the primary's external_ref; otherwise adopt the first other's (cleared there first: it is unique)."""
+    if primary.external_ref:
+        return
+    donor = next((o for o in others if o.external_ref), None)
+    if donor is None:
+        return
+    Lead.objects.filter(pk=donor.pk).update(external_ref="")
+    primary.external_ref = donor.external_ref
+
+
+def _merge_do_not_contact(primary: Lead, others: t.Sequence[Lead]) -> None:
+    """If any lead is suppressed the primary becomes suppressed (earliest stamp, reasons combined)."""
+    suppressed = [lead for lead in (primary, *others) if lead.do_not_contact]
+    if not suppressed:
+        return
+    primary.do_not_contact = True
+    reasons: list[str] = []
+    for lead in suppressed:
+        reason = lead.do_not_contact_reason.strip()
+        if reason and reason not in reasons:
+            reasons.append(reason)
+    primary.do_not_contact_reason = "; ".join(reasons)
+    stamps = [lead.do_not_contact_at for lead in suppressed if lead.do_not_contact_at is not None]
+    primary.do_not_contact_at = min(stamps) if stamps else None
+    sync_do_not_contact_timestamp(primary)
+
+
+CONFLICT_NOTE_FIELDS: tuple[str, ...] = (
+    "external_ref",
+    *LEAD_ONLY_MATCH_FIELDS,
+    "email",
+    "phone",
+    "telegram",
+    "instagram",
+    "website",
+    "company",
+    "source",
+)
+
+
+def _differs(a: str, b: str) -> bool:
+    return a.strip().lower() != b.strip().lower()
+
+
+def _remember_identities(primary: Lead, other: Lead) -> None:
+    """Record ``other``'s external_refs and lead-only handles on the primary when they differ from its own."""
+    refs: list[str] = primary.merged_external_refs
+    for ref in [other.external_ref, *(other.merged_external_refs or [])]:
+        if ref and _differs(ref, primary.external_ref) and ref not in refs:
+            refs.append(ref)
+    for field in MERGED_IDENTITY_FIELDS:
+        known: list[str] = primary.merged_identities.setdefault(field, [])
+        for value in [getattr(other, field), *(other.merged_identities or {}).get(field, [])]:
+            if value and _differs(value, getattr(primary, field)) and value not in known:
+                known.append(value)
+
+
+def _keep_contact_methods(primary: Lead, other: Lead) -> None:
+    """Give ``other``'s lead-level contact methods a Contact row on the primary unless one already covers them."""
+    for field in CONTACT_FIELDS:
+        value = getattr(other, field)
+        if not value or not _differs(value, getattr(primary, field)):
+            continue
+        probe = Contact(**{field: value})
+        keys = _contact_keys(probe)
+        existing = primary.contacts.all()
+        covered = (
+            any(keys & _contact_keys(c) for c in existing)
+            if keys
+            else any(not _differs(getattr(c, field), value) for c in existing)
+        )
+        if not covered:
+            Contact.objects.create(lead=primary, name=other.name or "Merged", **{field: value})
+
+
+def _note_conflicts(primary: Lead, other: Lead) -> None:
+    """Append one note line listing every non-empty value of ``other`` that differs from the primary's."""
+    lost = [
+        f"{field}={getattr(other, field)}"
+        for field in CONFLICT_NOTE_FIELDS
+        if getattr(other, field) and _differs(getattr(other, field), getattr(primary, field))
+    ]
+    line = f"Merged from #{other.pk}: {', '.join(lost)}"
+    if lost and line not in primary.notes:
+        primary.notes = f"{primary.notes.rstrip()}\n\n{line}" if primary.notes.strip() else line
+
+
+def _preserve_identities(primary: Lead, others: t.Sequence[Lead]) -> None:
+    """Keep every non-empty value of a merged-away lead that did not make it onto the primary.
+
+    external_refs and lead-only handles go to ``merged_external_refs`` / ``merged_identities`` (upsert matches on
+    them, so a re-import resolves to the primary); contact methods become extra Contact rows; everything is also
+    listed in the primary's notes. Call after contacts moved and before the others are deleted.
+    """
+    primary.merged_external_refs = list(primary.merged_external_refs or [])
+    primary.merged_identities = {k: list(v) for k, v in (primary.merged_identities or {}).items()}
+    for other in others:
+        _remember_identities(primary, other)
+        _keep_contact_methods(primary, other)
+        _note_conflicts(primary, other)
+    primary.merged_identities = {k: v for k, v in primary.merged_identities.items() if v}
+
+
+def _contact_keys(contact: Contact) -> set[tuple[str, str]]:
+    """Identity keys of a contact used to detect duplicates: (field, normalised value) for email and instagram."""
+    keys: set[tuple[str, str]] = set()
+    if contact.email.strip():
+        keys.add(("email", contact.email.strip().lower()))
+    if contact.instagram.strip():
+        keys.add(("instagram", contact.instagram.strip().lstrip("@").lower()))
+    digits = "".join(ch for ch in contact.phone if ch.isdigit())
+    if len(digits) >= PHONE_MATCH_MIN_DIGITS:
+        keys.add(("phone", digits))
+    handle = re.sub(r"^(https?://)?(www\.)?(t\.me|telegram\.me)/", "", contact.telegram.strip(), flags=re.I)
+    handle = handle.strip("/").lstrip("@").lower()
+    if handle:
+        keys.add(("telegram", handle))
+    return keys
+
+
+def _normal(field: str, value: str) -> str:
+    """Normalise a contact field value for comparison."""
+    value = value.strip().lower()
+    if field == "phone":
+        return "".join(ch for ch in value if ch.isdigit())
+    if field == "telegram":
+        return re.sub(r"^(https?://)?(www\.)?(t\.me|telegram\.me)/", "", value).strip("/").lstrip("@")
+    if field == "instagram":
+        return value.lstrip("@")
+    return value
+
+
+def _contacts_conflict(kept: Contact, other: Contact) -> bool:
+    """True when both contacts have a non-empty value for a field and the normalised values differ."""
+    for field in ("name", "role", "email", "phone", "telegram", "instagram", "website", "notes"):
+        a, b = _normal(field, getattr(kept, field)), _normal(field, getattr(other, field))
+        if a and b and a != b:
+            return True
+    return False
+
+
+def _absorb_contact(kept: Contact, duplicate: Contact) -> None:
+    """Fill blanks on ``kept`` from ``duplicate`` and repoint emails/drafts that referenced the duplicate."""
+    changed = False
+    for field in ("name", "role", "phone", "telegram", "website", "email", "instagram", "notes"):
+        if not getattr(kept, field) and getattr(duplicate, field):
+            setattr(kept, field, getattr(duplicate, field))
+            changed = True
+    if changed:
+        kept.save()
+    EmailSent.objects.filter(contact=duplicate).update(contact=kept)
+    for draft in EmailDraft.objects.filter(contact=duplicate):
+        draft.contact = kept
+        draft.save(update_fields=["contact"])
+    duplicate.delete()
+
+
+def _move_contacts(primary: Lead, others: t.Sequence[Lead]) -> None:
+    """Move contacts to the primary, merging ones with an identical email/instagram into the existing contact."""
+    existing = list(primary.contacts.all())
+    has_primary = any(c.is_primary for c in existing)
+    for other in others:
+        for contact in list(other.contacts.order_by("-is_primary", "pk")):
+            keys = _contact_keys(contact)
+            twin = next((c for c in existing if keys & _contact_keys(c)), None) if keys else None
+            if twin is not None and not _contacts_conflict(twin, contact):
+                _absorb_contact(twin, contact)
+                continue
+            if contact.is_primary and has_primary:
+                contact.is_primary = False
+            has_primary = has_primary or contact.is_primary
+            contact.lead = primary
+            contact.save()
+            existing.append(contact)
+
+
+def _move_related(primary: Lead, others: t.Sequence[Lead]) -> None:
+    """Re-point actions, outreach messages, email drafts and sent emails at the primary."""
+    ids = [o.pk for o in others]
+    # save(update_fields=["lead"]) keeps updated_at and still writes a simple_history row for the move
+    for model in (Action, OutreachMessage, EmailDraft):
+        for obj in model.objects.filter(lead_id__in=ids):
+            obj.lead = primary
+            obj.save(update_fields=["lead"])
+    EmailSent.objects.filter(lead_id__in=ids).update(lead=primary)
+
+
+def _cleanup_review_tags(primary: Lead) -> None:
+    """Drop review:duplicate-<n> tags nobody else carries any more, then review:duplicates if no group is left."""
+    for tag in primary.tags.all():
+        name = tag.name.lower()
+        if name.startswith(REVIEW_GROUP_PREFIX) and not Lead.objects.filter(tags=tag).exclude(pk=primary.pk).exists():
+            primary.tags.remove(tag)
+    if not primary.tags.filter(name__istartswith=REVIEW_GROUP_PREFIX).exists():
+        primary.tags.remove(*primary.tags.filter(name__iexact=REVIEW_GENERIC_TAG))
+
+
+def _change_reason(others: t.Sequence[Lead], user: AbstractBaseUser | AnonymousUser | None) -> str:
+    who = user.get_username() if user is not None and user.is_authenticated else "API"
+    reason = f"merged {', '.join(f'#{o.pk}' for o in others)} by {who}"
+    return reason if len(reason) <= CHANGE_REASON_MAX else reason[: CHANGE_REASON_MAX - 3] + "..."
+
+
+def merge_leads(primary: Lead, others: t.Sequence[Lead], user: AbstractBaseUser | AnonymousUser | None = None) -> Lead:
+    """Merge duplicate leads into ``primary`` in one transaction, then delete the others.
+
+    Blank primary fields are filled from the others (oldest first), nothing non-empty is overwritten, notes are
+    appended, tags and ticketing platforms are unioned, value/last_contact/temperature take the highest, status the
+    most advanced. Contacts (de-duplicated by email/instagram), actions, DMs, drafts and sent emails move to the
+    primary; a do-not-contact lead anywhere makes the primary do-not-contact and cascades suppression.
+
+    Raises:
+        MergeError: when ``others`` is empty, contains the primary, or more than ``MERGE_MAX_LEADS`` leads are given.
+    """
+    other_ids = list(dict.fromkeys(o.pk for o in others))
+    if not other_ids:
+        raise MergeError("Select at least one other lead to merge into the primary")
+    if primary.pk in other_ids:
+        raise MergeError("A lead cannot be merged into itself")
+    if len(other_ids) + 1 > MERGE_MAX_LEADS:
+        raise MergeError(f"Merge at most {MERGE_MAX_LEADS} leads at once")
+
+    with transaction.atomic():
+        locked = {lead.pk: lead for lead in Lead.objects.select_for_update().filter(pk__in=[primary.pk, *other_ids])}
+        if len(locked) != len(other_ids) + 1:
+            raise MergeError("Some of the leads no longer exist")
+        locked_primary = locked[primary.pk]
+        locked_others = sorted((locked[pk] for pk in other_ids), key=lambda lead: (lead.created_at, lead.pk))
+
+        tag_ids = list(Tag.objects.filter(leads__in=locked_others).values_list("pk", flat=True))
+        _merge_external_ref(locked_primary, locked_others)
+        _merge_lead_fields(locked_primary, locked_others)
+        _merge_do_not_contact(locked_primary, locked_others)
+        locked_primary.tags.add(*tag_ids)
+
+        _move_contacts(locked_primary, locked_others)
+        _move_related(locked_primary, locked_others)
+        _preserve_identities(locked_primary, locked_others)
+
+        locked_primary._change_reason = _change_reason(locked_others, user)  # type: ignore[attr-defined]
+        for other in locked_others:
+            other.delete()
+        locked_primary.save()
+        suppress_outreach(locked_primary)
+        _cleanup_review_tags(locked_primary)
+    return locked_primary
+
+
+def summarize_merge(leads: t.Sequence[Lead]) -> dict[int, dict[str, int]]:
+    """Per lead id, how many contacts/actions/messages/drafts/emails it carries (what would move if merged away)."""
+    return {
+        lead.pk: {
+            "contacts": lead.contacts.count(),
+            "actions": lead.actions.count(),
+            "messages": lead.messages.count(),
+            "drafts": lead.email_drafts.count(),
+            "emails": lead.emails_sent.count(),
+        }
+        for lead in leads
+    }

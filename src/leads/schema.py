@@ -641,6 +641,13 @@ class LeadTagsIn(Schema):
     remove: list[str] = Field(default_factory=list, description="Tag names to remove (case-insensitive)")
 
 
+class LeadMergeIn(Schema):
+    """Merge duplicate leads into one."""
+
+    primary_id: int = Field(..., description="Lead to keep; the others are merged into it and deleted")
+    other_ids: list[int] = Field(..., description="Leads to merge into the primary (max 19)")
+
+
 class LeadTagsOut(Schema):
     """Bulk tag result."""
 

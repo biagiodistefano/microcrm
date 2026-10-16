@@ -108,6 +108,7 @@ leads update    LEAD_ID [--name] [--email] [--phone] [--company] [--type]
                 [--website] [--source] [--status] [--temperature] [--tag]
                 [--notes] [--value] [--raw]
 leads delete    LEAD_ID [--force]
+leads merge     PRIMARY OTHER... [--force] [--raw]   (merge duplicates into PRIMARY; preview unless --force)
 leads import    FILE [--dry-run]
 leads send-email LEAD_ID [--template] [--subject] [--body] [--to] [--bcc]
                 [--background] [--send] [--raw]
@@ -230,6 +231,9 @@ python cli.py jobs list --status completed
   `POST /leads/upsert` to change only some fields. `PUT` never touches `do_not_contact`.
 - `POST /leads/upsert` returns `{id, created, do_not_contact, matched_on}`. `external_ref` is lowercased and
   stripped everywhere. Aggregator/social websites (linktr.ee, instagram.com, ...) are never a dedupe key.
+- `POST /leads/merge` `{primary_id, other_ids}` merges duplicate leads (service `merge_leads`, also the admin
+  "Merge selected leads…" action): fills blank primary fields, appends notes, unions tags, moves contacts/actions/
+  DMs/drafts/emails, deletes the others; any do-not-contact lead makes the result do-not-contact. Max 20 leads.
 - Marking a lead do-not-contact skips its draft DMs, deletes its unsent email drafts (history is kept), and blocks
   every send path. An assigned email draft can only be sent by its assignee or a superuser, from their own Gmail.
 

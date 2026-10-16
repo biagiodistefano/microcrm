@@ -46,6 +46,7 @@ from leads.schema import (
     JobActionResponse,
     LeadFilterSchema,
     LeadIn,
+    LeadMergeIn,
     LeadPatch,
     LeadSchema,
     LeadTagsIn,
@@ -162,6 +163,28 @@ class LeadController(ControllerBase):
         """
         lead, created, matched_on = service.upsert_lead(data)
         return LeadUpsertOut(id=lead.id, created=created, do_not_contact=lead.do_not_contact, matched_on=matched_on)
+
+    @route.post("/merge", response=LeadSchema)
+    def merge_leads(self, data: LeadMergeIn) -> Lead:
+        """Merge duplicate leads into one and return the merged lead.
+
+        Example request: `{"primary_id": 12, "other_ids": [40, 57]}`.
+
+        Blank fields on the primary are filled from the others; notes are appended, tags are unioned, status is the
+        most advanced, temperature the hottest. Contacts, actions, DMs, drafts and emails move to the primary and
+        the others are deleted. If any lead is do-not-contact the result is do-not-contact.
+        Errors: 400 (merge into itself, no others, more than 20 leads), 404 (unknown lead id).
+        """
+        ids = [data.primary_id, *data.other_ids]
+        leads = {lead.pk: lead for lead in Lead.objects.filter(pk__in=ids)}
+        missing = sorted(set(ids) - set(leads))
+        if missing:
+            raise HttpError(404, f"Lead(s) not found: {', '.join(f'#{i}' for i in missing)}")
+        try:
+            merged = service.merge_leads(leads[data.primary_id], [leads[i] for i in data.other_ids if i in leads])
+        except service.MergeError as exc:
+            raise HttpError(400, str(exc)) from exc
+        return get_object_or_404(self.get_queryset(), id=merged.pk)
 
     @route.get("/{lead_id}", response=LeadSchema)
     def get_lead(self, lead_id: int) -> Lead:
