@@ -12,7 +12,7 @@ from ninja.errors import HttpError
 
 from leads import models, service
 from leads.models import EmailDraft, Lead, OutreachMessage
-from leads.schema import LeadUpsertIn
+from leads.schema import CityIn, LeadUpsertIn
 
 pytestmark = pytest.mark.django_db
 
@@ -113,7 +113,11 @@ def test_every_flip_path_suppresses(lead: Lead, api_client: Client, via: str, ad
         lead.do_not_contact = True
         request = RequestFactory().post("/")
         request.user = admin_user
-        LeadAdmin(Lead, AdminSite()).save_model(request, lead, None, True)
+        ladmin = LeadAdmin(Lead, AdminSite())
+        ladmin.save_model(request, lead, None, True)
+        form = type("F", (), {"instance": lead})()
+        with patch("django.contrib.admin.options.ModelAdmin.save_related"):
+            ladmin.save_related(request, form, [], True)
         lead.refresh_from_db()
         assert lead.do_not_contact_at is not None
     else:
@@ -217,18 +221,42 @@ def up(**kw: t.Any) -> tuple[Lead, bool, str | None]:
     return service.upsert_lead(LeadUpsertIn(**kw))
 
 
-def test_different_ref_blocks_every_key() -> None:
+def test_strong_keys_win_regardless_of_ref() -> None:
     a, _, _ = up(external_ref="a", email="shared@x.org", phone="1", instagram="ig", bluesky="b", name="A")
-    for key in ({"email": "shared@x.org"}, {"phone": "1"}, {"instagram": "ig"}, {"bluesky": "b"}):
+    for key in ({"email": "shared@x.org"}, {"phone": "1"}, {"instagram": "IG"}, {"bluesky": "b"}):
         lead, created, matched_on = up(external_ref="other-" + next(iter(key)), name="Z", **key)
-        assert created is True and matched_on is None and lead.pk != a.pk
+        assert created is False and lead.pk == a.pk and matched_on == next(iter(key))
+        lead.refresh_from_db()
+        assert lead.external_ref == "a"  # existing ref never overwritten
 
 
-def test_ref_blocked_candidate_skipped_for_next_candidate() -> None:
-    up(external_ref="a", email="shared@x.org", name="A")
-    blank = Lead.objects.create(name="Blank", email="shared@x.org")
-    lead, created, matched_on = up(external_ref="b", email="shared@x.org", name="B")
-    assert created is False and lead.pk == blank.pk and matched_on == "email"
+def test_weak_keys_vetoed_by_different_ref() -> None:
+    a, _, _ = up(
+        external_ref="a", website="https://clubx.de", name="Club", city=CityIn(name="B", country="G", iso2="DE")
+    )
+    w, created, _ = up(external_ref="b", website="clubx.de", name="Other")
+    assert created is True and w.pk != a.pk
+    n, created, _ = up(external_ref="c", name="club", city=CityIn(name="B", country="G", iso2="DE"))
+    assert created is True and n.pk != a.pk
+
+
+def test_cross_source_ref_does_not_bypass_do_not_contact() -> None:
+    a, _, _ = up(name="Club", instagram="clubx", external_ref="salesops:ig:clubx")
+    service.mark_do_not_contact(a, "not-a-fit")
+    b, created, on = up(
+        name="Club X", instagram="clubx", email="hi@clubx.de", external_ref="salesops:bsky:clubx.bsky.social"
+    )
+    assert (b.pk, created, on, b.do_not_contact) == (a.pk, False, "instagram", True)
+    assert Lead.objects.count() == 1
+    b.refresh_from_db()
+    assert b.email == ""  # suppressed lead is left untouched
+
+
+def test_do_not_contact_candidate_preferred_among_strong_matches() -> None:
+    plain = Lead.objects.create(name="Plain", email="dup@x.org")
+    sup = service.mark_do_not_contact(Lead.objects.create(name="Sup", email="dup@x.org"))
+    lead, created, _ = up(name="Z", email="dup@x.org")
+    assert created is False and lead.pk == sup.pk != plain.pk
 
 
 def test_matched_on_values() -> None:
@@ -363,3 +391,47 @@ class TestAssignedDraftSending:
         d = EmailDraft.objects.create(lead=lead, subject="s", body="b", to=["o@x.org"])
         with patch("leads.gmail.get_gmail_credentials"), patch("leads.gmail.send_email_via_gmail"):
             assert service.send_email_draft(d, rep).status == "sent"
+
+
+# --- N2: admin form external_ref case ---
+
+
+def test_admin_form_external_ref_case_is_form_error() -> None:
+    from django.contrib.admin.sites import AdminSite
+
+    from leads.admin import LeadAdmin
+
+    Lead.objects.create(name="First", external_ref="abc")
+    form_cls = LeadAdmin(Lead, AdminSite()).get_form(RequestFactory().get("/"), fields=["name", "external_ref"])
+    form = form_cls({"name": "Second", "external_ref": "ABC"})
+    assert not form.is_valid()  # a form error, not an IntegrityError 500
+    ok = form_cls({"name": "Third", "external_ref": "XyZ"})
+    assert ok.is_valid()
+    assert ok.save().external_ref == "xyz"
+
+
+# --- N3: cascade after inlines ---
+
+
+def test_inline_save_cannot_resurrect_draft(lead: Lead) -> None:
+    from django.contrib.admin.sites import AdminSite
+
+    from leads.admin import LeadAdmin
+
+    msg = OutreachMessage.objects.create(lead=lead, channel="instagram", text="a")
+    stale = OutreachMessage.objects.get(pk=msg.pk)  # inline formset instance loaded before the cascade
+    ladmin = LeadAdmin(Lead, AdminSite())
+    request = RequestFactory().post("/")
+    request.user = User.objects.create_user("adm", email="adm@x.io")
+    lead.do_not_contact = True
+    ladmin.save_model(request, lead, None, True)
+
+    def inline_save(*args: t.Any, **kwargs: t.Any) -> None:
+        stale.text = "edited inline"
+        stale.save()
+
+    form = type("F", (), {"instance": lead})()
+    with patch("django.contrib.admin.options.ModelAdmin.save_related", side_effect=inline_save):
+        ladmin.save_related(request, form, [], True)
+    msg.refresh_from_db()
+    assert msg.text == "edited inline" and msg.status == "skipped"

@@ -154,6 +154,10 @@ class Lead(models.Model):
             ),
         ]
 
+    def clean(self) -> None:
+        """Normalise external_ref before uniqueness validation so e.g. "ABC" vs "abc" is a form error."""
+        self.external_ref = self.external_ref.strip().lower()
+
     def save(self, *args: t.Any, **kwargs: t.Any) -> None:
         """Normalise external_ref (strip + lowercase) so matching and the unique constraint are exact."""
         self.external_ref = self.external_ref.strip().lower()

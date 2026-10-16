@@ -555,10 +555,14 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
         js = ["leads/js/chained_filters.js"]
 
     def save_model(self, request: HttpRequest, obj: models.Lead, form: t.Any, change: bool) -> None:  # noqa: FBT001
-        """Keep the do-not-contact stamp consistent and neutralise pending outreach when suppressing."""
+        """Keep the do-not-contact stamp consistent."""
         lead_service.sync_do_not_contact_timestamp(obj)
         super().save_model(request, obj, form, change)
-        lead_service.suppress_outreach(obj)
+
+    def save_related(self, request: HttpRequest, form: t.Any, formsets: t.Any, change: bool) -> None:  # noqa: FBT001
+        """Neutralise pending outreach AFTER inlines are saved, so an inline can't resurrect a draft."""
+        super().save_related(request, form, formsets, change)
+        lead_service.suppress_outreach(form.instance)
 
     def get_urls(self) -> list[t.Any]:
         """Add custom URLs for email and filter endpoints."""

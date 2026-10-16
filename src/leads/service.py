@@ -285,16 +285,19 @@ def normalize_website(url: str) -> str:
     return f"{host}{path}"
 
 
-def _match_exact(field: str, value: str, ok: t.Callable[[Lead], bool]) -> tuple[Contact | None, Lead] | None:
-    """Case-insensitive exact match on a contact method / handle (Contact rows first, then Lead columns)."""
+def _match_exact(field: str, value: str) -> tuple[Contact | None, Lead] | None:
+    """Case-insensitive exact match on a strong identity key (Contact rows first, then Lead columns).
+
+    Strong keys are never vetoed by external_ref. If several leads match, a do-not-contact one wins so a
+    suppressed lead can never be bypassed by a duplicate.
+    """
+    candidates: list[tuple[Contact | None, Lead]] = []
     if field in CONTACT_FIELDS:
-        for contact in Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value}):
-            if ok(contact.lead):
-                return contact, contact.lead
-    for lead in Lead.objects.filter(**{f"{field}__iexact": value}):
-        if ok(lead):
-            return None, lead
-    return None
+        candidates += [
+            (c, c.lead) for c in Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value})
+        ]
+    candidates += [(None, lead) for lead in Lead.objects.filter(**{f"{field}__iexact": value})]
+    return next((c for c in candidates if c[1].do_not_contact), candidates[0] if candidates else None)
 
 
 def _match_website(value: str, ok: t.Callable[[Lead], bool]) -> tuple[Contact | None, Lead] | None:
@@ -315,8 +318,10 @@ def _match_website(value: str, ok: t.Callable[[Lead], bool]) -> tuple[Contact | 
 def find_existing_lead(data: LeadUpsertIn, city: City | None) -> tuple[Contact | None, Lead | None, str | None]:
     """Find the lead an incoming record refers to.
 
-    Order: external_ref, then each contact method / handle, then name+city. A candidate that carries a
-    different non-empty external_ref than the incoming record is never matched, on any key.
+    Order: external_ref, then each contact method / handle, then name+city. Exact matches on strong keys
+    (email, phone, instagram, telegram, bluesky, facebook, linkedin, whatsapp) win regardless of external_ref,
+    since the same organisation found on another source arrives with a different ref. Only the weak keys
+    (website, name+city) are vetoed by a different non-empty external_ref on the candidate.
 
     Returns:
         Tuple of (matched_contact, lead, matched_on). matched_contact is set only on a Contact-row match;
@@ -336,7 +341,7 @@ def find_existing_lead(data: LeadUpsertIn, city: City | None) -> tuple[Contact |
         value = (getattr(data, field) or "").strip()
         if not value:
             continue
-        found = _match_website(value, ok) if field == "website" else _match_exact(field, value, ok)
+        found = _match_website(value, ok) if field == "website" else _match_exact(field, value)
         if found:
             return found[0], found[1], field
 

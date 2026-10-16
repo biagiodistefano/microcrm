@@ -182,9 +182,8 @@ class TestUpsertMerge:
     def test_existing_external_ref_not_replaced(self) -> None:
         _upsert(name="Org", email="o@x.org", external_ref="ops:1")
         other, created = _upsert(name="Org", email="o@x.org", external_ref="ops:2")
-        assert created is True  # different non-empty ref: never merged, even on a shared email
-        assert other.external_ref == "ops:2"
-        assert Lead.objects.get(external_ref="ops:1").pk != other.pk
+        assert created is False  # strong key (email) wins across sources; existing ref is kept
+        assert other.external_ref == "ops:1"
 
     def test_fills_city_and_type_when_missing(self) -> None:
         _upsert(name="Org", email="o@x.org")
