@@ -1,0 +1,84 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block extrahead %}
+{{ block.super }}
+<style>
+    .merge-page { max-width: 1100px; }
+    .merge-page table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+    .merge-page th, .merge-page td { text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border-color, #ddd); vertical-align: top; }
+    .merge-page tr.keep { background: rgba(34, 197, 94, 0.12); }
+    .merge-page .notice { padding: 0.75rem 1rem; border-radius: 0.375rem; background: #e5e7eb; color: #374151; margin: 1rem 0; }
+    .merge-page .notice.warn { background: #fef3c7; color: #92400e; }
+    .merge-page .notice.error { background: #fee2e2; color: #991b1b; }
+    .merge-page .actions { display: flex; gap: 1rem; align-items: center; margin-top: 1rem; }
+    .merge-page .quiet { color: var(--body-quiet-color, #666); font-size: 0.8rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="merge-page">
+    <div class="notice">
+        <strong>What does merging do?</strong>
+        These leads look like the same organisation. Pick the one you want to <strong>keep</strong>.
+        Everything the other leads have that the kept lead is missing (email, Instagram, notes, tags, contacts,
+        tasks, messages, emails) is copied onto it, and the other leads are then deleted.
+        Nothing already filled in on the kept lead is overwritten. The status becomes the most advanced one
+        and the temperature the hottest. This cannot be undone.
+    </div>
+
+    {% if error %}<div class="notice error">{{ error }}</div>{% endif %}
+    {% if any_dnc %}
+    <div class="notice warn">At least one of these leads is marked <strong>do not contact</strong>.
+        The merged lead will be do not contact too, and its pending drafts and messages will be cancelled.</div>
+    {% endif %}
+
+    <form method="post" action="{% url 'admin:leads_lead_merge' %}">
+        {% csrf_token %}
+        <input type="hidden" name="ids" value="{{ ids }}">
+        <table>
+            <thead>
+                <tr>
+                    <th>Keep</th><th>Name</th><th>Status</th><th>Email</th><th>Instagram</th><th>Website</th>
+                    <th>City</th><th>Source</th><th>Created</th><th>Will be moved</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for row in rows %}
+                <tr {% if row.lead.pk == primary_id %}class="keep"{% endif %}>
+                    <td>
+                        <input type="radio" name="primary" id="primary-{{ row.lead.pk }}" value="{{ row.lead.pk }}"
+                               {% if row.lead.pk == primary_id %}checked{% endif %}>
+                    </td>
+                    <td>
+                        <label for="primary-{{ row.lead.pk }}"><strong>{{ row.lead.name }}</strong></label>
+                        <div class="quiet"><a href="{{ row.link }}" target="_blank" rel="noopener">#{{ row.lead.pk }} (open)</a>
+                        {% if row.lead.do_not_contact %} · do not contact{% endif %}</div>
+                    </td>
+                    <td>{{ row.lead.get_status_display }}</td>
+                    <td>{{ row.email|default:"-" }}</td>
+                    <td>{{ row.instagram|default:"-" }}</td>
+                    <td>{{ row.lead.website|default:"-" }}</td>
+                    <td>{{ row.lead.city|default:"-" }}</td>
+                    <td>{{ row.lead.source|default:"-" }}</td>
+                    <td>{{ row.lead.created_at|date:"Y-m-d" }}</td>
+                    <td class="quiet">
+                        {{ row.counts.contacts }} contact{{ row.counts.contacts|pluralize }},
+                        {{ row.counts.actions }} task{{ row.counts.actions|pluralize }},
+                        {{ row.counts.messages }} message{{ row.counts.messages|pluralize }},
+                        {{ row.counts.drafts }} draft{{ row.counts.drafts|pluralize }},
+                        {{ row.counts.emails }} email{{ row.counts.emails|pluralize }}
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        <p class="quiet">The last column is what each lead has; if you do not keep it, that is what moves onto the kept lead.
+            By default we suggest the most advanced lead, then the oldest.</p>
+        <div class="actions">
+            <button type="submit" class="button default" style="padding: 0.5rem 1rem;">Confirm merge</button>
+            <a href="{{ back_url }}">Cancel</a>
+        </div>
+    </form>
+</div>
+{% endblock %}

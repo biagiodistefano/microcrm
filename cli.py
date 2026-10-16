@@ -352,6 +352,32 @@ def leads_delete(
         handle_error(e)
 
 
+@leads_app.command("merge")
+def leads_merge(
+    primary: int = typer.Argument(..., help="Lead ID to keep"),
+    others: list[int] = typer.Argument(..., help="Lead IDs to merge into the primary (then deleted)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip the preview and confirmation"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
+) -> None:
+    """Merge duplicate leads into PRIMARY (the others are deleted). Shows a preview unless --force."""
+    try:
+        if not force:
+            preview = [api.get(f"/leads/{lead_id}") for lead_id in [primary, *others]]
+            rows = [{**lead, "role": "KEEP" if lead["id"] == primary else "merge+delete"} for lead in preview]  # type: ignore[index,call-overload]
+            output_table(
+                rows, ["id", "role", "name", "status", "email", "instagram", "website", "created_at"], "Merge preview"
+            )
+            if not typer.confirm(f"Merge {len(others)} lead(s) into #{primary}? This cannot be undone"):
+                raise typer.Abort()
+        result = api.post("/leads/merge", {"primary_id": primary, "other_ids": others})
+        if raw:
+            output_json(result, raw=True)
+        else:
+            rprint(f"[green]Merged {len(others)} lead(s) into #{result['id']} ({result['name']})[/green]")
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+
 IMPORT_STRING_KEYS = (
     "email",
     "phone",
