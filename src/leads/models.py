@@ -1,3 +1,7 @@
+import hashlib
+from urllib.parse import parse_qs, quote, urlparse
+
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import F
 from encrypted_fields.fields import EncryptedTextField
@@ -60,7 +64,11 @@ class Lead(models.Model):
     class Status(models.TextChoices):
         NEW = "new", "New"
         CONTACTED = "contacted", "Contacted"
+        REPLIED = "replied", "Replied"
         QUALIFIED = "qualified", "Qualified"
+        CALL_BOOKED = "call_booked", "Call booked"
+        ORG_CREATED = "org_created", "Org created"
+        FIRST_EVENT_LIVE = "first_event_live", "First event live"
         CONVERTED = "converted", "Converted"
         LOST = "lost", "Lost"
 
@@ -85,6 +93,21 @@ class Lead(models.Model):
     telegram = models.CharField(max_length=255, blank=True, help_text="Telegram username or link")
     instagram = models.CharField(max_length=255, blank=True, help_text="Instagram handle")
     website = models.URLField(blank=True)
+    bluesky = models.CharField(max_length=255, blank=True, help_text="Bluesky handle or profile URL")
+    facebook = models.CharField(max_length=255, blank=True, help_text="Facebook page URL or slug")
+    linkedin = models.CharField(max_length=255, blank=True, help_text="LinkedIn profile/company URL")
+    whatsapp = models.CharField(max_length=50, blank=True, help_text="WhatsApp number (international format)")
+    ticketing_platforms = models.JSONField(
+        default=list, blank=True, help_text="Ticketing platform keys they use (e.g. eventbrite, ra)"
+    )
+    external_ref = models.CharField(
+        max_length=255, blank=True, help_text="Stable ID from an external tool, used for idempotent upserts"
+    )
+
+    # Suppression: set only by explicit action, never cleared by upsert/import/research
+    do_not_contact = models.BooleanField(default=False, help_text="Never message this lead (suppressed forever)")
+    do_not_contact_reason = models.TextField(blank=True)
+    do_not_contact_at = models.DateTimeField(null=True, blank=True)
 
     # Lead tracking
     source = models.CharField(max_length=255, blank=True, help_text="How they found us / we found them")
@@ -112,6 +135,7 @@ class Lead(models.Model):
         indexes = [
             # Choice fields and dates - frequently filtered
             models.Index(fields=["status"], name="leads_lead_status"),
+            models.Index(fields=["do_not_contact"], name="leads_lead_dnc"),
             models.Index(fields=["temperature"], name="leads_lead_temperature"),
             models.Index(fields=["created_at"], name="leads_lead_created_at"),
             # Contact fields - frequently searched/filtered (Note: FKs like city/lead_type get auto-indexed)
@@ -120,6 +144,13 @@ class Lead(models.Model):
             models.Index(fields=["instagram"], name="leads_lead_instagram"),
             models.Index(fields=["telegram"], name="leads_lead_telegram"),
             models.Index(fields=["website"], name="leads_lead_website"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["external_ref"],
+                condition=~models.Q(external_ref=""),
+                name="leads_lead_unique_external_ref",
+            ),
         ]
 
     def __str__(self) -> str:
@@ -201,6 +232,155 @@ class Action(models.Model):
     def __str__(self) -> str:
         """Return string representation."""
         return f"{self.name} ({self.lead.name})"
+
+
+def _hash_matches(text: str, expected: str) -> bool:
+    """True when sha256(text) equals a non-empty expected hash."""
+    return bool(expected) and hashlib.sha256(text.encode()).hexdigest() == expected
+
+
+def _refuse_do_not_contact(obj: "EmailDraft | OutreachMessage") -> None:
+    """Raise ValidationError when creating an object for a do-not-contact lead."""
+    if obj._state.adding and obj.lead_id and obj.lead.do_not_contact:
+        raise ValidationError(f"{obj.lead.name} is marked do not contact")
+
+
+def _extract_handle(value: str, hosts: tuple[str, ...]) -> str:
+    """Return the bare handle from a handle, @handle or profile URL on one of ``hosts``."""
+    value = value.strip()
+    if "/" in value or any(host in value.lower() for host in hosts):
+        parsed = urlparse(value if "//" in value else f"//{value}")
+        segments = [seg for seg in parsed.path.split("/") if seg]
+        if segments and segments[0].lower() in ("profile", "u", "_u"):
+            segments = segments[1:]
+        value = segments[0] if segments else ""
+    return value.lstrip("@").strip()
+
+
+def _facebook_slug(value: str) -> str:
+    """Return the page slug/ID from a Facebook URL or bare slug."""
+    value = value.strip()
+    if "/" not in value and "facebook.com" not in value.lower() and "fb.com" not in value.lower():
+        return value.lstrip("@")
+    parsed = urlparse(value if "//" in value else f"//{value}")
+    segments = [seg for seg in parsed.path.split("/") if seg]
+    if segments and segments[0].lower() == "profile.php":
+        return parse_qs(parsed.query).get("id", [""])[0]
+    if segments and segments[0].lower() == "pages":
+        return segments[-1]
+    return segments[0] if segments else ""
+
+
+class OutreachMessage(models.Model):
+    """A prepared direct message to send by hand to a lead on a social channel."""
+
+    class Channel(models.TextChoices):
+        INSTAGRAM = "instagram", "Instagram"
+        FACEBOOK = "facebook", "Facebook"
+        WHATSAPP = "whatsapp", "WhatsApp"
+        BLUESKY = "bluesky", "Bluesky"
+        LINKEDIN = "linkedin", "LinkedIn"
+        TELEGRAM = "telegram", "Telegram"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SENT = "sent", "Sent"
+        SKIPPED = "skipped", "Skipped"
+
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="messages")
+    channel = models.CharField(max_length=20, choices=Channel.choices)
+    text = models.TextField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    assigned_to = models.ForeignKey(
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_outreach_messages",
+        help_text="Who is expected to send this message",
+    )
+    sent_at = models.DateTimeField(null=True, blank=True)
+    sent_by = models.ForeignKey(
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sent_outreach_messages",
+    )
+    humanized_hash = models.CharField(max_length=255, blank=True, help_text="Hash of the humanized text (audit)")
+    batch = models.CharField(max_length=255, blank=True, help_text="Batch label from the producing tool")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = HistoricalRecords()
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status"], name="leads_outreach_status"),
+            models.Index(fields=["channel"], name="leads_outreach_channel"),
+            models.Index(fields=["batch"], name="leads_outreach_batch"),
+            models.Index(fields=["created_at"], name="leads_outreach_created_at"),
+        ]
+
+    @property
+    def is_humanized(self) -> bool:
+        """True when the text still matches the hash recorded when it was humanized."""
+        return _hash_matches(self.text, self.humanized_hash)
+
+    def clean(self) -> None:
+        """Refuse new messages for do-not-contact leads."""
+        _refuse_do_not_contact(self)
+
+    def __str__(self) -> str:
+        """Return string representation."""
+        return f"{self.get_channel_display()} DM to {self.lead.name} ({self.status})"
+
+    def _lead_handle(self, field: str) -> str:
+        """Return the lead's value for ``field``, falling back to a contact that has it."""
+        value: str = getattr(self.lead, field, "") or ""
+        if value:
+            return value
+        for contact in sorted(self.lead.contacts.all(), key=lambda c: not c.is_primary):
+            if getattr(contact, field, ""):
+                return str(getattr(contact, field))
+        return ""
+
+    @property
+    def deeplink(self) -> str:
+        """Return the URL that opens a DM to the lead on this channel, or "" if the lead lacks the field."""
+        channel = self.Channel
+        if self.channel == channel.INSTAGRAM:
+            handle = _extract_handle(self._lead_handle("instagram"), ("instagram.com", "ig.me"))
+            return f"https://ig.me/m/{quote(handle, safe='._')}" if handle else ""
+        if self.channel == channel.FACEBOOK:
+            slug = _facebook_slug(self.lead.facebook)
+            return f"https://m.me/{quote(slug, safe='.-_')}" if slug else ""
+        if self.channel == channel.WHATSAPP:
+            digits = "".join(ch for ch in self.lead.whatsapp if ch.isdigit())
+            if not digits:
+                return ""
+            return f"https://wa.me/{digits}?text={quote(self.text, safe='')}"
+        if self.channel == channel.BLUESKY:
+            handle = _extract_handle(self.lead.bluesky, ("bsky.app",))
+            return f"https://bsky.app/profile/{quote(handle, safe='.-_:')}" if handle else ""
+        if self.channel == channel.LINKEDIN:
+            return self._linkedin_url()
+        if self.channel == channel.TELEGRAM:
+            handle = _extract_handle(self._lead_handle("telegram"), ("t.me", "telegram.me"))
+            return f"https://t.me/{quote(handle, safe='._')}" if handle else ""
+        return ""
+
+    def _linkedin_url(self) -> str:
+        """Return the lead's LinkedIn URL, always http(s)."""
+        url = self.lead.linkedin.strip()
+        if not url:
+            return ""
+        if url.lower().startswith(("http://", "https://")):
+            return url
+        if "linkedin.com" in url.lower():
+            return f"https://{url}"
+        return f"https://www.linkedin.com/company/{quote(url)}"
 
 
 class ResearchPromptConfig(SingletonModel):
@@ -360,10 +540,22 @@ class EmailDraft(models.Model):
     from_email = models.CharField(
         blank=True, help_text="Sender email address (defaults to DEFAULT_FROM_EMAIL)", max_length=255
     )
+    assigned_to = models.ForeignKey(
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_email_drafts",
+        help_text="User whose queue this draft belongs to (sends from their Gmail)",
+    )
     to = models.JSONField(default=list, help_text="List of recipient email addresses")
     bcc = models.JSONField(default=list, blank=True, help_text="List of BCC email addresses")
     subject = models.CharField(max_length=255, help_text="Email subject")
     body = models.TextField(help_text="Email body")
+    humanized_hash = models.CharField(
+        max_length=255, blank=True, help_text="sha256 of subject + \\x1f + body as humanized (audit)"
+    )
+    batch = models.CharField(max_length=255, blank=True, help_text="Batch label from the producing tool")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -377,6 +569,15 @@ class EmailDraft(models.Model):
             models.Index(fields=["created_at"], name="leads_emaildraft_created"),
             models.Index(fields=["updated_at"], name="leads_emaildraft_updated"),
         ]
+
+    @property
+    def is_humanized(self) -> bool:
+        """True when subject + body still match the hash recorded when they were humanized."""
+        return _hash_matches(f"{self.subject}\x1f{self.body}", self.humanized_hash)
+
+    def clean(self) -> None:
+        """Refuse new drafts for do-not-contact leads."""
+        _refuse_do_not_contact(self)
 
     def __str__(self) -> str:
         """Return string representation."""

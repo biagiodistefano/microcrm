@@ -247,8 +247,8 @@ def _get_chart_data() -> dict[str, t.Any]:
     """Prepare chart data for JavaScript."""
     # Status data
     status_counts = _get_leads_by_status()
-    status_order = ["new", "contacted", "qualified", "converted", "lost"]
-    status_labels = ["New", "Contacted", "Qualified", "Converted", "Lost"]
+    status_order = [status.value for status in Lead.Status]
+    status_labels = [str(status.label) for status in Lead.Status]
     status_data = [status_counts.get(s, 0) for s in status_order]
 
     # Temperature data
