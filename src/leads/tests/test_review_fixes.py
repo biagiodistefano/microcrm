@@ -176,11 +176,11 @@ def test_queue_excludes_dnc_leads(lead: Lead, rep: User) -> None:
     request.user = rep
     for params in ({}, {"queue": ["drafts"]}):
         f = OutreachQueueFilter(
-            request, dict(params), OutreachMessage, OutreachMessageAdmin(OutreachMessage, AdminSite())
+            request, t.cast(t.Any, dict(params)), OutreachMessage, OutreachMessageAdmin(OutreachMessage, AdminSite())
         )
         assert not f.queryset(request, OutreachMessage.objects.all()).exists()
     f = OutreachQueueFilter(
-        request, {"queue": ["all"]}, OutreachMessage, OutreachMessageAdmin(OutreachMessage, AdminSite())
+        request, t.cast(t.Any, {"queue": ["all"]}), OutreachMessage, OutreachMessageAdmin(OutreachMessage, AdminSite())
     )
     assert f.queryset(request, OutreachMessage.objects.all()).exists()
 
@@ -203,7 +203,7 @@ def test_queue_excludes_dnc_leads(lead: Lead, rep: User) -> None:
 def test_row_action_origin(admin_client: Client, lead: Lead, headers: dict[str, str], allowed: bool) -> None:
     m = OutreachMessage.objects.create(lead=lead, channel="instagram", text="hi")
     url = reverse("admin:leads_outreachmessage_mark_sent_row", args=[m.pk])
-    r = admin_client.get(url, **headers)
+    r = admin_client.get(url, headers=None, **t.cast(dict[str, t.Any], headers))
     m.refresh_from_db()
     assert (m.status == "sent") is allowed
     assert r.status_code == (302 if allowed else 403)
