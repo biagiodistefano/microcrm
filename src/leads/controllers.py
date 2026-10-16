@@ -155,11 +155,13 @@ class LeadController(ControllerBase):
         }
         ```
 
-        Returns `{"id": 123, "created": true, "do_not_contact": false}`. A candidate matching a lead marked
-        do-not-contact changes nothing and returns `{"id": ..., "created": false, "do_not_contact": true}`.
+        Returns `{"id": 123, "created": true, "do_not_contact": false, "matched_on": null}`; `matched_on`
+        names the key an existing lead was matched on (e.g. "external_ref", "email", "name_city").
+        A candidate matching a lead marked do-not-contact changes nothing and returns
+        `{"id": ..., "created": false, "do_not_contact": true, ...}`.
         """
-        lead, created = service.upsert_lead(data)
-        return LeadUpsertOut(id=lead.id, created=created, do_not_contact=lead.do_not_contact)
+        lead, created, matched_on = service.upsert_lead(data)
+        return LeadUpsertOut(id=lead.id, created=created, do_not_contact=lead.do_not_contact, matched_on=matched_on)
 
     @route.get("/{lead_id}", response=LeadSchema)
     def get_lead(self, lead_id: int) -> Lead:

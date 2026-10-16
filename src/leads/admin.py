@@ -1,17 +1,19 @@
 import typing as t
 from datetime import date
+from urllib.parse import urlparse
 
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.auth.models import User
 from django.core.exceptions import PermissionDenied
-from django.db.models import DateField, QuerySet
+from django.db.models import DateField, Q, QuerySet
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import path, reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
+from ninja.errors import HttpError
 from simple_history.admin import SimpleHistoryAdmin
 from solo.admin import SingletonModelAdmin
 from unfold.admin import ModelAdmin, StackedInline, TabularInline
@@ -551,6 +553,12 @@ class LeadAdmin(ModelAdmin, SimpleHistoryAdmin, CityLinkMixin, LeadTypeLinkMixin
 
     class Media:
         js = ["leads/js/chained_filters.js"]
+
+    def save_model(self, request: HttpRequest, obj: models.Lead, form: t.Any, change: bool) -> None:  # noqa: FBT001
+        """Keep the do-not-contact stamp consistent and neutralise pending outreach when suppressing."""
+        lead_service.sync_do_not_contact_timestamp(obj)
+        super().save_model(request, obj, form, change)
+        lead_service.suppress_outreach(obj)
 
     def get_urls(self) -> list[t.Any]:
         """Add custom URLs for email and filter endpoints."""
@@ -1239,7 +1247,10 @@ class ActionAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc]
 
 
 class OutreachQueueFilter(admin.SimpleListFilter):
-    """Queue scope. Defaults to the current user's drafts; one click shows everyone's drafts or everything."""
+    """Queue scope. Defaults to my (and unassigned) drafts; one click shows everyone's drafts or everything.
+
+    Suppressed (do-not-contact) leads never appear in the drafts queues.
+    """
 
     title = "queue"
     parameter_name = "queue"
@@ -1251,7 +1262,7 @@ class OutreachQueueFilter(admin.SimpleListFilter):
         yield {
             "selected": self.value() is None,
             "query_string": changelist.get_query_string(remove=[self.parameter_name]),
-            "display": "My drafts",
+            "display": "Mine + unassigned",
         }
         for lookup, title in self.lookup_choices:
             yield {
@@ -1263,15 +1274,21 @@ class OutreachQueueFilter(admin.SimpleListFilter):
     def queryset(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> QuerySet[t.Any]:
         if self.value() == "all":
             return queryset
-        queryset = queryset.filter(status=models.OutreachMessage.Status.DRAFT)
+        queryset = queryset.filter(status=models.OutreachMessage.Status.DRAFT, lead__do_not_contact=False)
         if self.value() == "drafts":
             return queryset
-        return queryset.filter(assigned_to=request.user)
+        return queryset.filter(Q(assigned_to=request.user) | Q(assigned_to__isnull=True))
 
 
-def _reject_cross_site(request: HttpRequest) -> None:
-    """Row actions are plain links (GET); refuse them when a browser says the request is cross-site."""
-    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+def _require_same_origin(request: HttpRequest) -> None:
+    """Row actions are plain GET links (Unfold cannot POST them), so be strict about where the click came from.
+
+    Requires Sec-Fetch-Site of same-origin/none AND a Referer on this exact host; a missing header is refused.
+    """
+    if request.headers.get("Sec-Fetch-Site") not in ("same-origin", "none"):
+        raise PermissionDenied
+    referer = request.headers.get("Referer", "")
+    if not referer or urlparse(referer).netloc != request.get_host():
         raise PermissionDenied
 
 
@@ -1346,8 +1363,12 @@ class OutreachMessageAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc
     def _mark_sent(self, request: HttpRequest, queryset: QuerySet[models.OutreachMessage]) -> int:
         count = 0
         for message in queryset.exclude(status=models.OutreachMessage.Status.SENT):
-            lead_service.mark_message_sent(message, t.cast(User, request.user))
-            count += 1
+            try:
+                lead_service.mark_message_sent(message, t.cast(User, request.user))
+            except HttpError as e:
+                self.message_user(request, f"{message.lead.name}: {e.message}", messages.ERROR)
+            else:
+                count += 1
         return count
 
     def _skip(self, request: HttpRequest, queryset: QuerySet[models.OutreachMessage]) -> int:
@@ -1374,22 +1395,26 @@ class OutreachMessageAdmin(ModelAdmin, SimpleHistoryAdmin):  # type: ignore[misc
 
     @action(description="Mark sent", url_path="mark-sent", icon="send", variant="success", attrs={"target": "_self"})  # type: ignore[untyped-decorator]
     def mark_sent_row(self, request: HttpRequest, object_id: int) -> HttpResponse:
-        _reject_cross_site(request)
+        _require_same_origin(request)
         count = self._mark_sent(request, self.get_queryset(request).filter(pk=object_id))
         self.message_user(request, f"Marked {count} message(s) as sent", messages.SUCCESS)
         return self._back(request)
 
     @action(description="Skip", url_path="skip", icon="skip_next", variant="default", attrs={"target": "_self"})  # type: ignore[untyped-decorator]
     def skip_row(self, request: HttpRequest, object_id: int) -> HttpResponse:
-        _reject_cross_site(request)
+        _require_same_origin(request)
         count = self._skip(request, self.get_queryset(request).filter(pk=object_id))
         self.message_user(request, f"Skipped {count} message(s)", messages.SUCCESS)
         return self._back(request)
 
     @action(description="Mark sent", url_path="mark-sent-detail", icon="send", variant="success")  # type: ignore[untyped-decorator]
     def mark_sent_detail(self, request: HttpRequest, instance: models.OutreachMessage) -> HttpResponse:
-        lead_service.mark_message_sent(instance, t.cast(User, request.user))
-        self.message_user(request, f"Marked message to '{instance.lead.name}' as sent", messages.SUCCESS)
+        try:
+            lead_service.mark_message_sent(instance, t.cast(User, request.user))
+        except HttpError as e:
+            self.message_user(request, e.message, messages.ERROR)
+        else:
+            self.message_user(request, f"Marked message to '{instance.lead.name}' as sent", messages.SUCCESS)
         return self._back(request)
 
     @action(description="Skip", url_path="skip-detail", icon="skip_next", variant="default")  # type: ignore[untyped-decorator]
@@ -1446,7 +1471,7 @@ class EmailSentAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (None, {"fields": ("lead", "template", "status", "sent_by")}),
-        ("Recipients", {"fields": ("assigned_to", "from_email", "to", "bcc")}),
+        ("Recipients", {"fields": ("from_email", "to", "bcc")}),
         ("Content", {"fields": ("subject", "display_body")}),
         ("Status", {"fields": ("error_message", "created_at", "sent_at")}),
     )
@@ -1523,7 +1548,7 @@ class EmailDraftAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (None, {"fields": ("id", "lead", "template")}),
-        ("Recipients", {"fields": ("from_email", "to", "bcc")}),
+        ("Recipients", {"fields": ("assigned_to", "from_email", "to", "bcc")}),
         ("Content", {"fields": ("subject", "body", "humanized_hash", "display_humanized", "batch")}),
         ("Timestamps", {"fields": ("created_at", "updated_at")}),
     )

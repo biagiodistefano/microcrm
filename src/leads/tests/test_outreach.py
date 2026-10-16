@@ -22,6 +22,9 @@ from leads.models import Action, EmailDraft, GmailConnection, Lead, OutreachMess
 pytestmark = pytest.mark.django_db
 
 
+ASSIGNEE = "weronika@letsrevel.io"
+
+
 def sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -95,9 +98,21 @@ class TestDeeplinks:
         lead = Lead.objects.create(name="Q", telegram="a b/../c")
         assert " " not in msg(lead, "telegram").deeplink
 
-    def test_linkedin_never_javascript_scheme(self) -> None:
-        lead = Lead.objects.create(name="X", linkedin="javascript:alert(1)")
-        assert msg(lead, "linkedin").deeplink.startswith("https://")
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "javascript:alert(1)",
+            "javascript:alert(1)//linkedin.com",
+            "https://evil.com/linkedin.com",
+            "badlinkedin.com/x",
+            "https://linkedin.com.evil.io/in/x",
+            "some-slug",
+            "ftp://linkedin.com/in/x",
+        ],
+    )
+    def test_linkedin_only_on_linkedin_host(self, value: str) -> None:
+        lead = Lead.objects.create(name="X", linkedin=value)
+        assert msg(lead, "linkedin").deeplink == ""
 
 
 class TestHumanized:
@@ -162,7 +177,7 @@ class TestMarkSent:
 
 class TestMessageApi:
     def _create(self, client: Client, lead: Lead, **extra: t.Any) -> t.Any:
-        payload = {"lead_id": lead.pk, "channel": "instagram", "text": "Hey!", **extra}
+        payload = {"lead_id": lead.pk, "channel": "instagram", "text": "Hey!", "assigned_to_email": ASSIGNEE, **extra}
         return client.post("/api/messages/", payload, content_type="application/json")
 
     def test_create_shape(self, api_client: Client, lead: Lead, rep: User) -> None:
@@ -181,15 +196,24 @@ class TestMessageApi:
         assert body["sent_at"] is None and body["sent_by_email"] is None
 
     def test_create_ignores_status(self, api_client: Client, lead: Lead) -> None:
+        User.objects.create_user("w2", email=ASSIGNEE)
         resp = self._create(api_client, lead, status="sent")
         assert resp.json()["status"] == "draft"
 
-    def test_unknown_assignee_404_and_lead_404(self, api_client: Client, lead: Lead) -> None:
+    def test_unknown_assignee_404_and_lead_404(self, api_client: Client, lead: Lead, rep: User) -> None:
         assert self._create(api_client, lead, assigned_to_email="no@one.io").status_code == 404
         resp = api_client.post(
-            "/api/messages/", {"lead_id": 999, "channel": "instagram", "text": "x"}, content_type="application/json"
+            "/api/messages/",
+            {"lead_id": 999, "channel": "instagram", "text": "x", "assigned_to_email": rep.email},
+            content_type="application/json",
         )
         assert resp.status_code == 404
+
+    def test_assignee_required(self, api_client: Client, lead: Lead) -> None:
+        r = api_client.post(
+            "/api/messages/", {"lead_id": lead.pk, "channel": "instagram", "text": "x"}, content_type="application/json"
+        )
+        assert r.status_code == 422
 
     def test_bad_channel_and_empty_text(self, api_client: Client, lead: Lead) -> None:
         assert self._create(api_client, lead, channel="sms").status_code == 422
@@ -223,10 +247,10 @@ class TestMessageApi:
         assert r.json()["text"] == "new" and r.json()["assigned_to_email"] == rep.email
         r = api_client.put(
             f"/api/messages/{m.pk}",
-            {"lead_id": lead.pk, "channel": "telegram", "text": "put"},
+            {"lead_id": lead.pk, "channel": "telegram", "text": "put", "assigned_to_email": rep.email},
             content_type="application/json",
         )
-        assert r.json()["channel"] == "telegram" and r.json()["assigned_to_email"] is None
+        assert r.json()["channel"] == "telegram" and r.json()["assigned_to_email"] == rep.email
         assert api_client.delete(f"/api/messages/{m.pk}").status_code == 204
         assert api_client.get(f"/api/messages/{m.pk}").status_code == 404
 
@@ -321,7 +345,7 @@ class TestDoNotContact:
     def test_message_refused(self, api_client: Client, dnc: Lead) -> None:
         r = api_client.post(
             "/api/messages/",
-            {"lead_id": dnc.pk, "channel": "instagram", "text": "x"},
+            {"lead_id": dnc.pk, "channel": "instagram", "text": "x", "assigned_to_email": "a@b.c"},
             content_type="application/json",
         )
         assert r.status_code == 400 and "do not contact" in r.json()["detail"]
@@ -351,7 +375,7 @@ class TestDoNotContact:
         m = msg(lead, "instagram")
         r = api_client.put(
             f"/api/messages/{m.pk}",
-            {"lead_id": dnc.pk, "channel": "instagram", "text": "x"},
+            {"lead_id": dnc.pk, "channel": "instagram", "text": "x", "assigned_to_email": "a@b.c"},
             content_type="application/json",
         )
         assert r.status_code == 400
@@ -362,7 +386,7 @@ class TestDoNotContact:
             {"name": "Nope", "email": "N@x.org", "company": "NewCo", "tags": ["T"], "do_not_contact": False},
             content_type="application/json",
         )
-        assert r.json() == {"id": dnc.pk, "created": False, "do_not_contact": True}
+        assert r.json() == {"id": dnc.pk, "created": False, "do_not_contact": True, "matched_on": "email"}
         dnc.refresh_from_db()
         assert dnc.company == "" and dnc.do_not_contact is True and dnc.tags.count() == 0
 
@@ -468,6 +492,11 @@ def req(rep: User) -> HttpRequest:
     return request
 
 
+def same_origin(request: HttpRequest) -> None:
+    request.META["HTTP_SEC_FETCH_SITE"] = "same-origin"
+    request.META["HTTP_REFERER"] = "http://testserver/admin/leads/outreachmessage/"
+
+
 @pytest.fixture
 def msg_admin() -> OutreachMessageAdmin:
     return OutreachMessageAdmin(OutreachMessage, AdminSite())
@@ -491,7 +520,8 @@ class TestOutreachAdmin:
             f = OutreachQueueFilter(req, params, OutreachMessage, OutreachMessageAdmin(OutreachMessage, AdminSite()))
             return set(f.queryset(req, OutreachMessage.objects.all()).values_list("pk", flat=True))
 
-        assert ids(None) == {mine.pk}
+        assert len(ids(None)) == 2  # mine + unassigned; not the other user's, not the sent one
+        assert mine.pk in ids(None)
         assert len(ids("drafts")) == 3
         assert len(ids("all")) == 4
 
@@ -500,7 +530,7 @@ class TestOutreachAdmin:
         cl = MagicMock()
         cl.get_query_string.return_value = "?"
         displays = [c["display"] for c in f.choices(cl)]
-        assert displays == ["My drafts", "All drafts", "Everything"]
+        assert displays == ["Mine + unassigned", "All drafts", "Everything"]
         assert [c["selected"] for c in f.choices(cl)] == [True, False, False]
 
     def test_open_dm_and_copy_html(self, msg_admin: OutreachMessageAdmin, social_lead: Lead) -> None:
@@ -539,6 +569,7 @@ class TestOutreachAdmin:
         self, msg_admin: OutreachMessageAdmin, req: HttpRequest, rep: User, lead: Lead
     ) -> None:
         a, b, c = msg(lead, "instagram"), msg(lead, "facebook"), msg(lead, "whatsapp")
+        same_origin(req)
         msg_admin.mark_sent_row(req, a.pk)
         msg_admin.skip_row(req, b.pk)
         msg_admin.mark_sent_detail(req, c)

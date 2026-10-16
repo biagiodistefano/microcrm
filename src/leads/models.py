@@ -1,4 +1,5 @@
 import hashlib
+import typing as t
 from urllib.parse import parse_qs, quote, urlparse
 
 from django.core.exceptions import ValidationError
@@ -153,6 +154,11 @@ class Lead(models.Model):
             ),
         ]
 
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Normalise external_ref (strip + lowercase) so matching and the unique constraint are exact."""
+        self.external_ref = self.external_ref.strip().lower()
+        super().save(*args, **kwargs)
+
     def __str__(self) -> str:
         """Return string representation."""
         return self.name
@@ -271,6 +277,21 @@ def _facebook_slug(value: str) -> str:
     return segments[0] if segments else ""
 
 
+def _linkedin_url(value: str) -> str:
+    """Return a safe https LinkedIn URL, or "" unless the host is linkedin.com / www.linkedin.com."""
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or host not in ("linkedin.com", "www.linkedin.com"):
+        return ""
+    return f"https://{host}{quote(parsed.path, safe='/%-._~')}"
+
+
 class OutreachMessage(models.Model):
     """A prepared direct message to send by hand to a lead on a social channel."""
 
@@ -365,22 +386,11 @@ class OutreachMessage(models.Model):
             handle = _extract_handle(self.lead.bluesky, ("bsky.app",))
             return f"https://bsky.app/profile/{quote(handle, safe='.-_:')}" if handle else ""
         if self.channel == channel.LINKEDIN:
-            return self._linkedin_url()
+            return _linkedin_url(self.lead.linkedin)
         if self.channel == channel.TELEGRAM:
             handle = _extract_handle(self._lead_handle("telegram"), ("t.me", "telegram.me"))
             return f"https://t.me/{quote(handle, safe='._')}" if handle else ""
         return ""
-
-    def _linkedin_url(self) -> str:
-        """Return the lead's LinkedIn URL, always http(s)."""
-        url = self.lead.linkedin.strip()
-        if not url:
-            return ""
-        if url.lower().startswith(("http://", "https://")):
-            return url
-        if "linkedin.com" in url.lower():
-            return f"https://{url}"
-        return f"https://www.linkedin.com/company/{quote(url)}"
 
 
 class ResearchPromptConfig(SingletonModel):

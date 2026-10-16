@@ -391,6 +391,11 @@ class LeadIn(Schema):
     def _normalize_platforms(cls, value: list[str]) -> list[str]:
         return normalize_platforms(value) or []
 
+    @field_validator("external_ref")
+    @classmethod
+    def _normalize_ref(cls, value: str) -> str:
+        return value.strip().lower()
+
 
 class LeadUpsertIn(LeadIn):
     """Lead upsert input: same fields as LeadIn, deduplicated/merged instead of always creating.
@@ -426,6 +431,11 @@ class LeadUpsertOut(Schema):
     id: int
     created: bool
     do_not_contact: bool = False
+    matched_on: str | None = Field(
+        default=None,
+        description="Key the existing lead was matched on (external_ref, email, phone, instagram, telegram, "
+        "website, bluesky, facebook, linkedin, whatsapp, name_city); null when a lead was created",
+    )
 
 
 class LeadPatch(Schema):
@@ -467,6 +477,11 @@ class LeadPatch(Schema):
     @classmethod
     def _normalize_platforms(cls, value: list[str] | None) -> list[str] | None:
         return normalize_platforms(value)
+
+    @field_validator("external_ref")
+    @classmethod
+    def _normalize_ref(cls, value: str | None) -> str | None:
+        return value.strip().lower() if value is not None else None
 
 
 class ContactIn(Schema):
@@ -587,7 +602,7 @@ class OutreachMessageIn(Schema):
     lead_id: int = Field(..., description="ID of the lead this message is for")
     channel: OutreachMessage.Channel = Field(..., description="Channel the DM is sent on")
     text: str = Field(..., min_length=1, description="Message text, ready to paste")
-    assigned_to_email: str | None = Field(default=None, description="Email of the user who should send it")
+    assigned_to_email: str = Field(..., min_length=1, description="Email of the user who should send it (required)")
     humanized_hash: str = Field(default="", description="sha256 hex of the humanized text, stored for audit")
     batch: str = Field(default="", description="Batch label")
 

@@ -4,6 +4,7 @@ import logging
 import re
 import typing as t
 from datetime import timedelta
+from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -121,7 +122,7 @@ def _dual_write_primary_contact(lead: Lead, contact_updates: dict[str, str], is_
     primary.save()
 
 
-def _sync_do_not_contact_timestamp(lead: Lead) -> None:
+def sync_do_not_contact_timestamp(lead: Lead) -> None:
     """Stamp do_not_contact_at when suppression is switched on; reset the reason/stamp when switched off."""
     if lead.do_not_contact and lead.do_not_contact_at is None:
         lead.do_not_contact_at = timezone.now()
@@ -140,13 +141,29 @@ def refuse_if_do_not_contact(lead: Lead) -> None:
         raise HttpError(400, f"Lead '{lead.name}' is marked do not contact; no outreach can be created for it")
 
 
+def suppress_outreach(lead: Lead) -> None:
+    """Neutralise pending outreach for a do-not-contact lead.
+
+    Draft DMs are marked skipped; unsent email drafts are deleted (their history rows are kept by
+    simple_history, so the audit trail survives, and nothing unsendable lingers in anyone's queue).
+    """
+    if not lead.do_not_contact:
+        return
+    for message in lead.messages.filter(status=OutreachMessage.Status.DRAFT):
+        message.status = OutreachMessage.Status.SKIPPED
+        message.save(update_fields=["status", "updated_at"])
+    for draft in lead.email_drafts.all():
+        draft.delete()
+
+
 def mark_do_not_contact(lead: Lead, reason: str = "") -> Lead:
     """Suppress a lead (idempotent; keeps an existing reason when none is given)."""
     lead.do_not_contact = True
     if reason:
         lead.do_not_contact_reason = reason
-    _sync_do_not_contact_timestamp(lead)
+    sync_do_not_contact_timestamp(lead)
     lead.save(update_fields=["do_not_contact", "do_not_contact_reason", "do_not_contact_at", "updated_at"])
+    suppress_outreach(lead)
     return lead
 
 
@@ -172,8 +189,9 @@ def apply_lead_data(lead: Lead, data: LeadIn | LeadPatch, is_patch: bool = False
             contact_updates[field] = value or ""
 
     _apply_lead_relations(lead, data, is_patch)
-    _sync_do_not_contact_timestamp(lead)
+    sync_do_not_contact_timestamp(lead)
     lead.save()
+    suppress_outreach(lead)
 
     _dual_write_primary_contact(lead, contact_updates, is_patch)
 
@@ -219,39 +237,114 @@ def bulk_update_lead_tags(lead_ids: list[int], add: list[str], remove: list[str]
 # --- Lead Upsert (dedupe + merge) ---
 
 
-def find_existing_lead(data: LeadUpsertIn, city: City | None) -> tuple[Contact | None, Lead | None]:
+# Hosts shared by many organizations (link hubs, socials, ticketing, maps): never a dedupe key
+AGGREGATOR_HOSTS: tuple[str, ...] = (
+    "linktr.ee",
+    "instagram.com",
+    "facebook.com",
+    "fb.com",
+    "ra.co",
+    "bsky.app",
+    "linkedin.com",
+    "tiktok.com",
+    "beacons.ai",
+    "lnk.bio",
+    "carrd.co",
+    "t.me",
+    "wa.me",
+    "maps.app.goo.gl",
+)
+
+
+def _is_aggregator(host: str, path: str) -> bool:
+    """True for hosts/paths that identify a platform rather than one organization."""
+    if any(host == h or host.endswith(f".{h}") for h in AGGREGATOR_HOSTS):
+        return True
+    if host.startswith("eventbrite.") or ".eventbrite." in host:
+        return True
+    is_google = host == "google.com" or host.startswith("google.") or host.endswith(".google.com")
+    return is_google and (path.startswith("/maps") or host.startswith("maps."))
+
+
+def normalize_website(url: str) -> str:
+    """Normalise a website to ``host/path`` (no scheme, www, query or trailing slash; host lowercased).
+
+    Returns "" for empty input and for aggregator/social hosts, which must never be used for matching.
+    """
+    url = url.strip()
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url if "//" in url else f"//{url}")
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return ""
+    path = parsed.path.rstrip("/")
+    if not host or _is_aggregator(host, path):
+        return ""
+    return f"{host}{path}"
+
+
+def _match_exact(field: str, value: str, ok: t.Callable[[Lead], bool]) -> tuple[Contact | None, Lead] | None:
+    """Case-insensitive exact match on a contact method / handle (Contact rows first, then Lead columns)."""
+    if field in CONTACT_FIELDS:
+        for contact in Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value}):
+            if ok(contact.lead):
+                return contact, contact.lead
+    for lead in Lead.objects.filter(**{f"{field}__iexact": value}):
+        if ok(lead):
+            return None, lead
+    return None
+
+
+def _match_website(value: str, ok: t.Callable[[Lead], bool]) -> tuple[Contact | None, Lead] | None:
+    """Match on a normalised website; stored values are normalised on the fly."""
+    norm = normalize_website(value)
+    if not norm:
+        return None
+    host = norm.split("/")[0]
+    for contact in Contact.objects.select_related("lead").filter(website__icontains=host):
+        if normalize_website(contact.website) == norm and ok(contact.lead):
+            return contact, contact.lead
+    for lead in Lead.objects.filter(website__icontains=host):
+        if normalize_website(lead.website) == norm and ok(lead):
+            return None, lead
+    return None
+
+
+def find_existing_lead(data: LeadUpsertIn, city: City | None) -> tuple[Contact | None, Lead | None, str | None]:
     """Find the lead an incoming record refers to.
 
-    Order: external_ref, then each contact method (Contact rows first, then legacy Lead columns),
-    then the Lead-only handles (bluesky/facebook/linkedin/whatsapp), then name+city.
+    Order: external_ref, then each contact method / handle, then name+city. A candidate that carries a
+    different non-empty external_ref than the incoming record is never matched, on any key.
 
     Returns:
-        Tuple of (matched_contact, lead); matched_contact is set only on a Contact-row match.
+        Tuple of (matched_contact, lead, matched_on). matched_contact is set only on a Contact-row match;
+        matched_on is the key name ("external_ref", "email", ..., "name_city"), or None if nothing matched.
     """
-    if data.external_ref:
-        lead = Lead.objects.filter(external_ref__iexact=data.external_ref).first()
+    ref = data.external_ref
+
+    def ok(lead: Lead) -> bool:
+        return not (ref and lead.external_ref and lead.external_ref != ref)
+
+    if ref:
+        lead = Lead.objects.filter(external_ref=ref).first()
         if lead:
-            return None, lead
+            return None, lead, "external_ref"
 
     for field in LEAD_MATCH_FIELDS:
         value = (getattr(data, field) or "").strip()
         if not value:
             continue
-        if field in CONTACT_FIELDS:
-            contact = Contact.objects.select_related("lead").filter(**{f"{field}__iexact": value}).first()
-            if contact:
-                return contact, contact.lead
-        lead_match = Lead.objects.filter(**{f"{field}__iexact": value}).first()
-        if lead_match:
-            return None, lead_match
+        found = _match_website(value, ok) if field == "website" else _match_exact(field, value, ok)
+        if found:
+            return found[0], found[1], field
 
-    if city is None:
-        return None, None
-    candidate = Lead.objects.filter(name__iexact=data.name, city=city).first()
-    # Two records the external tool tells apart by ref must not be merged on a weak name+city match
-    if candidate and data.external_ref and candidate.external_ref and candidate.external_ref != data.external_ref:
-        return None, None
-    return None, candidate
+    if city is not None:
+        for candidate in Lead.objects.filter(name__iexact=data.name, city=city):
+            if ok(candidate):
+                return None, candidate, "name_city"
+    return None, None, None
 
 
 def _merge_contact_methods(lead: Lead, matched: Contact | None, data: LeadUpsertIn) -> None:
@@ -289,13 +382,14 @@ def merge_lead_data(lead: Lead, matched: Contact | None, data: LeadUpsertIn) -> 
     if data.do_not_contact:
         lead.do_not_contact = True
         lead.do_not_contact_reason = lead.do_not_contact_reason or data.do_not_contact_reason
-        _sync_do_not_contact_timestamp(lead)
+        sync_do_not_contact_timestamp(lead)
     if data.lead_type and not lead.lead_type:
         lead.lead_type = get_or_create_lead_type(data.lead_type)
     if data.city and not lead.city:
         lead.city = get_or_create_city(data.city)
     lead.ticketing_platforms = list(dict.fromkeys([*(lead.ticketing_platforms or []), *data.ticketing_platforms]))
     lead.save()
+    suppress_outreach(lead)
 
     _merge_contact_methods(lead, matched, data)
     if data.tags:
@@ -303,29 +397,26 @@ def merge_lead_data(lead: Lead, matched: Contact | None, data: LeadUpsertIn) -> 
     return lead
 
 
-def upsert_lead(data: LeadUpsertIn) -> tuple[Lead, bool]:
+def upsert_lead(data: LeadUpsertIn) -> tuple[Lead, bool, str | None]:
     """Create a lead or merge into the existing one it matches (idempotent for a given external_ref).
 
     Returns:
-        Tuple of (lead, created).
+        Tuple of (lead, created, matched_on); matched_on is None when a lead was created.
     """
     city = get_or_create_city(data.city) if data.city else None
-    matched, lead = find_existing_lead(data, city)
-    if lead and lead.do_not_contact:
-        return lead, False  # suppressed: change nothing
-    if lead:
-        return merge_lead_data(lead, matched, data), False
-    try:
-        with transaction.atomic():
-            return create_lead(data), True
-    except IntegrityError:
-        # Lost a race on external_ref: the other writer's lead is now the match
-        matched, lead = find_existing_lead(data, city)
-        if lead is None:
-            raise
-        if lead.do_not_contact:
-            return lead, False
-        return merge_lead_data(lead, matched, data), False
+    matched, lead, matched_on = find_existing_lead(data, city)
+    if lead is None:
+        try:
+            with transaction.atomic():
+                return create_lead(data), True, None
+        except IntegrityError:
+            # Lost a race on external_ref: the other writer's lead is now the match
+            matched, lead, matched_on = find_existing_lead(data, city)
+            if lead is None:
+                raise
+    if lead.do_not_contact:
+        return lead, False, matched_on  # suppressed: change nothing
+    return merge_lead_data(lead, matched, data), False, matched_on
 
 
 # --- Contact Functions ---
@@ -714,6 +805,8 @@ def send_email_to_lead(  # noqa: PLR0913
     """
     from leads.gmail import get_gmail_credentials, send_email_via_gmail
 
+    refuse_if_do_not_contact(lead)
+
     # Validate no placeholders remain
     unreplaced = validate_no_placeholders(subject, body)
     if unreplaced:
@@ -841,6 +934,7 @@ def send_email_to_lead_api(lead: Lead, data: SendEmailIn) -> dict[str, t.Any]:
     """
     from leads.tasks import send_email_task
 
+    refuse_if_do_not_contact(lead)
     contact = _resolve_send_contact(lead, data.contact_id)
     template, subject, body = _resolve_send_subject_body(lead, data, contact)
     to = _resolve_send_recipients(data.to, contact, lead)
@@ -1003,6 +1097,23 @@ def patch_email_draft(draft: EmailDraft, data: EmailDraftPatch) -> EmailDraft:
     return draft
 
 
+def _ensure_may_send_draft(draft: EmailDraft, user: User | None) -> None:
+    """Only the assignee (or a superuser acting explicitly) may send an assigned draft.
+
+    Sending always uses the acting user's own Gmail connection, never anyone else's.
+
+    Raises:
+        HttpError: 403 if the draft is assigned to someone else, or to someone and there is no acting user.
+    """
+    assignee = draft.assigned_to
+    if assignee is None:
+        return
+    if not isinstance(user, User):
+        raise HttpError(403, f"Draft is assigned to {assignee.email}; it must be sent by them from the admin")
+    if user.pk != assignee.pk and not user.is_superuser:
+        raise HttpError(403, f"Draft is assigned to {assignee.email}; only they (or a superuser) can send it")
+
+
 def send_email_draft(draft: EmailDraft, user: User | None = None) -> EmailSent:
     """Send an email draft.
 
@@ -1018,6 +1129,9 @@ def send_email_draft(draft: EmailDraft, user: User | None = None) -> EmailSent:
     Raises:
         ValueError: If there are unreplaced placeholders in subject or body
     """
+    refuse_if_do_not_contact(draft.lead)
+    _ensure_may_send_draft(draft, user)
+
     # Validate no placeholders remain
     errors = validate_no_placeholders(draft.subject, draft.body)
     if errors:
@@ -1161,10 +1275,14 @@ def mark_message_sent(message: OutreachMessage, user: User | None = None) -> Out
     Sets status/sent_at/sent_by, bumps the lead's last_contact to today, moves a `new` lead to `contacted`
     (later statuses are never downgraded) and schedules a follow-up Action. Idempotent for already-sent messages.
     """
-    if message.status == OutreachMessage.Status.SENT:
-        return message
     today = timezone.localdate()
     with transaction.atomic():
+        # Lock the row and re-check, so a concurrent/stale second call creates no second follow-up
+        list(OutreachMessage.objects.select_for_update().filter(pk=message.pk))
+        message.refresh_from_db()
+        if message.status == OutreachMessage.Status.SENT:
+            return message
+        refuse_if_do_not_contact(message.lead)
         message.status = OutreachMessage.Status.SENT
         message.sent_at = timezone.now()
         message.sent_by = user if isinstance(user, User) else None

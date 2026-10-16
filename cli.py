@@ -1510,7 +1510,7 @@ def messages_create(
         ..., "--channel", "-c", help="instagram, facebook, whatsapp, bluesky, linkedin, telegram"
     ),
     text: str = typer.Option(..., "--text", "-t", help="Message text"),
-    assigned_to: str | None = typer.Option(None, "--assigned-to", help="Assignee email"),
+    assigned_to: str = typer.Option(..., "--assigned-to", help="Assignee email (required)"),
     humanized_hash: str = typer.Option("", "--humanized-hash", help="sha256 of the humanized text"),
     batch: str = typer.Option("", "--batch", help="Batch label"),
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw JSON"),
@@ -1523,9 +1523,8 @@ def messages_create(
             "text": text,
             "humanized_hash": humanized_hash,
             "batch": batch,
+            "assigned_to_email": assigned_to,
         }
-        if assigned_to:
-            data["assigned_to_email"] = assigned_to
         result = api.post("/messages/", data)
         if raw:
             output_json(result, raw=True)
