@@ -2,6 +2,12 @@ name: Test
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to test (defaults to the caller's ref)
+        type: string
+        default: ""
   push:
     branches: [main]
     paths:
@@ -22,6 +28,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7

@@ -1,5 +1,7 @@
 # Production Docker Compose configuration
-# Usage: ./prod_wizard.sh
+# Usage: ./prod_wizard.sh  (deploys: scripts/deploy.sh)
+# Images come from GHCR (tag via MICROCRM_IMAGE_TAG, written by scripts/deploy.sh).
+# To build locally instead: add -f compose.build.yaml (see scripts/deploy.sh --build).
 
 services:
   caddy:
@@ -54,7 +56,7 @@ services:
       - microcrm
 
   web:
-    build: .
+    image: ghcr.io/biagiodistefano/microcrm:${MICROCRM_IMAGE_TAG:-main}
     container_name: microcrm_web
     restart: unless-stopped
     command:
@@ -82,7 +84,7 @@ services:
       - microcrm
 
   celery:
-    build: .
+    image: ghcr.io/biagiodistefano/microcrm:${MICROCRM_IMAGE_TAG:-main}
     container_name: microcrm_celery
     restart: unless-stopped
     command: celery -A crm worker -l INFO --concurrency 2
@@ -104,7 +106,7 @@ services:
       - microcrm
 
   beat:
-    build: .
+    image: ghcr.io/biagiodistefano/microcrm:${MICROCRM_IMAGE_TAG:-main}
     container_name: microcrm_beat
     restart: unless-stopped
     command: celery -A crm beat -l INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler
