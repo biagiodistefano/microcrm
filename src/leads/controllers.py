@@ -807,7 +807,7 @@ class OutreachMessageController(ControllerBase):
     def mark_sent(self, message_id: int) -> OutreachMessage:
         """Record that the message was sent by hand.
 
-        Sets sent_at, updates the lead's last_contact, moves a `new` lead to `contacted` and creates a
+        Sets sent_at, updates the lead's last_contact, moves a `new` or `qualified` lead to `contacted` and creates a
         follow-up action due in 4 days. Idempotent. With a personal API token, `sent_by` is that user.
         """
         message = get_object_or_404(self.get_queryset(), id=message_id)
