@@ -148,7 +148,7 @@ class TestMarkSent:
         assert action.due_date == timezone.localdate() + timedelta(days=4)
         assert action.status == Action.Status.PENDING
 
-    @pytest.mark.parametrize("status", ["contacted", "replied", "qualified", "call_booked", "converted", "lost"])
+    @pytest.mark.parametrize("status", ["contacted", "replied", "call_booked", "converted", "lost"])
     def test_no_status_change_for_non_new(self, lead: Lead, status: str) -> None:
         Lead.objects.filter(pk=lead.pk).update(status=status)
         service.mark_message_sent(msg(lead, "facebook"), None)
@@ -258,6 +258,13 @@ class TestMessageApi:
         m = msg(lead, "instagram")
         r = api_client.post(f"/api/messages/{m.pk}/mark-sent")
         assert r.status_code == 200 and r.json()["status"] == "sent" and r.json()["sent_at"]
+        lead.refresh_from_db()
+        assert lead.status == Lead.Status.CONTACTED
+
+    def test_mark_sent_moves_qualified_to_contacted(self, lead: Lead) -> None:
+        """A qualified lead becomes contacted, as on the email send path."""
+        Lead.objects.filter(pk=lead.pk).update(status=Lead.Status.QUALIFIED)
+        service.mark_message_sent(msg(lead, "instagram"), None)
         lead.refresh_from_db()
         assert lead.status == Lead.Status.CONTACTED
 

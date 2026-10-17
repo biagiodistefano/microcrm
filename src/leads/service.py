@@ -1254,8 +1254,9 @@ def patch_outreach_message(message: OutreachMessage, data: OutreachMessagePatch)
 def mark_message_sent(message: OutreachMessage, user: User | None = None) -> OutreachMessage:
     """Record that a human sent this message by hand.
 
-    Sets status/sent_at/sent_by, bumps the lead's last_contact to today, moves a `new` lead to `contacted`
-    (later statuses are never downgraded) and schedules a follow-up Action. Idempotent for already-sent messages.
+    Sets status/sent_at/sent_by, bumps the lead's last_contact to today, moves a `new` or `qualified` lead to
+    `contacted` (later statuses are never downgraded) and schedules a follow-up Action. Idempotent for already-sent
+    messages.
     """
     today = timezone.localdate()
     with transaction.atomic():
@@ -1274,7 +1275,7 @@ def mark_message_sent(message: OutreachMessage, user: User | None = None) -> Out
         lead = Lead.objects.select_for_update().get(pk=message.lead_id)
         lead.last_contact = today
         update_fields = ["last_contact", "updated_at"]
-        if lead.status == Lead.Status.NEW:
+        if lead.status in (Lead.Status.NEW, Lead.Status.QUALIFIED):
             lead.status = Lead.Status.CONTACTED
             update_fields.append("status")
         lead.save(update_fields=update_fields)
