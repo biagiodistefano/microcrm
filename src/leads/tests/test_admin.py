@@ -98,7 +98,7 @@ class TestHasEmailFilter:
 
     def test_lookups(self, request_factory: RequestFactory, lead_admin: LeadAdmin) -> None:
         request = request_factory.get("/admin/")
-        filter_instance = HasEmailFilter(request, request.GET.copy(), models.Lead, lead_admin)
+        filter_instance = HasEmailFilter(request, dict(request.GET.lists()), models.Lead, lead_admin)
         lookups = filter_instance.lookups(request, lead_admin)
         assert lookups == [("yes", "Yes"), ("no", "No")]
 
@@ -107,7 +107,7 @@ class TestHasEmailFilter:
         lead_no_email = models.Lead.objects.create(name="No Email", email="")
         # Django expects QueryDict (not plain dict)
         request = request_factory.get("/admin/", {"has_email": "yes"})
-        filter_instance = HasEmailFilter(request, request.GET.copy(), models.Lead, lead_admin)
+        filter_instance = HasEmailFilter(request, dict(request.GET.lists()), models.Lead, lead_admin)
         qs = filter_instance.queryset(request, models.Lead.objects.all())
         assert lead in qs  # Has email - included
         assert lead_no_email not in qs  # No email - excluded
@@ -118,14 +118,14 @@ class TestHasEmailFilter:
         lead_no_email = models.Lead.objects.create(name="No Email Lead", email="")
         # Django expects QueryDict (uses value[-1] to get last list element)
         request = request_factory.get("/admin/", {"has_email": "no"})
-        filter_instance = HasEmailFilter(request, request.GET.copy(), models.Lead, lead_admin)
+        filter_instance = HasEmailFilter(request, dict(request.GET.lists()), models.Lead, lead_admin)
         qs = filter_instance.queryset(request, models.Lead.objects.all())
         assert lead_no_email in qs
         assert lead_with_email not in qs
 
     def test_filter_none(self, request_factory: RequestFactory, lead: models.Lead, lead_admin: LeadAdmin) -> None:
         request = request_factory.get("/admin/")
-        filter_instance = HasEmailFilter(request, request.GET.copy(), models.Lead, lead_admin)
+        filter_instance = HasEmailFilter(request, dict(request.GET.lists()), models.Lead, lead_admin)
         qs = filter_instance.queryset(request, models.Lead.objects.all())
         assert lead in qs  # All leads returned
 

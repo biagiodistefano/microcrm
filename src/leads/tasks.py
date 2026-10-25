@@ -154,13 +154,15 @@ def start_research_job(job_id: int) -> dict[str, t.Any]:
             background=True,
             response_format=schema_json,
         )
-        job.gemini_interaction_id = interaction.id
+        # background=True returns a non-streaming Interaction (the SDK overloads can't express that)
+        interaction_id = t.cast(str, interaction.id)  # type: ignore[union-attr]
+        job.gemini_interaction_id = interaction_id
         job.status = ResearchJob.Status.RUNNING
         job.error = ""
         job.completed_at = None
         job.save()
-        logger.info("Started research for job %s (interaction: %s)", job.id, interaction.id)
-        return {"job_id": job.id, "status": "running", "interaction_id": interaction.id}
+        logger.info("Started research for job %s (interaction: %s)", job.id, interaction_id)
+        return {"job_id": job.id, "status": "running", "interaction_id": interaction_id}
     except Exception:
         job.status = ResearchJob.Status.FAILED
         job.error = traceback.format_exc()

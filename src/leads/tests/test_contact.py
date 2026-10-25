@@ -193,11 +193,11 @@ def test_has_email_filter_multi_contact_mixed(lead: Lead) -> None:
     admin_instance = LeadAdmin(Lead, AdminSite())
 
     req_yes = factory.get("/admin/", {"has_email": "yes"})
-    f_yes = HasEmailFilter(req_yes, req_yes.GET.copy(), Lead, admin_instance)
+    f_yes = HasEmailFilter(req_yes, dict(req_yes.GET.lists()), Lead, admin_instance)
     assert lead in f_yes.queryset(req_yes, Lead.objects.all())
 
     req_no = factory.get("/admin/", {"has_email": "no"})
-    f_no = HasEmailFilter(req_no, req_no.GET.copy(), Lead, admin_instance)
+    f_no = HasEmailFilter(req_no, dict(req_no.GET.lists()), Lead, admin_instance)
     assert lead not in f_no.queryset(req_no, Lead.objects.all())
 
 
