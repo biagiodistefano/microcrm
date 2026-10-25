@@ -13,7 +13,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "celery>=5.6.0",
-    "django>=5.2.9",
+    "django>=5.2.17,<6",
     "django-celery-beat>=2.8.1",
     "django-celery-results>=2.6.0",
     "django-google-sso>=9.0.2",
@@ -43,7 +43,7 @@ dependencies = [
 dev = [
     "celery-types>=0.23.0",
     "django-stubs[compatible-mypy]>=5.2.8",
-    "mypy>=1.19.1",
+    "mypy>=1.19.1,<2",
     "pytest>=8.4.1",
     "pytest-cov>=6.2.1",
     "pytest-django>=4.11.1",
@@ -97,6 +97,10 @@ line-ending = "auto"
 mypy_path = ["./src"]
 plugins = ["mypy_django_plugin.main"]
 exclude = ["(?x)(^.*/migrations/.*\\.py$|^crm_client\\.py$|^trello_crm\\.py$)"]
+
+[[tool.mypy.overrides]]
+module = "django_celery_beat.*"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "django_google_sso.*"

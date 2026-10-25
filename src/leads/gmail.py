@@ -232,7 +232,7 @@ def gmail_disconnect_view(request: HttpRequest) -> HttpResponse:
 
     # Revoke the token at Google
     try:
-        import requests as http_requests  # type: ignore[import-untyped]
+        import requests as http_requests
 
         http_requests.post(
             "https://oauth2.googleapis.com/revoke",
